@@ -1,0 +1,412 @@
+// Schéma Prisma / PostgreSQL du bot.
+//
+// Convention : les timestamps métier (mouvements, échéances, cooldowns...)
+// sont des `DateTime` Postgres (TIMESTAMPTZ), pas des entiers millisecondes
+// bruts — plus idiomatique côté Postgres/Prisma. La couche src/db.ts est la
+// SEULE à convertir entre `Date` et millisecondes (Date.now()/getTime()) ;
+// tout le reste du bot manipule des nombres, comme avec l'ancien SQLite.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══ MULTI-TENANT (registre des guildes connues — voir src/guild-registry.ts) ═══
+
+/// Une ligne par guilde Discord ayant déjà invité le bot. Source de vérité
+/// pour "quelles guildes ce déploiement sert" — distinct de BotConfig (qui
+/// est la config MÉTIER d'une guilde, pas son statut de tenant). `active`
+/// passe à false quand le bot est retiré (guildDelete) : soft-delete
+/// uniquement, on ne supprime jamais les données métier d'une guilde qui
+/// part — elle peut revenir. `frontendUrl`/`corsOrigin` remplacent, PAR
+/// GUILDE, les anciennes variables d'env globales FRONTEND_URL/
+/// API_CORS_ORIGIN (une seule guilde ne peut plus les définir pour tout le
+/// monde) — voir src/api/auth.ts et src/api/server.ts.
+model Guild {
+  guildId     String    @id @map("guild_id")
+  name        String?
+  active      Boolean   @default(true)
+  addedAt     DateTime  @default(now()) @map("added_at")
+  removedAt   DateTime? @map("removed_at")
+  frontendUrl String?   @map("frontend_url")
+  corsOrigin  String?   @map("cors_origin")
+
+  @@map("guilds")
+}
+
+// `guildId` scope chaque table métier à une guilde (multi-tenant — un seul
+// déploiement sert plusieurs guildes Discord, données totalement étanches).
+// Fait partie de chaque clé primaire/unique composite ci-dessous : jamais de
+// requête sur ces tables sans le filtrer, voir src/db.ts (chaque fonction
+// exportée prend un `guildId` en premier paramètre).
+
+// ═══ CONFIGURATION (pilotée par /config, lue par src/config-store.ts) ═══
+
+/// Scalaires de config (salaire par vente, plafonds munitions, amende
+/// fourrière...) — pas de table dédiée pour une poignée de nombres nommés.
+/// Les salons et rôles Discord, eux, ont leurs propres tables ci-dessous
+/// (Channel/DiscordRole) plutôt que ce KV générique : un salon comme
+/// `logs_coffres` peut désigner plusieurs salons à la fois, ce qu'une simple
+/// paire clé/valeur ne représente pas proprement.
+model Setting {
+  guildId String @map("guild_id")
+  key     String
+  value   String
+
+  @@id([guildId, key])
+  @@map("settings")
+}
+
+/// Association rôle fonctionnel du bot → salon(s) Discord, pilotée par
+/// `/config channel`. Une ligne par salon assigné à un rôle : la plupart des
+/// rôles (stock_general, quotas, armurerie...) n'ont qu'une seule ligne, mais
+/// `logs_coffres`/`logs_coffres_admin` peuvent chacun en avoir plusieurs
+/// (tous les salons de logs de coffre surveillés) — même table, pas de cas
+/// spécial.
+model Channel {
+  guildId   String  @map("guild_id")
+  role      String
+  channelId String  @map("channel_id")
+  /// Nom donné par l'admin (ex. "Coffre principal") — seulement utile pour un
+  /// rôle à valeurs multiples (logs_coffres/logs_coffres_admin), où plusieurs
+  /// salons partagent le même rôle et ne se distinguent que par ce nom. Voir
+  /// `/config channel add-log-coffre nom:`. `null` tant que non renseigné.
+  label     String?
+
+  @@id([guildId, role, channelId])
+  @@map("channels")
+}
+
+/// Association usage du bot → rôle Discord ('admin' : commandes sensibles ;
+/// 'taxes' : accès back-office taxes), pilotée par `/config role`.
+model DiscordRole {
+  guildId String @map("guild_id")
+  target  String
+  roleId  String @map("role_id")
+
+  @@id([guildId, target])
+  @@map("discord_roles")
+}
+
+/// Items de coffre suivis. Le nom doit correspondre exactement (accents,
+/// casse) à ce qu'écrit le bot de jeu FiveM dans les logs de coffre — voir
+/// /config item add. stockGroup fusionne plusieurs items sous un même
+/// libellé dans le message de stock (ex. "Drogue à vendre"). vente =
+/// déclarable en vente PNJ (retrait qui ouvre une vente en attente, voir
+/// modules/ventes.ts). Pas de flag équivalent pour la confirmation du
+/// paiement : un seul item joue ce rôle en pratique ("Argent Sale"), fixé en
+/// dur dans modules/ventes.ts (`CONFIRME_VENTE_ITEM`, même principe que
+/// `MUNITIONS_STOCK_GROUP` dans armurerie.ts) plutôt qu'un flag par item.
+/// visibleStock : l'item reste suivi (stock à jour, historique) même à
+/// `false` — seul son affichage dans le message "Stock Général" est masqué.
+/// laboLie : clé d'une activité "labo" (ex. "labo_cocaine", voir
+/// ACTIVITY_TYPES_FIXED dans config-store.ts) si cet item est lié à ce labo
+/// — `laboLieRole` précise COMMENT : 'produit' (c'est LA drogue que ce labo
+/// produit) ou 'materiau' (c'est une matière PREMIÈRE qu'il consomme, ex.
+/// Psilocybe pour labo_sporex). Jamais les deux à la fois pour un item, d'où
+/// un seul couple de champs plutôt que deux colonnes mutuellement
+/// exclusives. 'produit' sert à dériver, par tier d'organisation,
+/// l'exclusion de vente_pnj : une drogue que le tier courant peut produire
+/// lui-même (labo actif pour ce tier, voir LABO_TIERS) n'est pas vendable en
+/// PNJ à ce tier — vente_pnj reste sinon tel que configuré ici. 'materiau'
+/// sert uniquement à l'affichage ("Matériaux de production" dans le message
+/// Stock Général, voir modules/stocks.ts), jamais à l'exclusion de vente_pnj.
+/// `laboLie` `null` pour un item sans lien avec un labo (jamais exclu,
+/// jamais affiché dans ces deux champs) ; `laboLieRole` n'a alors aucun sens
+/// et reste `null` aussi. stockMultiplier : nombre d'unités de base que
+/// représente une unité de cet item (ex. une boîte de munitions) — appliqué
+/// au stock de cet item avant de le sommer dans un STOCK_GROUP (voir
+/// armurerie.weightedStockSum). `1` = pas de conversion.
+model Item {
+  guildId         String  @map("guild_id")
+  name            String
+  stockGroup      String? @map("stock_group")
+  vente           Boolean @default(false)
+  displayOrder    Int     @default(0) @map("display_order")
+  visibleStock    Boolean @default(true) @map("visible_stock")
+  laboLie         String? @map("labo_lie")
+  laboLieRole     String? @map("labo_lie_role")
+  stockMultiplier Int     @default(1) @map("stock_multiplier")
+
+  @@id([guildId, name])
+  @@map("items")
+}
+
+/// Objectif hebdomadaire par catégorie de quota. Une catégorie sans ligne
+/// ici est suivie mais sans objectif affiché/alerté.
+model QuotaTarget {
+  guildId      String @map("guild_id")
+  quotaType    String @map("quota_type")
+  weeklyTarget Int    @map("weekly_target")
+
+  @@id([guildId, quotaType])
+  @@map("quota_targets")
+}
+
+/// Taux de paie ($ par unité) pour une catégorie de quota. Une catégorie sans
+/// ligne ici ne génère aucune paie — voir `computeSalaire` dans
+/// src/modules/quotas.ts. Indépendant de QuotaTarget : une catégorie peut
+/// avoir un objectif sans taux de paie, un taux sans objectif, ou les deux.
+model SalaryRate {
+  guildId   String @map("guild_id")
+  quotaType String @map("quota_type")
+  amount    Float
+
+  @@id([guildId, quotaType])
+  @@map("salary_rates")
+}
+
+/// Taux de paie ($ par unité) spécifique à UN item, en override du taux
+/// général de la catégorie "vente" (SalaryRate) pour cet item précis — voir
+/// `computeSalaire` dans src/modules/quotas.ts. N'a de sens que pour un item
+/// vendu au PNJ (quota_type "vente") ; un item sans ligne ici utilise le taux
+/// général de SalaryRate("vente"). Fiable car `item` correspond exactement au
+/// nom détecté dans les logs FiveM (voir Transaction.type pour l'action
+/// "vente"), jamais un texte tapé librement par un joueur.
+model ItemSalaryRate {
+  guildId String @map("guild_id")
+  item    String
+  amount  Float
+
+  @@id([guildId, item])
+  @@map("item_salary_rates")
+}
+
+/// Points de classement ($ par unité → ici points par unité) par catégorie de
+/// quota — même principe que SalaryRate, pour un classement par points plutôt
+/// que par salaire. Voir `computeClassement` dans src/modules/quotas.ts.
+model ClassementRate {
+  guildId   String @map("guild_id")
+  quotaType String @map("quota_type")
+  amount    Int
+
+  @@id([guildId, quotaType])
+  @@map("classement_rates")
+}
+
+/// Points de classement spécifiques à UNE activité de la famille "actions"
+/// (atm, cambu, superette, gofast, braq_armurerie, fleeca, bijouterie,
+/// pinebank, human_labs), en override du nombre général de la catégorie
+/// "actions" pour cette activité précise — voir `computeClassement`. N'a de
+/// sens que pour une activité de quotaType "actions" ; `activityKey` est une
+/// clé fixe du registre `ACTIVITY_TYPES_FIXED` (jamais un texte libre,
+/// contrairement à `ItemSalaryRate.item`).
+model ActivityClassementRate {
+  guildId     String @map("guild_id")
+  activityKey String @map("activity_key")
+  amount      Int
+
+  @@id([guildId, activityKey])
+  @@map("activity_classement_rates")
+}
+
+// ═══ DONNÉES MÉTIER (génériques, indépendantes de la config ci-dessus) ═══
+
+/// Stock total, tous coffres suivis confondus (`/config channel add-log-coffre`)
+/// — c'est celui qu'affiche le panneau "Stock Général". Voir {@link
+/// CoffreStock} pour le détail par coffre (salon de log), suivi séparément
+/// depuis la mise en place de l'API (voir README, section Interopérabilité).
+model Stock {
+  guildId  String @map("guild_id")
+  item     String
+  quantite Int    @default(0)
+
+  @@id([guildId, item])
+  @@map("stocks")
+}
+
+/// Stock détaillé PAR coffre (un salon `logs_coffres`) — complément de
+/// {@link Stock} (le total global), pas un remplacement : les deux sont mis à
+/// jour ensemble à chaque mouvement (voir `stocks.ts`, `applyCoffreStockDelta`
+/// aux côtés de `applyStockDelta`). Vidé et reconstruit lors d'un `/sync-stock`
+/// complet, comme `Stock`.
+model CoffreStock {
+  guildId   String @map("guild_id")
+  channelId String @map("channel_id")
+  item      String
+  quantite  Int    @default(0)
+
+  @@id([guildId, channelId, item])
+  @@map("coffre_stocks")
+}
+
+model StockHistory {
+  guildId    String   @map("guild_id")
+  id         Int      @id @default(autoincrement())
+  timestamp  DateTime @default(now())
+  joueur     String
+  action     String
+  item       String
+  quantite   Int
+  stockAvant Int      @map("stock_avant")
+  stockApres Int      @map("stock_apres")
+  /// Salon `logs_coffres` d'origine du mouvement — `null` pour les lignes
+  /// enregistrées avant l'ajout de ce suivi par coffre (jamais backfillé).
+  channelId  String?  @map("channel_id")
+
+  @@index([guildId, item])
+  @@map("stock_history")
+}
+
+model Transaction {
+  guildId      String   @map("guild_id")
+  id           Int      @id @default(autoincrement())
+  userId       String   @map("user_id")
+  username     String   @default("")
+  action       String
+  quantite     Float    @default(0)
+  type         String?
+  partenaires  String   @default("[]")
+  tempsRestant String?  @map("temps_restant")
+  timestamp    DateTime @default(now())
+  deleted      Boolean  @default(false)
+  deletedBy    String?  @map("deleted_by")
+
+  @@index([guildId, action])
+  @@index([guildId, timestamp])
+  @@map("transactions")
+}
+
+model Stat {
+  guildId String @map("guild_id")
+  userId  String @map("user_id")
+  action  String
+  count   Float  @default(0)
+  points  Float  @default(0)
+
+  @@id([guildId, userId, action])
+  @@map("stats")
+}
+
+model Cooldown {
+  guildId   String   @map("guild_id")
+  userId    String   @map("user_id")
+  action    String
+  expiresAt DateTime @map("expires_at")
+  notified  Boolean  @default(false)
+
+  @@id([guildId, userId, action])
+  @@map("cooldowns")
+}
+
+/// Fenêtre glissante de 7 jours sur les actions de braquage.
+model Braquage {
+  guildId   String   @map("guild_id")
+  id        Int      @id @default(autoincrement())
+  userId    String   @map("user_id")
+  action    String
+  timestamp DateTime @default(now())
+
+  @@index([guildId, action, timestamp])
+  @@map("braquages")
+}
+
+model Taxe {
+  guildId    String   @map("guild_id")
+  id         Int      @id @default(autoincrement())
+  nom        String
+  /// Type fixe ('sporex', 'heroine', 'vente', 'fertilisant') OU, pour une
+  /// taxe de zone, le nom exact de la zone (ex. 'Roxwood Village') — le
+  /// regroupement par zone se fait uniquement via ce champ, pas de colonne
+  /// séparée. Voir ZONES dans src/modules/taxes.ts.
+  type       String
+  telephone  String?
+  echeance   DateTime
+  motDePasse String?  @map("mot_de_passe")
+  actif      Boolean  @default(true)
+  alerteSent Boolean  @default(false) @map("alerte_sent")
+  paye       Boolean  @default(true)
+
+  @@index([guildId, actif])
+  @@map("taxes")
+}
+
+model Arme {
+  guildId   String  @map("guild_id")
+  id        Int     @id @default(autoincrement())
+  nom       String
+  reference String
+  statut    String  @default("en_stock")
+  preteeA   String? @map("pretee_a")
+  type      String?
+
+  @@unique([guildId, reference])
+  @@map("armurerie")
+}
+
+model UserMapping {
+  guildId   String @map("guild_id")
+  gameName  String @map("game_name")
+  discordId String @map("discord_id")
+
+  @@id([guildId, gameName, discordId])
+  @@map("user_mapping")
+}
+
+model PendingSale {
+  guildId    String   @map("guild_id")
+  id         Int      @id @default(autoincrement())
+  joueur     String
+  discordId  String?  @map("discord_id")
+  item       String
+  quantite   Int
+  timestamp  DateTime @default(now())
+  statut     String   @default("en_attente")
+  montant    Int?
+  prixPochon Float?   @map("prix_pochon")
+  messageId  String?  @map("message_id")
+  channelId  String?  @map("channel_id")
+  confirmed  Boolean  @default(false)
+
+  @@index([guildId, statut])
+  @@map("pending_sales")
+}
+
+/// État courant de chaque véhicule : qui l'a sorti en dernier, du garage ou
+/// de la fourrière. Un rangement propre efface le responsable (discordId/
+/// joueur = null). Alimenté par modules/garages.ts depuis logs_garages.
+model Vehicule {
+  guildId   String   @map("guild_id")
+  plaque    String
+  modele    String?
+  discordId String?  @map("discord_id")
+  joueur    String?
+  timestamp DateTime @default(now())
+
+  @@id([guildId, plaque])
+  @@map("vehicules")
+}
+
+/// Historique des mises en fourrière facturées, imputées au dernier
+/// responsable connu du véhicule.
+model Fourriere {
+  guildId   String   @map("guild_id")
+  id        Int      @id @default(autoincrement())
+  discordId String?  @map("discord_id")
+  joueur    String
+  plaque    String
+  modele    String?
+  timestamp DateTime @default(now())
+
+  @@index([guildId, timestamp])
+  @@map("fourrieres")
+}
+
+/// Déclarations de vente de munitions (suivi indicatif — modules/armurerie.ts).
+model MunitionVente {
+  guildId         String   @map("guild_id")
+  id              Int      @id @default(autoincrement())
+  timestamp       DateTime @default(now())
+  vendeurId       String   @map("vendeur_id")
+  vendeurUsername String   @default("") @map("vendeur_username")
+  acheteurId      String   @map("acheteur_id")
+  quantite        Int
+  prix            Float
+
+  @@index([guildId, timestamp])
+  @@map("munitions_ventes")
+}

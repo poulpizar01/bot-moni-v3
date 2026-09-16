@@ -1,0 +1,41 @@
+{
+  "name": "bot-famille",
+  "version": "1.0.0",
+  "description": "Bot Discord générique pour organisation RP FiveM illégale — stocks, quotas, braquages, cooldowns, taxes, armurerie, ventes, fourrière, entièrement configurable depuis Discord",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "migrate-from-sqlite": "tsx scripts/migrate-from-sqlite.ts",
+    "seed-config": "tsx scripts/seed-config.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.20.0",
+    "cors": "^2.8.6",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20.16.11",
+    "@types/node-cron": "^3.0.11",
+    "better-sqlite3": "^11.5.0",
+    "prisma": "^5.20.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

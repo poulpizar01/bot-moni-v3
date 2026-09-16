@@ -1,0 +1,694 @@
+/**
+ * @file src/modules/armurerie.ts
+ * @description Gestion de l'inventaire d'armes de l'organisation (contexte RP FiveM).
+ *
+ * Chaque arme a un statut ('en_stock' | 'pretee' | 'perdue') et un `type`.
+ * Contrairement à items/activités/quotas, les types d'armes restent une
+ * liste fixe dans le code ({@link ARME_TYPES} ci-dessous, pas de `/config
+ * arme`) — le champ `type` stocké en base est la CLÉ du type, pas son
+ * libellé affiché.
+ *
+ * Un message permanent dans le salon `armurerie` expose : Ajouter, Perdu,
+ * Prêter, Rendu, Liste des Pertes, et — uniquement si le tier courant
+ * fabrique un type de munition (voir {@link getMunitionsFabricationType} :
+ * Petite Frappe → pistolet, Gang → SMG, aucun pour Indépendant/Organisation)
+ * — deux déclarations indicatives : Fabrication (plafond hebdomadaire fixe
+ * ci-dessous) et Vente (juste un total suivi, sans plafond) — Historique.
+ *
+ * Le stock réel de munitions affiché en tête de ce message vient de
+ * `/config item add` comme n'importe quel item de coffre — voir
+ * {@link MUNITIONS_STOCK_GROUP} pour l'associer au bon libellé de groupe.
+ */
+import {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  StringSelectMenuBuilder,
+  type Client,
+  type ButtonInteraction,
+  type StringSelectMenuInteraction,
+  type ModalSubmitInteraction,
+} from 'discord.js';
+import * as db from '../db';
+import * as configStore from '../config-store';
+import { replyAutoDelete, updateAutoDelete } from '../interaction-helpers';
+
+/**
+ * Types d'armes proposés à l'ajout — liste fixe (voir docstring de fichier).
+ * Chaque modèle est son propre type (pas de regroupement par catégorie
+ * d'arme) : c'est ce qui détermine le groupement par section dans l'embed
+ * armurerie (voir `buildArmurierieEmbed`). Plus de 25 entrées → l'ajout d'une
+ * arme passe par le pattern "modal de recherche avant select" (limite
+ * Discord de 25 options par menu, voir `handleButton`/`handleModal`).
+ */
+const ARME_TYPES: Array<{ key: string; label: string }> = [
+  // Armes de poing
+  { key: 'pistolet_artisanal', label: 'Pistolet artisanal' },
+  { key: 'sns', label: 'SNS' },
+  { key: 'sns_pico', label: 'SNS PICO' },
+  { key: 'colt', label: 'Colt' },
+  { key: 'p88', label: 'P88' },
+  { key: 'beretta', label: 'Beretta' },
+  { key: 'glock', label: 'Glock' },
+  { key: 'glock_17', label: 'Glock 17' },
+  { key: 'pistolet_en_ceramique', label: 'Pistolet en céramique' },
+  { key: 'calibre_50', label: 'Calibre 50' },
+  { key: 'berreta_mk2', label: 'Berreta (Pistolet MK2)' },
+  { key: 'pistolet_lourd', label: 'Pistolet Lourd' },
+  { key: 'revolver', label: 'Revolver' },
+  // Fusils à pompe
+  { key: 'fusil_a_canon_scie', label: 'Fusil à canon scié' },
+  { key: 'fusil_a_pompe', label: 'Fusil à pompe' },
+  { key: 'striker_12', label: 'Striker 12' },
+  { key: 'fusil_a_pompe_dassaut', label: "Fusil à pompe d'assaut" },
+  { key: 'fusil_a_double_canon', label: 'Fusil à double canon' },
+  // Armes automatiques
+  { key: 'mini_smg', label: 'Mini SMG' },
+  { key: 'micro_smg', label: 'Micro SMG' },
+  { key: 'tec9', label: 'TEC9' },
+  { key: 'mini_uzi_tactic', label: 'Mini Uzi Tactic' },
+  { key: 'mac_10', label: 'MAC-10' },
+  { key: 'mp5k', label: 'Mp5k' },
+  { key: 'mitraillette_tactique', label: 'Mitraillette Tactique' },
+  { key: 'vesper_9', label: 'Vesper 9' },
+  { key: 'vortex_smg', label: 'Vortex SMG' },
+  // Armes lourdes
+  { key: 'fusil_compact', label: 'Fusil compact' },
+  { key: 'ump_45', label: 'UMP 45' },
+  { key: 'sg552', label: 'SG552' },
+  { key: 'fusil_lourd', label: 'Fusil Lourd' },
+  { key: 'thompson', label: 'Thompson' },
+  { key: 'ak47', label: 'AK47' },
+  { key: 'ump_45_chr', label: 'UMP 45 CHR' },
+  { key: 'mk_priss', label: 'Mk Priss' },
+  { key: 'ar_7', label: 'AR 7' },
+];
+
+/** Plafond indicatif hebdomadaire de fabrication — valeur fixe, ne bouge jamais. La vente n'a volontairement aucun plafond (juste le total suivi, voir buildArmurierieEmbed). */
+const MUNITIONS_FABRICATION_QUOTA_HEBDO = 5000;
+
+/**
+ * Libellé de regroupement (`/config item add nom:"..." groupe:"Munition de
+ * pistolet"`) attendu pour le(s) item(s) qui représentent les munitions de
+ * pistolet dans les logs de coffre. Volontairement PAS un nom d'item exact
+ * (contrairement au piège n°1 du projet, voir docstring de fichier) : le
+ * `groupe` est choisi librement par l'admin, il n'a pas besoin de coïncider
+ * avec l'orthographe FiveM — ça permet aussi de regrouper plusieurs items
+ * (ex. plusieurs calibres, ou une boîte qui vaut plusieurs unités via son
+ * propre `multiplicateur` — voir {@link weightedStockSum}) sous un seul
+ * total ici.
+ *
+ * Exportée pour que `src/default-items.ts` pré-remplisse l'item "Munition de
+ * pistolet" avec exactement ce groupe au premier démarrage — sans ce lien,
+ * un admin qui ne devine pas cette constante voit silencieusement "0 balles
+ * en stock" sans jamais comprendre pourquoi (voir discussion CLAUDE.md).
+ */
+export const MUNITIONS_STOCK_GROUP = 'Munition de pistolet';
+
+/**
+ * Somme pondérée du stock d'une liste d'items, à partir d'un stock déjà
+ * chargé en mémoire (clé = nom en minuscules) : chaque item compte pour
+ * `ItemConfig.stockMultiplier` unités de base (`/config item add ...
+ * multiplicateur:`, ex. 24 pour "Boîte mun. pistolet") plutôt que 1 pour 1 —
+ * lu directement sur l'item déjà résolu (`itemsByName`), jamais un second
+ * matching par nom séparé (contrairement au piège n°1, voir CLAUDE.md).
+ * Utilisée aussi bien pour ce total armurerie que pour les sections
+ * `STOCK_GROUPS` du Stock Général (voir `stocks.buildStockEmbed`).
+ */
+export function weightedStockSum(items: string[], stockByItem: Record<string, number>, itemsByName: Record<string, configStore.ItemConfig>): number {
+  return items.reduce((sum, item) => {
+    const lower = item.toLowerCase();
+    const multiplier = itemsByName[item]?.stockMultiplier ?? 1;
+    return sum + (stockByItem[lower] || 0) * multiplier;
+  }, 0);
+}
+
+/** Stock total (pondéré, voir {@link weightedStockSum}) des items regroupés sous {@link MUNITIONS_STOCK_GROUP} (0 si aucun item n'est configuré avec ce groupe). */
+async function getMunitionsStock(guildId: string): Promise<number> {
+  const c = configStore.get(guildId);
+  const items = c.STOCK_GROUPS[MUNITIONS_STOCK_GROUP] ?? [];
+  const stockByItem = await db.getStocksByItems(guildId, items);
+  return weightedStockSum(items, stockByItem, c.ITEMS_BY_NAME);
+}
+
+/** Nom exact de l'item de munitions SMG (voir piège n°1, docstring de `default-items.ts`) — contrairement à {@link MUNITIONS_STOCK_GROUP}, juste un stock affiché tel quel, sans regroupement pondéré (pas de "boîte" de SMG à ce jour). */
+export const MUNITIONS_SMG_ITEM = 'Munition de SMG';
+
+export type MunitionsFabricationType = 'pistolet' | 'smg';
+
+/**
+ * Type de munition dont la fabrication/vente est suivie (boutons dédiés +
+ * quota hebdomadaire), selon le tier — `null` si ce tier n'en fabrique
+ * aucune (voir demande utilisateur du 15/09 : Petite Frappe fabrique du
+ * pistolet, Gang du SMG, Indépendant/Organisation aucun des deux). Les
+ * compteurs hebdomadaires (`fabrication_munitions`/ventes) restent un total
+ * générique unique, réutilisé quel que soit le type actif : purement
+ * indicatif, un changement de tier en cours de semaine peut mélanger du
+ * pistolet et du SMG dans le même total, ce qui est acceptable ici.
+ */
+const MUNITIONS_FABRICATION_TIER: Record<configStore.GroupTier, MunitionsFabricationType | null> = {
+  independant: null,
+  petite_frappe: 'pistolet',
+  gang: 'smg',
+  organisation: null,
+};
+
+/** Type de munition fabricable pour le tier courant de cette guilde, ou `null` (voir {@link MUNITIONS_FABRICATION_TIER}). */
+export function getMunitionsFabricationType(guildId: string): MunitionsFabricationType | null {
+  return MUNITIONS_FABRICATION_TIER[configStore.get(guildId).TYPE_GROUPE];
+}
+
+/** Libellé affiché pour un {@link MunitionsFabricationType} (titres de modal, confirmations). */
+function munitionsTypeLabel(type: MunitionsFabricationType): string {
+  return type === 'pistolet' ? 'Pistolet' : 'SMG';
+}
+
+/**
+ * Résumé munitions (stock réel + compteurs hebdomadaires indicatifs) —
+ * données brutes, pas d'embed. Exportée pour être réutilisée par l'API en
+ * lecture seule (voir src/api/routes/armurerie.ts) sans dupliquer cette
+ * logique : source unique pour le panneau Discord ET l'API. `fabricationType`
+ * indique à quel calibre `fabriqueesCetteSemaine`/`vendusCetteSemaine`/
+ * `fabricationQuotaHebdo` s'appliquent actuellement (voir
+ * {@link getMunitionsFabricationType}) — `null` si aucun pour ce tier.
+ */
+export async function getMunitionsSummary(guildId: string) {
+  const sinceReset = Number((await db.getSetting(guildId, 'last_weekly_reset')) || 0);
+  const [stock, fabriqueesCetteSemaine, vendusCetteSemaine, stockSmg] = await Promise.all([
+    getMunitionsStock(guildId),
+    db.getMunitionsFabriqueesDepuis(guildId, sinceReset),
+    db.getMunitionsVenduesDepuis(guildId, sinceReset),
+    db.getStock(guildId, MUNITIONS_SMG_ITEM),
+  ]);
+  return {
+    stock,
+    fabricationType: getMunitionsFabricationType(guildId),
+    fabriqueesCetteSemaine,
+    fabricationQuotaHebdo: MUNITIONS_FABRICATION_QUOTA_HEBDO,
+    vendusCetteSemaine,
+    stockSmg,
+  };
+}
+
+/** Fenêtre de rétention des ventes de munitions avant purge — juste indicatif (compteur hebdo + 15 dernières), rien ne justifie de garder plus, voir `deleteOldMunitionVentes` dans db.ts. */
+const MUNITION_VENTE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Cron quotidien : purge les ventes de munitions de plus de 30 jours, pour une guilde. */
+export async function purgeOldMunitionVentes(guildId: string): Promise<void> {
+  try {
+    const count = await db.deleteOldMunitionVentes(guildId, Date.now() - MUNITION_VENTE_RETENTION_MS);
+    if (count > 0) console.log(`[armurerie] Purge (${guildId}) : ${count} vente(s) de munitions de plus de 30 jours supprimée(s).`);
+  } catch (err) {
+    console.error(`[armurerie] purgeOldMunitionVentes(${guildId}):`, (err as Error).message);
+  }
+}
+
+// ─── STATUT LABELS ───────────────────────────────────────────────────────────
+
+/** Libellé affiché pour le statut d'une arme ('en_stock' | 'pretee' | 'perdue'). */
+function statutLabel(arme: { statut: string; preteeA?: string | null }): string {
+  switch (arme.statut) {
+    case 'en_stock': return '🟢 En Stock';
+    case 'pretee': return `🟡 Prêtée à ${arme.preteeA || '?'}`;
+    case 'perdue': return '🔴 Perdue';
+    default: return arme.statut;
+  }
+}
+
+// ─── TRI NATUREL ──────────────────────────────────────────────────────────────
+
+/** Tri numérique par segment (G2 avant G10) plutôt que lexicographique. */
+function comparerNomsNaturel(a: { nom: string }, b: { nom: string }): number {
+  const segsA = a.nom.match(/\d+|\D+/g) || [];
+  const segsB = b.nom.match(/\d+|\D+/g) || [];
+  const len = Math.max(segsA.length, segsB.length);
+
+  for (let i = 0; i < len; i++) {
+    const sa = segsA[i] || '';
+    const sb = segsB[i] || '';
+    const na = Number(sa);
+    const nb = Number(sb);
+
+    if (sa !== '' && sb !== '' && !isNaN(na) && !isNaN(nb)) {
+      if (na !== nb) return na - nb;
+    } else if (sa !== sb) {
+      return sa.localeCompare(sb);
+    }
+  }
+  return 0;
+}
+
+// ─── EMBED ARMURERIE ─────────────────────────────────────────────────────────
+
+type Arme = Awaited<ReturnType<typeof db.getAllArmes>>[number];
+
+/** Construit l'embed de l'armurerie : bloc munitions (stock + quotas indicatifs), puis les armes groupées par type (voir ARME_TYPES). */
+async function buildArmurierieEmbed(guildId: string, armes: Arme[]): Promise<EmbedBuilder> {
+  const embed = new EmbedBuilder().setTitle('🔫 Armurerie').setColor(0xFEE75C).setTimestamp().setFooter({ text: 'Mis à jour' });
+
+  const { stock, fabricationType, fabriqueesCetteSemaine, vendusCetteSemaine, stockSmg } = await getMunitionsSummary(guildId);
+  const quotaLines = (type: MunitionsFabricationType) => fabricationType === type
+    ? `\n🛠️ ${fabriqueesCetteSemaine} / ${MUNITIONS_FABRICATION_QUOTA_HEBDO} fabriquées cette semaine\n💰 ${vendusCetteSemaine} vendues cette semaine`
+    : '';
+  const blocs = [
+    `__Munition de pistolet__\n🧰 ${stock} balles en stock${quotaLines('pistolet')}`,
+    `__Munition de SMG__\n🧰 ${stockSmg} balles en stock${quotaLines('smg')}`,
+  ];
+
+  if (!armes.length) {
+    embed.setDescription(blocs.join('\n\n') + '\n\n*Aucune arme enregistrée*');
+    return embed;
+  }
+
+  const groupes = new Map<string, Arme[]>();
+  for (const t of ARME_TYPES) groupes.set(t.key, []);
+  const sansType: Arme[] = [];
+
+  for (const a of armes) {
+    if (a.type && groupes.has(a.type)) {
+      groupes.get(a.type)!.push(a);
+    } else {
+      sansType.push(a);
+    }
+  }
+
+  const ligneArme = (a: Arme) => `**${a.nom}** \`${a.reference}\` — ${statutLabel(a)}`;
+
+  for (const t of ARME_TYPES) {
+    const liste = groupes.get(t.key)!;
+    if (!liste.length) continue;
+    liste.sort(comparerNomsNaturel);
+    blocs.push(`__${t.label}__\n${liste.map(ligneArme).join('\n')}`);
+  }
+  if (sansType.length) {
+    sansType.sort(comparerNomsNaturel);
+    blocs.push(`__Sans type__\n${sansType.map(ligneArme).join('\n')}`);
+  }
+
+  embed.setDescription(blocs.join('\n\n'));
+  return embed;
+}
+
+// ─── BOUTONS PRINCIPAUX ───────────────────────────────────────────────────────
+
+/**
+ * Construit les rangées de boutons du message permanent (actions armes, puis
+ * munitions) — la rangée munitions (Fabrication/Vente/Historique) n'est
+ * ajoutée que si le tier courant fabrique un type de munition (voir
+ * {@link getMunitionsFabricationType}) : absente pour Indépendant/Organisation.
+ */
+function buildArmurierieButtons(guildId: string): ActionRowBuilder<ButtonBuilder>[] {
+  const rows = [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId('arm_ajouter').setLabel('Ajouter').setStyle(ButtonStyle.Success).setEmoji('➕'),
+      new ButtonBuilder().setCustomId('arm_retirer').setLabel('Perdu').setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
+      new ButtonBuilder().setCustomId('arm_preter').setLabel('Prêter').setStyle(ButtonStyle.Primary).setEmoji('🤝'),
+      new ButtonBuilder().setCustomId('arm_rendu').setLabel('Rendu').setStyle(ButtonStyle.Success).setEmoji('✅'),
+      new ButtonBuilder().setCustomId('arm_pertes').setLabel('Liste des Pertes').setStyle(ButtonStyle.Secondary).setEmoji('📋'),
+    ),
+  ];
+  if (getMunitionsFabricationType(guildId)) {
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId('arm_fabrication').setLabel('Fabrication').setStyle(ButtonStyle.Secondary).setEmoji('🛠️'),
+      new ButtonBuilder().setCustomId('arm_vente_munitions').setLabel('Vente').setStyle(ButtonStyle.Secondary).setEmoji('💰'),
+      new ButtonBuilder().setCustomId('arm_historique_munitions').setLabel('Historique').setStyle(ButtonStyle.Secondary).setEmoji('📜'),
+    ));
+  }
+  return rows;
+}
+
+// ─── MESSAGE PERMANENT ────────────────────────────────────────────────────────
+
+/** Édite le message permanent de l'armurerie (ou le crée s'il n'existe pas encore/plus). */
+export async function updatePermanentMessage(client: Client, guildId: string): Promise<void> {
+  const channelId = configStore.get(guildId).CHANNELS.armurerie;
+  if (!channelId) return;
+  try {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isSendable()) return;
+
+    const armes = (await db.getAllArmes(guildId)).filter(a => a.statut !== 'perdue');
+    const embed = await buildArmurierieEmbed(guildId, armes);
+    const rows = buildArmurierieButtons(guildId);
+
+    const storedId = await db.getSetting(guildId, 'armurerie_message_id');
+    if (storedId) {
+      const msg = await channel.messages.fetch(storedId).catch(() => null);
+      if (msg) { await msg.edit({ embeds: [embed], components: rows }); return; }
+    }
+
+    const newMsg = await channel.send({ embeds: [embed], components: rows });
+    await db.setSetting(guildId, 'armurerie_message_id', newMsg.id);
+  } catch (err) {
+    console.error(`[armurerie] updatePermanentMessage(${guildId}):`, (err as Error).message);
+  }
+}
+
+/** Initialise le message permanent de l'armurerie au démarrage du bot. */
+export async function initPermanentMessage(client: Client, guildId: string): Promise<void> {
+  await updatePermanentMessage(client, guildId);
+}
+
+// ─── HANDLER BOUTONS ─────────────────────────────────────────────────────────
+
+/** Route les clics de bouton du message permanent (`arm_*`) vers le modal de recherche/saisie approprié. */
+export async function handleButton(interaction: ButtonInteraction): Promise<void> {
+  const id = interaction.customId;
+  const guildId = interaction.guildId!;
+
+  if (id === 'arm_ajouter') {
+    if (!ARME_TYPES.length) {
+      return replyAutoDelete(interaction, "❌ Aucun type d'arme défini dans le code (ARME_TYPES est vide dans src/modules/armurerie.ts).");
+    }
+    const modal = new ModalBuilder()
+      .setCustomId('modal_arm_recherche_ajouter')
+      .setTitle("Ajouter une arme")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('recherche').setLabel('Modèle (vide = tout afficher)')
+            .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(50),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_retirer' || id === 'arm_preter' || id === 'arm_rendu') {
+    const action = id.replace('arm_', '');
+    const titres: Record<string, string> = { retirer: 'Retirer une arme', preter: 'Prêter une arme', rendu: 'Marquer une arme comme rendue' };
+
+    const modal = new ModalBuilder()
+      .setCustomId(`modal_arm_recherche_${action}`)
+      .setTitle(titres[action])
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('recherche').setLabel('Nom ou référence (vide = tout afficher)')
+            .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(50),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_fabrication') {
+    const type = getMunitionsFabricationType(guildId);
+    // Garde-fou : bouton normalement absent pour ce tier (voir
+    // buildArmurierieButtons), au cas où un message pas encore rafraîchi
+    // depuis un changement de tier serait encore cliqué.
+    if (!type) return replyAutoDelete(interaction, "❌ Aucune fabrication de munitions pour ce type d'organisation.");
+    const modal = new ModalBuilder()
+      .setCustomId('modal_arm_fabrication')
+      .setTitle(`Fabrication de munitions (${munitionsTypeLabel(type)})`)
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('quantite').setLabel('Nombre de munitions fabriquées')
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(6),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_vente_munitions') {
+    const type = getMunitionsFabricationType(guildId);
+    if (!type) return replyAutoDelete(interaction, "❌ Aucune fabrication de munitions pour ce type d'organisation.");
+    const modal = new ModalBuilder()
+      .setCustomId('modal_arm_vente_munitions')
+      .setTitle(`Vente de munitions (${munitionsTypeLabel(type)})`)
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('quantite').setLabel('Nombre de munitions vendues')
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(6),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('acheteur_id').setLabel("ID unique de l'acheteur")
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(50),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('prix').setLabel('Prix total ($)')
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_pertes') {
+    const pertes = await db.getArmesPerdue(guildId);
+    const embed = new EmbedBuilder()
+      .setTitle('📋 Armes perdues')
+      .setColor(0xED4245)
+      .setDescription(pertes.length ? pertes.map(a => `**${a.nom}** \`${a.reference}\``).join('\n') : '*Aucune arme perdue*');
+    return replyAutoDelete(interaction, { embeds: [embed] });
+  }
+
+  if (id === 'arm_historique_munitions') {
+    const formatDate = (ts: number) => new Date(ts).toLocaleDateString('fr-FR', { timeZone: 'Europe/Paris' });
+
+    const fabrications = await db.getFabricationMunitionsHistorique(guildId, 15);
+    const ventes = await db.getMunitionsVentesHistorique(guildId, 15);
+
+    const blocFab = fabrications.length ? fabrications.map(f => `${formatDate(f.timestamp)} — **${f.quantite}** munitions`).join('\n') : '*Aucune déclaration*';
+    const blocVente = ventes.length ? ventes.map(v => `${formatDate(v.timestamp)} — **${v.quantite}** munitions à \`${v.acheteur_id}\` pour **${v.prix}$**`).join('\n') : '*Aucune déclaration*';
+
+    const embed = new EmbedBuilder()
+      .setTitle('📜 Historique munitions')
+      .setColor(0x5865F2)
+      .addFields(
+        { name: '🛠️ Fabrication (15 dernières)', value: blocFab },
+        { name: '💰 Vente (15 dernières)', value: blocVente },
+      );
+    return replyAutoDelete(interaction, { embeds: [embed] });
+  }
+}
+
+// ─── HANDLER SELECT MENUS ─────────────────────────────────────────────────────
+
+/** Route les sélections de menu (`arm_select_*`) : choix du type à l'ajout, ou de l'arme visée par retirer/prêter/rendu. */
+export async function handleSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  const id = interaction.customId;
+  const guildId = interaction.guildId!;
+
+  if (id === 'arm_select_ajouter_type') {
+    const typeKey = interaction.values[0];
+    const type = ARME_TYPES.find(t => t.key === typeKey);
+    if (!type) return updateAutoDelete(interaction, { content: '❌ Type invalide.', components: [] });
+
+    const modal = new ModalBuilder()
+      .setCustomId(`modal_arm_ajouter_${typeKey}`)
+      .setTitle(`Ajouter : ${type.label}`.slice(0, 45))
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('nom').setLabel("Nom de l'arme").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(50),
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('reference').setLabel('Référence (unique)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_select_retirer') {
+    const armeId = parseInt(interaction.values[0], 10);
+    const arme = await db.getArme(guildId, armeId);
+    if (!arme) return updateAutoDelete(interaction, { content: '❌ Arme introuvable.', components: [] });
+    await db.updateArmeStatut(guildId, armeId, 'perdue', null);
+    await updateAutoDelete(interaction, { content: `🔴 **${arme.nom}** (\`${arme.reference}\`) marquée comme **perdue**.`, components: [] });
+    await updatePermanentMessage(interaction.client, guildId);
+    return;
+  }
+
+  if (id === 'arm_select_preter') {
+    const armeId = interaction.values[0];
+    const arme = await db.getArme(guildId, parseInt(armeId, 10));
+    if (!arme) return updateAutoDelete(interaction, { content: '❌ Arme introuvable.', components: [] });
+
+    const modal = new ModalBuilder()
+      .setCustomId(`modal_arm_preter_${armeId}`)
+      .setTitle(`Prêter : ${arme.nom}`.slice(0, 45))
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder().setCustomId('pretee_a').setLabel('Nom de la personne').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(50),
+        ),
+      );
+    return interaction.showModal(modal);
+  }
+
+  if (id === 'arm_select_rendu') {
+    const armeId = parseInt(interaction.values[0], 10);
+    const arme = await db.getArme(guildId, armeId);
+    if (!arme) return updateAutoDelete(interaction, { content: '❌ Arme introuvable.', components: [] });
+    await db.updateArmeStatut(guildId, armeId, 'en_stock', null);
+    await updateAutoDelete(interaction, { content: `✅ **${arme.nom}** (\`${arme.reference}\`) rendue par **${arme.preteeA || '?'}** — remise en stock.`, components: [] });
+    await updatePermanentMessage(interaction.client, guildId);
+  }
+}
+
+// ─── HANDLER MODALS ───────────────────────────────────────────────────────────
+
+interface RechercheConfig {
+  armes: Arme[];
+  selectId: string;
+  placeholder: string;
+  content: string;
+  noneMsg: string;
+  description: ((a: Arme) => string) | null;
+}
+
+/** Route les soumissions de modal (`modal_arm_*`) : recherche, ajout, prêt, fabrication/vente de munitions. */
+export async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const id = interaction.customId;
+  const guildId = interaction.guildId!;
+
+  if (id === 'modal_arm_recherche_ajouter') {
+    const query = interaction.fields.getTextInputValue('recherche').trim().toLowerCase();
+    const filtered = query ? ARME_TYPES.filter(t => t.label.toLowerCase().includes(query)) : ARME_TYPES;
+
+    if (!filtered.length) return replyAutoDelete(interaction, `❌ Aucun type d'arme ne correspond à « ${query} ».`);
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId('arm_select_ajouter_type')
+      .setPlaceholder("Quel type d'arme ?")
+      .addOptions(filtered.slice(0, 25).map(t => ({ label: t.label, value: t.key })));
+
+    const baseMsg = "➕ Quel type d'arme veux-tu ajouter ?";
+    const content = filtered.length > 25
+      ? `⚠️ ${filtered.length} résultats, seuls les 25 premiers sont affichés — affine ta recherche.\n${baseMsg}`
+      : baseMsg;
+
+    return replyAutoDelete(interaction, {
+      content,
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+    }, { deleteAfterMs: 60_000 });
+  }
+
+  if (id.startsWith('modal_arm_recherche_')) {
+    const action = id.replace('modal_arm_recherche_', '');
+    const query = interaction.fields.getTextInputValue('recherche').trim().toLowerCase();
+
+    const configs: Record<string, RechercheConfig> = {
+      retirer: {
+        armes: await db.getAllArmes(guildId),
+        selectId: 'arm_select_retirer',
+        placeholder: 'Choisir une arme à retirer…',
+        content: '🗑️ Quelle arme supprimer ?',
+        noneMsg: '❌ Aucune arme en stock.',
+        description: (a) => statutLabel(a),
+      },
+      preter: {
+        armes: (await db.getAllArmes(guildId)).filter(a => a.statut === 'en_stock'),
+        selectId: 'arm_select_preter',
+        placeholder: 'Choisir une arme à prêter…',
+        content: '🤝 Quelle arme prêter ?',
+        noneMsg: '❌ Aucune arme disponible à prêter.',
+        description: null,
+      },
+      rendu: {
+        armes: (await db.getAllArmes(guildId)).filter(a => a.statut === 'pretee'),
+        selectId: 'arm_select_rendu',
+        placeholder: 'Quelle arme a été rendue ?',
+        content: "✅ Sélectionne l'arme rendue :",
+        noneMsg: '❌ Aucune arme actuellement prêtée.',
+        description: (a) => `Prêtée à ${a.preteeA || '?'}`,
+      },
+    };
+    const cfg = configs[action];
+    if (!cfg) return;
+
+    if (!cfg.armes.length) return replyAutoDelete(interaction, cfg.noneMsg);
+
+    const filtered = query
+      ? cfg.armes.filter(a => a.nom.toLowerCase().includes(query) || a.reference.toLowerCase().includes(query))
+      : cfg.armes;
+
+    if (!filtered.length) return replyAutoDelete(interaction, `❌ Aucune arme ne correspond à « ${query} ».`);
+
+    const options = filtered.slice(0, 25).map(a => ({
+      label: `${a.nom} (${a.reference})`,
+      ...(cfg.description ? { description: cfg.description(a) } : {}),
+      value: String(a.id),
+    }));
+
+    const select = new StringSelectMenuBuilder().setCustomId(cfg.selectId).setPlaceholder(cfg.placeholder).addOptions(options);
+
+    const content = filtered.length > 25
+      ? `⚠️ ${filtered.length} résultats, seuls les 25 premiers sont affichés — affine ta recherche.\n${cfg.content}`
+      : cfg.content;
+
+    return replyAutoDelete(interaction, {
+      content,
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+    }, { deleteAfterMs: 60_000 });
+  }
+
+  if (id.startsWith('modal_arm_ajouter_')) {
+    const typeKey = id.replace('modal_arm_ajouter_', '');
+    const type = ARME_TYPES.find(t => t.key === typeKey);
+    const nom = interaction.fields.getTextInputValue('nom').trim();
+    const reference = interaction.fields.getTextInputValue('reference').trim().toUpperCase();
+
+    if (!type) return replyAutoDelete(interaction, '❌ Type invalide.');
+
+    try {
+      await db.addArme(guildId, nom, reference, type.key);
+    } catch {
+      return replyAutoDelete(interaction, '❌ Cette référence existe déjà.');
+    }
+
+    await replyAutoDelete(interaction, `✅ **${nom}** (\`${reference}\`) — ${type.label} — ajoutée à l'armurerie.`);
+    await updatePermanentMessage(interaction.client, guildId);
+    return;
+  }
+
+  if (id.startsWith('modal_arm_preter_')) {
+    const armeId = parseInt(id.replace('modal_arm_preter_', ''), 10);
+    const arme = await db.getArme(guildId, armeId);
+    const preteaA = interaction.fields.getTextInputValue('pretee_a').trim();
+
+    if (!arme) return replyAutoDelete(interaction, '❌ Arme introuvable.');
+
+    await db.updateArmeStatut(guildId, armeId, 'pretee', preteaA);
+    await replyAutoDelete(interaction, `✅ **${arme.nom}** marquée comme prêtée à **${preteaA}**.`);
+    await updatePermanentMessage(interaction.client, guildId);
+    return;
+  }
+
+  if (id === 'modal_arm_fabrication') {
+    const quantite = parseInt(interaction.fields.getTextInputValue('quantite').trim(), 10);
+    if (!Number.isInteger(quantite) || quantite <= 0) return replyAutoDelete(interaction, '❌ Quantité invalide.');
+
+    await db.addTransaction(guildId, {
+      user_id: interaction.user.id,
+      username: interaction.member && 'displayName' in interaction.member ? interaction.member.displayName : interaction.user.username,
+      action: 'fabrication_munitions',
+      quantite,
+    });
+
+    const fabType = getMunitionsFabricationType(guildId);
+    await replyAutoDelete(interaction, `🛠️ **${quantite}** munitions${fabType ? ` (${munitionsTypeLabel(fabType)})` : ''} déclarées fabriquées.`);
+    await updatePermanentMessage(interaction.client, guildId);
+    return;
+  }
+
+  if (id === 'modal_arm_vente_munitions') {
+    const quantite = parseInt(interaction.fields.getTextInputValue('quantite').trim(), 10);
+    const acheteurId = interaction.fields.getTextInputValue('acheteur_id').trim();
+    const prix = parseFloat(interaction.fields.getTextInputValue('prix').trim().replace(',', '.'));
+
+    if (!Number.isInteger(quantite) || quantite <= 0) return replyAutoDelete(interaction, '❌ Quantité invalide.');
+    if (!acheteurId) return replyAutoDelete(interaction, '❌ ID acheteur manquant.');
+    if (!Number.isFinite(prix) || prix < 0) return replyAutoDelete(interaction, '❌ Prix invalide.');
+
+    await db.addMunitionVente(guildId, {
+      vendeur_id: interaction.user.id,
+      vendeur_username: interaction.member && 'displayName' in interaction.member ? interaction.member.displayName : interaction.user.username,
+      acheteur_id: acheteurId,
+      quantite,
+      prix,
+    });
+
+    const venteType = getMunitionsFabricationType(guildId);
+    await replyAutoDelete(interaction, `💰 **${quantite}** munitions${venteType ? ` (${munitionsTypeLabel(venteType)})` : ''} vendues à \`${acheteurId}\` pour **${prix}$**.`);
+    await updatePermanentMessage(interaction.client, guildId);
+  }
+}

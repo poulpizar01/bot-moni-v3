@@ -12,6 +12,12 @@
  * la clé d'UNE zone précise (ex. `roxwood_village` — voir
  * `/config channel list` côté Discord, ou `/api/taxes?type=zone` pour lister
  * les zones existantes, n'a pas besoin d'être connue à l'avance).
+ *
+ * Ordre des routes : `/` puis `/search`, `/:id` toujours en dernier (même
+ * convention que les autres groupes de l'API). `/` et `/search` renvoient
+ * les infos générales d'une taxe (vue "liste") — `telephone`/`mot_de_passe`
+ * sont réservés au détail d'UNE taxe précise (`/:id`, voir `db.getTaxe` vs
+ * `db.findTaxes`), pas affichés dans une liste.
  */
 import { Router } from 'express';
 import * as db from '../../db';
@@ -79,6 +85,27 @@ router.get('/search', async (req, res) => {
 
   const query = typeof req.query.q === 'string' ? req.query.q : undefined;
   res.json(await db.findTaxes(req.apiUser!.guildId, { types, query, limit: 25 }));
+});
+
+/**
+ * GET /api/taxes/:id — détail complet d'une taxe précise, y compris
+ * téléphone/mot de passe (absents de `/` et `/search`, voir docstring de
+ * fichier). 404 si absente (une taxe expirée mais pas encore
+ * supprimée/renouvelée reste consultable ici, contrairement au filtre par
+ * défaut de `/`). Toujours en dernier : paramètre dynamique du groupe.
+ */
+router.get('/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'id invalide' });
+    return;
+  }
+  const taxe = await db.getTaxe(req.apiUser!.guildId, id);
+  if (!taxe) {
+    res.status(404).json({ error: 'Taxe introuvable' });
+    return;
+  }
+  res.json(taxe);
 });
 
 export default router;

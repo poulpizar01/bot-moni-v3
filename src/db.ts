@@ -818,6 +818,12 @@ function mapTaxe<T extends { echeance: Date }>(t: T) {
   return { ...t, echeance: toMs(t.echeance) };
 }
 
+/** Comme `mapTaxe`, mais sans `telephone`/`motDePasse` — pour les vues "liste" (`GET /api/taxes`, `/search`), qui ne montrent que les infos générales. Le détail complet (avec ces deux champs) reste réservé à `GET /api/taxes/:id` (voir `getTaxe`). */
+function mapTaxeSummary<T extends { echeance: Date; telephone: string | null; motDePasse: string | null }>(t: T) {
+  const { telephone, motDePasse, ...rest } = mapTaxe(t);
+  return rest;
+}
+
 /** Crée une taxe et retourne son ID. */
 export async function addTaxe(guildId: string, data: TaxeInput): Promise<number> {
   const row = await prisma.taxe.create({
@@ -904,7 +910,7 @@ export async function findTaxes(guildId: string, opts: FindTaxesOptions = {}) {
     orderBy: { echeance: 'asc' },
     take: opts.limit,
   });
-  return rows.map(mapTaxe);
+  return rows.map(mapTaxeSummary);
 }
 
 /** Ajoute `days` jours à l'échéance d'une taxe (au moins depuis maintenant) et retourne la nouvelle échéance, ou `null` si introuvable. */

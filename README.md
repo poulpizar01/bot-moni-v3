@@ -49,8 +49,8 @@ Contrairement à un bot figé pour un serveur précis, **toute la structure mét
 ## Installation
 
 ```bash
-git clone https://github.com/poulpizar01/roxwood-network-famille.git
-cd roxwood-network-famille
+git clone https://github.com/poulpizar01/bot-moni-v3.git
+cd bot-moni-v3
 
 npm install
 
@@ -67,29 +67,29 @@ npm start
 `DATABASE_URL` pointe vers un PostgreSQL déjà accessible : un service hébergé (Supabase, Neon, Railway, RDS…), ou une instance locale sur le VPS lui-même — sur une base Debian/Ubuntu fraîche, par exemple :
 ```bash
 sudo apt install -y postgresql
-sudo -u postgres psql -c "CREATE USER roxwood_network_famille WITH PASSWORD 'change_me';"
-sudo -u postgres psql -c "CREATE DATABASE roxwood_network_famille OWNER roxwood_network_famille;"
-# DATABASE_URL=postgresql://roxwood_network_famille:change_me@localhost:5432/roxwood_network_famille
+sudo -u postgres psql -c "CREATE USER bot_moni_v3 WITH PASSWORD 'change_me';"
+sudo -u postgres psql -c "CREATE DATABASE bot_moni_v3 OWNER bot_moni_v3;"
+# DATABASE_URL=postgresql://bot_moni_v3:change_me@localhost:5432/bot_moni_v3
 ```
 
 En développement : `npm run dev` (tsx, rechargement à chaud, pas de build).
 
 ### Via systemd (production, sans Docker)
 
-Un modèle de service est fourni dans `deploy/roxwood-network-famille.service` — à adapter (chemins, utilisateur système) puis installer :
+Un modèle de service est fourni dans `deploy/bot-moni-v3.service` — à adapter (chemins, utilisateur système) puis installer :
 ```bash
-sudo cp deploy/roxwood-network-famille.service /etc/systemd/system/
-sudo nano /etc/systemd/system/roxwood-network-famille.service   # remplacer les champs REMPLACER_...
+sudo cp deploy/bot-moni-v3.service /etc/systemd/system/
+sudo nano /etc/systemd/system/bot-moni-v3.service   # remplacer les champs REMPLACER_...
 sudo systemctl daemon-reload
-sudo systemctl enable --now roxwood-network-famille.service
+sudo systemctl enable --now bot-moni-v3.service
 ```
 
 Ensuite, pour piloter le service :
 ```bash
-sudo systemctl restart roxwood-network-famille.service
-sudo journalctl -u roxwood-network-famille.service -n 50 --no-pager
+sudo systemctl restart bot-moni-v3.service
+sudo journalctl -u bot-moni-v3.service -n 50 --no-pager
 ```
-Après toute mise à jour du code : `git pull && npm install && npx prisma migrate deploy && npm run build` (toujours vérifier `npx tsc --noEmit` avant, pour attraper une erreur sans faire planter le service en cours) puis `sudo systemctl restart roxwood-network-famille.service`.
+Après toute mise à jour du code : `git pull && npm install && npx prisma migrate deploy && npm run build` (toujours vérifier `npx tsc --noEmit` avant, pour attraper une erreur sans faire planter le service en cours) puis `sudo systemctl restart bot-moni-v3.service`.
 
 ### Via Docker
 
@@ -101,11 +101,11 @@ cp .env.example .env
 # (DATABASE_URL est recalculé par docker-compose pour pointer vers le service "db" — inutile de l'éditer)
 
 docker compose up -d --build
-docker compose logs -f roxwood-network-famille
+docker compose logs -f bot-moni-v3
 ```
 Mise à jour après un `git pull` : `docker compose up -d --build`. Le port `5432` du service `db` est publié sur l'hôte par défaut (pratique pour `prisma studio`/`psql` en local) — à retirer ou restreindre par pare-feu sur un déploiement exposé publiquement.
 
-Les deux services ont une rotation de logs (`max-size: 10m`, `max-file: 3` — sinon le driver `json-file` par défaut grossit indéfiniment sur le disque de l'hôte) ; le service `roxwood-network-famille` a en plus une limite mémoire (`mem_limit: 512m`, large pour un bot Discord + petite API — à ajuster si `docker stats` montre un dépassement). Nommé ainsi (pas juste `bot`) pour rester identifiable sans ambiguïté si un second bot tourne sur le même hôte.
+Les deux services ont une rotation de logs (`max-size: 10m`, `max-file: 3` — sinon le driver `json-file` par défaut grossit indéfiniment sur le disque de l'hôte) ; le service `bot-moni-v3` a en plus une limite mémoire (`mem_limit: 512m`, large pour un bot Discord + petite API — à ajuster si `docker stats` montre un dépassement). Nommé ainsi (pas juste `bot`) pour rester identifiable sans ambiguïté si un second bot tourne sur le même hôte.
 
 Si `docker compose build` échoue avec `invalid file request` (observé sur Windows + OneDrive avec BuildKit sur ce projet), désactiver BuildKit pour ce build : `set DOCKER_BUILDKIT=0 && docker compose build` (PowerShell : `$env:DOCKER_BUILDKIT=0`).
 
@@ -308,7 +308,7 @@ Tables métier (génériques) : `stocks` (total global), `coffre_stocks` (détai
 ## Structure des fichiers
 
 ```
-roxwood-network-famille/
+bot-moni-v3/
 ├── src/
 │   ├── index.ts               # Point d'entrée, client Discord, routage, cron jobs
 │   ├── config-store.ts        # Cache de config en mémoire PAR GUILDE, rechargé par /config
@@ -337,7 +337,7 @@ roxwood-network-famille/
 ├── scripts/
 │   └── backfill-guild-id.ts    # One-off migration multi-tenant (voir historique du projet)
 ├── deploy/
-│   └── roxwood-network-famille.service  # Modèle de service systemd (voir "Via systemd")
+│   └── bot-moni-v3.service  # Modèle de service systemd (voir "Via systemd")
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-entrypoint.sh        # Applique les migrations puis démarre le bot (voir "Via Docker")

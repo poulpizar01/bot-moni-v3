@@ -1,13 +1,13 @@
-name: roxwood-network-famille
+name: bot-moni-v3
 
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-roxwood_network_famille}
+      POSTGRES_USER: ${POSTGRES_USER:-bot_moni_v3}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definir POSTGRES_PASSWORD dans .env}
-      POSTGRES_DB: ${POSTGRES_DB:-roxwood_network_famille}
+      POSTGRES_DB: ${POSTGRES_DB:-bot_moni_v3}
     volumes:
       - db_data:/var/lib/postgresql/data
     # Expose sur l'hote pour un acces direct (prisma studio, psql...) — a
@@ -16,7 +16,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-roxwood_network_famille} -d ${POSTGRES_DB:-roxwood_network_famille}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot_moni_v3} -d ${POSTGRES_DB:-bot_moni_v3}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -28,7 +28,7 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
-  roxwood-network-famille:
+  bot-moni-v3:
     build: .
     restart: unless-stopped
     depends_on:
@@ -40,7 +40,7 @@ services:
       # Ecrase le DATABASE_URL de .env (pense pour un Postgres hors conteneur,
       # via localhost) : a l'interieur du reseau docker-compose, la base est
       # joignable via le nom de service `db`, pas `localhost`.
-      DATABASE_URL: postgresql://${POSTGRES_USER:-roxwood_network_famille}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-roxwood_network_famille}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bot_moni_v3}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-bot_moni_v3}
     # API REST optionnelle (voir README, section Interoperabilite) : n'ecoute
     # que si API_PORT est defini dans .env, mais le port est toujours publie
     # ici (inoffensif si l'API est desactivee — rien n'ecoute dessus alors).
@@ -49,7 +49,7 @@ services:
     # Sans limite, une fuite memoire (ou un pic de charge inhabituel) ferait
     # tomber tout l'hote au lieu du seul conteneur. 512m est large pour un
     # bot Discord + petite API — a ajuster si des logs de crash memoire
-    # apparaissent (`docker compose logs roxwood-network-famille` / `docker stats`).
+    # apparaissent (`docker compose logs bot-moni-v3` / `docker stats`).
     mem_limit: 512m
     logging:
       driver: json-file

@@ -145,7 +145,12 @@ export async function upsertItem(guildId: string, data: ItemInput): Promise<void
       // jamais écraser silencieusement un groupe déjà posé sur cet item.
       ...(data.stock_group !== undefined ? { stockGroup: data.stock_group } : {}),
       vente: !!data.vente,
-      displayOrder: data.display_order ?? 0,
+      // Comme stock_group juste au-dessus : `undefined` ne touche pas la
+      // valeur existante. `/config item add` n'expose pas cette option —
+      // sans ce garde-fou, chaque appel sur un item déjà configuré (ex. pour
+      // changer un simple flag) réinitialiserait silencieusement l'ordre
+      // posé par `default-items.ts` ou une correction manuelle.
+      ...(data.display_order !== undefined ? { displayOrder: data.display_order } : {}),
       visibleStock: data.visible_stock !== false,
       laboLie: data.labo_lie ?? null,
       laboLieRole: data.labo_lie ? (data.labo_lie_role ?? 'produit') : null,
@@ -161,7 +166,7 @@ export async function deleteItem(guildId: string, name: string): Promise<void> {
 
 /** Tous les items suivis d'une guilde, triés par ordre d'affichage puis par nom. */
 export async function getAllItems(guildId: string) {
-  return prisma.item.findMany({ where: { guildId }, orderBy: [{ displayOrder: 'asc' }, { name: 'asc' }] });
+  return prisma.item.findMany({ where: { guildId }, orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }] });
 }
 
 // ─── QUOTA TARGETS (config) ──────────────────────────────────────────────────

@@ -25,20 +25,28 @@ import * as configStore from './config-store';
 import { MUNITIONS_STOCK_GROUP, MUNITIONS_SMG_ITEM } from './modules/armurerie';
 import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 
+// `display_order` négatif : garantit que les 5 items par défaut restent
+// TOUJOURS en tête du Stock Général, quel que soit l'ordre d'insertion réel
+// ou de futurs items ajoutés via `/config item add` (qui n'expose pas cette
+// option et retombe donc sur le défaut 0, donc toujours après). Valeurs
+// posées ici explicitement plutôt que déduites de l'ordre du tableau —
+// db.upsertItem ne touche jamais cette valeur pour un item déjà existant si
+// `display_order` n'est pas fourni (voir docstring de `upsertItem`), donc un
+// futur /config item add sur l'un de ces 5 items ne peut pas la réinitialiser.
 const DEFAULT_ITEMS: db.ItemInput[] = [
-  { name: 'Munition de pistolet', stock_group: MUNITIONS_STOCK_GROUP },
-  // Vaut 24x "Munition de pistolet" (stock_multiplier) — même groupe, comptée
-  // en conséquence dans le total munitions pondéré (voir armurerie.weightedStockSum).
-  { name: 'Boîte mun. pistolet', stock_group: MUNITIONS_STOCK_GROUP, stock_multiplier: 24 },
   // CONFIRME_VENTE_ITEM (voir ventes.ts) — simple item de stock ici, son rôle
   // de confirmation de vente est fixe dans le code, pas un flag à poser.
-  { name: CONFIRME_VENTE_ITEM },
+  { name: CONFIRME_VENTE_ITEM, display_order: -5 },
   // Distinct de CONFIRME_VENTE_ITEM ("Argent Sale") : simple item de stock,
   // ne joue aucun rôle dans le cycle de vente.
-  { name: 'Argent' },
+  { name: 'Argent', display_order: -4 },
+  { name: 'Munition de pistolet', stock_group: MUNITIONS_STOCK_GROUP, display_order: -3 },
+  // Vaut 24x "Munition de pistolet" (stock_multiplier) — même groupe, comptée
+  // en conséquence dans le total munitions pondéré (voir armurerie.weightedStockSum).
+  { name: 'Boîte mun. pistolet', stock_group: MUNITIONS_STOCK_GROUP, stock_multiplier: 24, display_order: -2 },
   // Simple item de stock, sans groupe : affiché dans l'armurerie via
   // MUNITIONS_SMG_ITEM (stock brut uniquement, pas de quota fabrication/vente).
-  { name: MUNITIONS_SMG_ITEM },
+  { name: MUNITIONS_SMG_ITEM, display_order: -1 },
 ];
 
 /**

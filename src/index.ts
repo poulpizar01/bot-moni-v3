@@ -315,6 +315,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.commandName === 'set-stock') return await stocks.handleSetStockCommand(interaction);
       if (interaction.commandName === 'sync-stock') return await stocks.handleSyncStockCommand(interaction);
       if (interaction.commandName === 'drogues-a-vendre') return await stocks.handleDroguesAVendreCommand(interaction);
+      if (interaction.commandName === 'coffre-stock') return await stocks.handleCoffreStockCommand(interaction);
       if (interaction.commandName === 'adduser') return await ventes.handleAddUserCommand(interaction);
       if (interaction.commandName === 'removeuser') return await ventes.handleRemoveUserCommand(interaction);
       if (interaction.commandName === 'listusers') return await ventes.handleListUsersCommand(interaction);

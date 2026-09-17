@@ -7,15 +7,15 @@
 #   - ExecStart           : chemin absolu vers node (voir `which node`) — un
 #                           PATH utilisateur (ex. nvm) n'est pas résolu par systemd
 [Unit]
-Description=Bot Famille — roxwood-network-famille (bot Discord RP FiveM)
+Description=Bot Famille — bot-moni-v3 (bot Discord RP FiveM)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=REMPLACER_utilisateur_systeme
-WorkingDirectory=/REMPLACER/chemin/vers/roxwood-network-famille
-EnvironmentFile=/REMPLACER/chemin/vers/roxwood-network-famille/.env
+WorkingDirectory=/REMPLACER/chemin/vers/bot-moni-v3
+EnvironmentFile=/REMPLACER/chemin/vers/bot-moni-v3/.env
 ExecStart=/REMPLACER/chemin/vers/node dist/index.js
 Restart=on-failure
 RestartSec=5

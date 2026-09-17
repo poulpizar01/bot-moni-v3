@@ -362,7 +362,8 @@ function buildStockEmbed(guildId: string, stocks: Array<{ item: string; quantite
   // Format commun aux 3 champs ci-dessous : items en clair (pas de gras,
   // pour bien les distinguer du Total), pas de ligne blanche avant le Total
   // en gras — voir demande utilisateur du 14/09.
-  const venteEnStock = c.VENTE_ITEMS.filter(item => (stockMap[item.toLowerCase()] || 0) > 0);
+  const venteEnStock = c.VENTE_ITEMS.filter(item => (stockMap[item.toLowerCase()] || 0) > 0)
+    .sort((a, b) => stockMap[a.toLowerCase()] - stockMap[b.toLowerCase()]);
   if (venteEnStock.length) {
     const venteLines = venteEnStock.map(item => `${item} : \`${stockMap[item.toLowerCase()].toLocaleString('fr-FR')}\``);
     const total = venteEnStock.reduce((sum, item) => sum + stockMap[item.toLowerCase()], 0);
@@ -484,12 +485,17 @@ export async function handleCoffreStockCommand(interaction: ChatInputCommandInte
   }
 
   const coffre = interaction.options.getChannel('coffre', true);
-  const c = configStore.get(guildId).CHANNELS;
-  const suivi = c.logs_coffres.includes(coffre.id) || c.logs_coffres_admin.includes(coffre.id);
+  const [normaux, adminCoffres] = await Promise.all([
+    db.getChannelsWithLabel(guildId, 'logs_coffres'),
+    db.getChannelsWithLabel(guildId, 'logs_coffres_admin'),
+  ]);
+  const entry = normaux.find(ch => ch.channelId === coffre.id) ?? adminCoffres.find(ch => ch.channelId === coffre.id);
+  const suivi = !!entry;
+  const displayName = entry?.label || coffre.name;
 
   const rows = await db.getCoffreStocks(guildId, coffre.id);
   const embed = new EmbedBuilder()
-    .setTitle(`📦 Stock — ${coffre.name}`)
+    .setTitle(`📦 Stock — ${displayName}`)
     .setColor(0x2b2d31);
 
   if (!suivi) {
@@ -568,13 +574,11 @@ export async function handleDroguesAVendreCommand(interaction: ChatInputCommandI
   }
 
   const venteItems = configStore.get(guildId).VENTE_ITEMS;
-  const lines: string[] = [];
-  let total = 0;
-  for (const item of venteItems) {
-    const qty = await db.getStock(guildId, item);
-    total += qty;
-    lines.push(`**${item}** : \`${qty.toLocaleString('fr-FR')}\``);
-  }
+  const quantities: Array<{ item: string; qty: number }> = [];
+  for (const item of venteItems) quantities.push({ item, qty: await db.getStock(guildId, item) });
+  quantities.sort((a, b) => a.qty - b.qty);
+  const total = quantities.reduce((sum, { qty }) => sum + qty, 0);
+  const lines = quantities.map(({ item, qty }) => `**${item}** : \`${qty.toLocaleString('fr-FR')}\``);
 
   const embed = new EmbedBuilder()
     .setTitle('💊 Drogues à vendre')

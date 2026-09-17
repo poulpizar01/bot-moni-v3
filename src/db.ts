@@ -969,6 +969,45 @@ export async function deleteUserMapping(guildId: string, gameName: string, disco
   }
 }
 
+/**
+ * Comptes Discord connus de la guilde, pour `GET /api/users` : union des
+ * `userId` de `Transaction` (nom affiché = `username` le plus récent non
+ * vide, déjà trié par `timestamp: 'desc'`) et des `discordId` de
+ * `UserMapping` (fallback sur le(s) `gameName` associé(s) si ce compte n'a
+ * aucune `Transaction`). Purement DB, aucun appel au client Discord — le nom
+ * affiché peut donc être un pseudo Discord périmé ou un nom en jeu, jamais
+ * résolu en direct.
+ */
+export async function getKnownUsers(guildId: string): Promise<Array<{ userId: string; username: string }>> {
+  const [transactions, mappings] = await Promise.all([
+    prisma.transaction.findMany({
+      where: { guildId, deleted: false, username: { not: '' } },
+      select: { userId: true, username: true },
+      orderBy: { timestamp: 'desc' },
+    }),
+    prisma.userMapping.findMany({ where: { guildId }, select: { discordId: true, gameName: true } }),
+  ]);
+
+  const byId = new Map<string, string>();
+  for (const t of transactions) {
+    if (!byId.has(t.userId)) byId.set(t.userId, t.username);
+  }
+
+  const gameNamesById = new Map<string, string[]>();
+  for (const m of mappings) {
+    const arr = gameNamesById.get(m.discordId) ?? [];
+    arr.push(m.gameName);
+    gameNamesById.set(m.discordId, arr);
+  }
+  for (const [discordId, gameNames] of gameNamesById) {
+    if (!byId.has(discordId)) byId.set(discordId, gameNames.join(', '));
+  }
+
+  return [...byId.entries()]
+    .map(([userId, username]) => ({ userId, username }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+}
+
 // ─── PENDING SALES (ventes en attente de confirmation) ───────────────────────
 
 export interface PendingSaleInput {

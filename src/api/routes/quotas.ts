@@ -18,6 +18,7 @@
 import { Router } from 'express';
 import * as quotas from '../../modules/quotas';
 import { resolveWeekRange } from '../week';
+import { requireSelfOrAdmin } from '../auth';
 
 const router = Router();
 
@@ -53,20 +54,20 @@ router.get('/pay', async (req, res) => {
   res.json(await quotas.getAllUserPayForRange(guildId, range));
 });
 
-/** GET /api/quotas/pay/:userId?week= — paie d'un joueur précis. */
-router.get('/pay/:userId', async (req, res) => {
+/** GET /api/quotas/pay/:userId?week= — paie d'un joueur précis. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). */
+router.get('/pay/:userId', requireSelfOrAdmin, async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
-  res.json(await quotas.getUserPayForRange(guildId, req.params.userId, range));
+  res.json(await quotas.getUserPayForRange(guildId, String(req.params.userId), range));
 });
 
-/** GET /api/quotas/:userId?week= — quota d'un joueur précis. Toujours en dernier : c'est le paramètre dynamique du groupe. */
-router.get('/:userId', async (req, res) => {
+/** GET /api/quotas/:userId?week= — quota d'un joueur précis. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). Toujours en dernier : c'est le paramètre dynamique du groupe. */
+router.get('/:userId', requireSelfOrAdmin, async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
-  res.json(await quotas.getUserQuotaSummaryForRange(guildId, req.params.userId, range));
+  res.json(await quotas.getUserQuotaSummaryForRange(guildId, String(req.params.userId), range));
 });
 
 export default router;

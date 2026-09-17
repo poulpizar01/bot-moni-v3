@@ -159,20 +159,22 @@ Pas de clé API statique : l'utilisateur se connecte avec son compte Discord, et
 2. Après connexion Discord, l'utilisateur revient sur `<url_du_site>#token=<jwt>` (l'URL configurée via `/config site-externe set` PAR CE SERVEUR) — le site récupère ce token côté client (fragment d'URL, jamais envoyé à un serveur) et le stocke.
 3. Chaque appel à `/api/*` doit inclure `Authorization: Bearer <jwt>`. Le token expire au bout de 7 jours (pas de refresh token — se reconnecter via `/auth/login`) et reste scopé au serveur choisi à l'étape 1 : impossible de l'utiliser pour lire les données d'un autre serveur.
 
-Deux niveaux d'accès : **membre du serveur Discord** (suffit pour `/api/stocks`, `/api/quotas`, `/api/armurerie`, `/api/ventes`) et **rôle taxes ou admin** (requis en plus pour `/api/taxes` — le rôle `TAXES_ROLE_ID` de `/config role`, jusqu'ici sans utilisateur réel, sert enfin à ça).
+Plusieurs niveaux d'accès : **membre du serveur Discord** (suffit pour la plupart des routes de groupe) ; **rôle taxes ou admin** (requis en plus pour `/api/taxes` — le rôle `TAXES_ROLE_ID` de `/config role`, jusqu'ici sans utilisateur réel, sert enfin à ça) ; **soi-même ou admin** (routes `:userId` de `/api/quotas`/`/api/ventes` — un membre ne peut consulter que ses propres données) ; **membre ou admin** (`/api/stocks/channels`/`/api/stocks/:channelId` — les coffres admin ne sont visibles que pour un admin, mais le total global `/api/stocks` reste le même pour tous).
 
 ### Endpoints disponibles
 
 | Endpoint | Accès | Retourne |
 |----------|-------|----------|
 | `GET /api/me` | Membre | Identité résolue (id, username, isAdmin, isTaxes) |
-| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus |
-| `GET /api/stocks/:channelId` | Membre | Stock actuel de chaque item pour UN coffre précis |
+| `GET /api/users` | Membre | Comptes Discord connus de la guilde (userId + dernier nom connu) — un non-admin ne reçoit que lui-même |
+| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus (total réel, coffres admin inclus pour tout le monde) |
+| `GET /api/stocks/channels` | Membre/Admin | Liste des salons de logs de coffre suivis (avec leur nom) — coffres admin visibles uniquement pour un admin |
+| `GET /api/stocks/:channelId` | Membre/Admin | Stock actuel de chaque item pour UN coffre précis — 403 si ce coffre est un coffre admin et que le requérant ne l'est pas |
 | `GET /api/stocks/history?item=&channelId=&limit=` | Membre | Derniers mouvements, filtrables par item et/ou coffre (défaut 20, max 200) |
 | `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis |
-| `GET /api/quotas/:userId?week=` | Membre | Quota d'un joueur précis |
+| `GET /api/quotas/:userId?week=` | Soi-même/Admin | Quota d'un joueur précis |
 | `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$ |
-| `GET /api/quotas/pay/:userId?week=` | Membre | Paie d'un joueur précis |
+| `GET /api/quotas/pay/:userId?week=` | Soi-même/Admin | Paie d'un joueur précis |
 | `GET /api/quotas/ranking?week=` | Membre | Classement groupe par points (`/config classement`), triés décroissant, uniquement > 0 |
 | `GET /api/quotas/summary?week=` | Membre | Bilan groupe : total par activité |
 | `GET /api/armurerie?status=` | Membre | Armes, filtrables par statut (`in_stock`/`loaned`/`lost` — sans filtre : tout sauf perdues) |
@@ -180,7 +182,7 @@ Deux niveaux d'accès : **membre du serveur Discord** (suffit pour `/api/stocks`
 | `GET /api/armurerie/ammo` | Membre | Stock + compteurs hebdomadaires munitions |
 | `GET /api/armurerie/ammo/history` | Membre | Ventes de munitions depuis le dernier reset hebdomadaire (dimanche 19h) |
 | `GET /api/ventes?week=` | Membre | Total vendu par joueur sur la plage (trié décroissant) + total du groupe |
-| `GET /api/ventes/:userId?week=` | Membre | Ventes d'un joueur précis : total + détail par drogue vendue |
+| `GET /api/ventes/:userId?week=` | Soi-même/Admin | Ventes d'un joueur précis : total + détail par drogue vendue |
 | `GET /api/taxes?type=&status=` | Taxes/Admin | Taxes filtrables par type (fixe, `zone` = toutes les zones groupées, ou la clé d'une zone précise) et statut (`active`/`expired`, défaut `active`) |
 | `GET /api/taxes/search?type=&q=` | Taxes/Admin | Recherche par nom dans un type donné (`type` requis) |
 

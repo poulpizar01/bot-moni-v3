@@ -692,7 +692,7 @@ const CHANNEL_DISPLAY_ORDER: readonly configStore.ChannelRole[] = [
  * (permission manquante) est loggée, jamais bloquante pour la commande
  * appelante.
  */
-async function applyChannelOrder(guild: Guild, guildId: string): Promise<void> {
+export async function applyChannelOrder(guild: Guild, guildId: string): Promise<void> {
   const existing = configStore.get(guildId).CHANNELS;
   const ordered = CHANNEL_DISPLAY_ORDER
     .map(role => existing[role])

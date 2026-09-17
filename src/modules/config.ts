@@ -335,8 +335,21 @@ async function handleChannel(interaction: ChatInputCommandInteraction, guildId: 
   }
   if (sub === 'add-log-coffre' || sub === 'remove-log-coffre' || sub === 'add-log-coffre-admin' || sub === 'remove-log-coffre-admin') {
     const role = sub.endsWith('-admin') ? 'logs_coffres_admin' : 'logs_coffres';
+    // Un salon ne peut être QUE l'un ou l'autre, jamais les deux à la fois —
+    // sinon ses mouvements sont rejoués deux fois par catchUpMissedMessages/
+    // fullResync (voir coffreLogChannelIds dans stocks.ts).
+    const otherRole = role === 'logs_coffres_admin' ? 'logs_coffres' : 'logs_coffres_admin';
     const salon = interaction.options.getChannel('salon', true);
     const nom = interaction.options.getString('nom') ?? undefined;
+    if (sub.startsWith('add-') && configStore.get(guildId).CHANNELS[otherRole].includes(salon.id)) {
+      const otherLabel = otherRole === 'logs_coffres_admin' ? 'coffre admin' : 'coffre';
+      const otherRemoveSub = otherRole === 'logs_coffres_admin' ? 'remove-log-coffre-admin' : 'remove-log-coffre';
+      await interaction.reply({
+        content: `❌ <#${salon.id}> est déjà configuré comme salon de logs **${otherLabel}** — un salon ne peut être que l'un ou l'autre, jamais les deux. Retire-le d'abord avec \`/config channel ${otherRemoveSub}\`.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     await configStore.mutate(guildId, () => sub.startsWith('add-')
       ? db.addChannelToRole(guildId, role, salon.id, nom)
       : db.removeChannelFromRole(guildId, role, salon.id));

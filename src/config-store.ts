@@ -172,7 +172,7 @@ export interface ItemConfig {
 }
 
 export interface BotConfig {
-  /** `logs_coffres`/`logs_coffres_admin` sont des listes (plusieurs salons possibles chacune, voir `/config channel add-log-coffre`/`add-log-coffre-admin`) — les deux sont surveillées de la même façon par `stocks.ts`, `logs_coffres_admin` obtenant en plus le badge 🛡️ dans `historique_stock` (voir `logStockToChannel`). */
+  /** `logs_coffres`/`logs_coffres_admin` sont des listes (plusieurs salons possibles chacune, voir `/config channel add-log-coffre`/`add-log-coffre-admin`), mutuellement exclusives — un salon ne peut être que l'un ou l'autre, jamais les deux (voir la vérification dans `handleChannel`, `modules/config.ts`). Les deux sont surveillées de la même façon par `stocks.ts`, `logs_coffres_admin` obtenant en plus le badge 🛡️ dans `historique_stock` (voir `logStockToChannel`). */
   CHANNELS: Record<ChannelRole, string | null> & { logs_coffres: string[]; logs_coffres_admin: string[] };
   ALLOWED_ITEMS: string[];
   ITEMS_BY_NAME: Record<string, ItemConfig>;

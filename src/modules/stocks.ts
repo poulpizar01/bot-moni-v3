@@ -60,10 +60,10 @@ async function alertJoueurNonMappe(client: Client, guildId: string, entry: Stock
   await channel.send({ embeds: [embed] }).catch(() => null);
 }
 
-/** Salons `logs_coffres`/`logs_coffres_admin` surveillés — les deux listes sont traitées de façon identique ici, `logs_coffres_admin` obtenant en plus le badge 🛡️ (voir `logStockToChannel`). */
+/** Salons `logs_coffres`/`logs_coffres_admin` surveillés — les deux listes sont traitées de façon identique ici, `logs_coffres_admin` obtenant en plus le badge 🛡️ (voir `logStockToChannel`). Les deux rôles sont mutuellement exclusifs (voir `handleChannel`, `modules/config.ts`) ; le `Set` est un filet de sécurité, pas le mécanisme censé garantir l'absence de doublon — un salon qui apparaîtrait quand même dans les deux ne doit pas voir ses mouvements comptés deux fois par `catchUpMissedMessages`/`fullResync`. */
 function coffreLogChannelIds(guildId: string): string[] {
   const c = configStore.get(guildId).CHANNELS;
-  return [...c.logs_coffres, ...c.logs_coffres_admin];
+  return [...new Set([...c.logs_coffres, ...c.logs_coffres_admin])];
 }
 
 /** Point d'entrée temps réel : traite un nouveau message posté dans un salon `logs_coffres`/`logs_coffres_admin` suivi. */

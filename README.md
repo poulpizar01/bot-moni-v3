@@ -167,24 +167,26 @@ Plusieurs niveaux d'accès : **membre du serveur Discord** (suffit pour la plupa
 | Endpoint | Accès | Retourne |
 |----------|-------|----------|
 | `GET /api/me` | Membre | Identité résolue (id, username, isAdmin, isTaxes) |
-| `GET /api/users` | Membre | Comptes Discord connus de la guilde (userId + dernier nom connu) — un non-admin ne reçoit que lui-même |
-| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus (total réel, coffres admin inclus pour tout le monde) |
+| `GET /api/users` | Membre | Comptes Discord connus de la guilde (userId, dernier pseudo, nom en jeu `gameName`) — un non-admin ne reçoit que lui-même |
+| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus (total réel, coffres admin inclus pour tout le monde), avec la configuration de l'item (`name`, `group`, `vente`, `visibleStock`, `laboLie`, `stockMultiplier`) |
 | `GET /api/stocks/channels` | Membre/Admin | Liste des salons de logs de coffre suivis (avec leur nom) — coffres admin visibles uniquement pour un admin |
 | `GET /api/stocks/:channelId` | Membre/Admin | Stock actuel de chaque item pour UN coffre précis — 403 si ce coffre est un coffre admin et que le requérant ne l'est pas |
 | `GET /api/stocks/history?item=&channelId=&limit=` | Membre/Admin | Derniers mouvements, filtrables par item et/ou coffre (défaut 20, max 200) — les mouvements des coffres admin n'apparaissent que pour un admin (403 si un non-admin les demande explicitement) |
-| `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis |
+| `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis, avec leur nom (`name`) |
 | `GET /api/quotas/config?week=` | Membre | De quoi interpréter les autres réponses : plage `[since, until)` résolue, objectifs (`/config quota`) et taux (`/config salaire`, `/config classement`) **actuels**, libellés des activités |
 | `GET /api/quotas/:userId?week=` | Soi-même/Admin | Quota d'un joueur précis |
-| `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$ |
+| `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$, avec leur nom (`name`) |
 | `GET /api/quotas/pay/:userId?week=` | Soi-même/Admin | Paie d'un joueur précis |
-| `GET /api/quotas/ranking?week=` | Membre | Classement groupe par points (`/config classement`), triés décroissant, uniquement > 0 |
+| `GET /api/quotas/ranking?week=` | Membre | Classement groupe par points (`/config classement`), triés décroissant, uniquement > 0, avec les noms (`name`) |
 | `GET /api/quotas/summary?week=` | Membre | Bilan groupe : total par activité |
 | `GET /api/armurerie?status=` | Membre | Armes, filtrables par statut (`in_stock`/`loaned`/`lost` — sans filtre : tout sauf perdues) |
 | `GET /api/armurerie/search?q=` | Membre | Recherche par nom ou référence (sous-chaîne) |
 | `GET /api/armurerie/ammo` | Membre | Stock + compteurs hebdomadaires munitions |
-| `GET /api/armurerie/ammo/history` | Membre | Ventes de munitions depuis le dernier reset hebdomadaire (dimanche 19h) |
-| `GET /api/ventes?week=` | Membre | Total vendu par joueur sur la plage (trié décroissant) + total du groupe |
+| `GET /api/armurerie/ammo/history` | Membre | Ventes de munitions depuis le dernier reset hebdomadaire (dimanche 19h), avec le nom de l'acheteur (`name`) |
+| `GET /api/ventes?week=` | Membre | Total vendu par joueur sur la plage (trié décroissant, avec `name`) + total du groupe |
 | `GET /api/ventes/:userId?week=` | Soi-même/Admin | Ventes d'un joueur précis : total + détail par drogue vendue |
+| `GET /api/braquages` | Membre | Plafonds de braquage de la semaine glissante (7 j) : plafond, consommé, restant, prochain créneau libre |
+| `GET /api/cooldowns` | Membre | Cooldowns actifs du requérant (`/api/cooldowns/:userId` : soi-même ou admin) |
 | `GET /api/taxes?type=&status=` | Taxes/Admin | Taxes filtrables par type (fixe, `zone` = toutes les zones groupées, ou la clé d'une zone précise) et statut (`active`/`expired`, défaut `active`) — infos générales, sans téléphone/mot de passe |
 | `GET /api/taxes/search?type=&q=` | Taxes/Admin | Recherche par nom dans un type donné (`type` requis) — mêmes infos générales que ci-dessus |
 | `GET /api/taxes/:id` | Taxes/Admin | Détail complet d'une taxe précise, téléphone/mot de passe compris |

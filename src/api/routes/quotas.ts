@@ -21,15 +21,16 @@ import * as configStore from '../../config-store';
 import { activityDisplayLabel } from '../../config-store';
 import { resolveWeekRange } from '../week';
 import { requireSelfOrAdmin } from '../auth';
+import { avecNoms } from '../noms';
 
 const router = Router();
 
-/** GET /api/quotas?week= — quota de tous les joueurs suivis (somme par catégorie + détail brut par activité). */
+/** GET /api/quotas?week= — quota de tous les joueurs suivis (somme par catégorie + détail brut par activité), avec le nom de chacun (`name`, voir ../noms.ts). */
 router.get('/', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
-  res.json(await quotas.getAllUserQuotaSummariesForRange(guildId, range));
+  res.json(await avecNoms(guildId, await quotas.getAllUserQuotaSummariesForRange(guildId, range)));
 });
 
 /**
@@ -74,7 +75,7 @@ router.get('/ranking', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
-  res.json(await quotas.getClassementRankingForRange(guildId, range));
+  res.json(await avecNoms(guildId, await quotas.getClassementRankingForRange(guildId, range)));
 });
 
 /** GET /api/quotas/pay?week= — paie de tous les joueurs suivis, y compris à 0$ (contrairement à `/ranking`). */
@@ -82,7 +83,7 @@ router.get('/pay', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
-  res.json(await quotas.getAllUserPayForRange(guildId, range));
+  res.json(await avecNoms(guildId, await quotas.getAllUserPayForRange(guildId, range)));
 });
 
 /** GET /api/quotas/pay/:userId?week= — paie d'un joueur précis. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). */

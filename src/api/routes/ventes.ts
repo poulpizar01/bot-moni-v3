@@ -19,19 +19,20 @@ import { Router } from 'express';
 import * as db from '../../db';
 import { resolveWeekRange } from '../week';
 import { requireSelfOrAdmin } from '../auth';
+import { avecNoms } from '../noms';
 
 const router = Router();
 
 /**
  * GET /api/ventes?week= — total vendu par joueur sur la plage, trié
- * décroissant, plus le total du groupe (somme de tous les joueurs).
+ * décroissant, avec le nom de chacun (`name`), plus le total du groupe.
  */
 router.get('/', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
   if (!range) return;
 
-  const players = (await db.getVenteTotalsForRange(guildId, range.since, range.until)).sort((a, b) => b.total - a.total);
+  const players = await avecNoms(guildId, (await db.getVenteTotalsForRange(guildId, range.since, range.until)).sort((a, b) => b.total - a.total));
   const groupTotal = players.reduce((sum, p) => sum + p.total, 0);
   res.json({ players, groupTotal });
 });

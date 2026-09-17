@@ -977,11 +977,12 @@ export async function deleteUserMapping(guildId: string, gameName: string, disco
  * `userId` de `Transaction` (nom affiché = `username` le plus récent non
  * vide, déjà trié par `timestamp: 'desc'`) et des `discordId` de
  * `UserMapping` (fallback sur le(s) `gameName` associé(s) si ce compte n'a
- * aucune `Transaction`). Purement DB, aucun appel au client Discord — le nom
- * affiché peut donc être un pseudo Discord périmé ou un nom en jeu, jamais
- * résolu en direct.
+ * aucune `Transaction`). `gameName` : le premier nom en jeu associé via
+ * `/adduser`, ou `null` — c'est lui qu'un site affiche de préférence au
+ * pseudo Discord. Purement DB, aucun appel au client Discord — le nom
+ * affiché peut donc être un pseudo Discord périmé, jamais résolu en direct.
  */
-export async function getKnownUsers(guildId: string): Promise<Array<{ userId: string; username: string }>> {
+export async function getKnownUsers(guildId: string): Promise<Array<{ userId: string; username: string; gameName: string | null }>> {
   const [transactions, mappings] = await Promise.all([
     prisma.transaction.findMany({
       where: { guildId, deleted: false, username: { not: '' } },
@@ -1007,7 +1008,7 @@ export async function getKnownUsers(guildId: string): Promise<Array<{ userId: st
   }
 
   return [...byId.entries()]
-    .map(([userId, username]) => ({ userId, username }))
+    .map(([userId, username]) => ({ userId, username, gameName: gameNamesById.get(userId)?.[0] ?? null }))
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 

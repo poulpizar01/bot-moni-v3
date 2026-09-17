@@ -18,6 +18,7 @@
 import { Router } from 'express';
 import * as db from '../../db';
 import { getMunitionsSummary } from '../../modules/armurerie';
+import { avecNoms } from '../noms';
 
 const router = Router();
 
@@ -68,7 +69,7 @@ router.get('/ammo', async (req, res) => {
 router.get('/ammo/history', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const sinceReset = Number((await db.getSetting(guildId, 'last_weekly_reset')) || 0);
-  res.json(await db.getMunitionsVentesDepuis(guildId, sinceReset));
+  res.json(await avecNoms(guildId, await db.getMunitionsVentesDepuis(guildId, sinceReset), 'acheteur_id'));
 });
 
 export default router;

@@ -26,9 +26,36 @@ import * as configStore from '../../config-store';
 
 const router = Router();
 
-/** GET /api/stocks — quantité actuelle de chaque item suivi, tous coffres confondus (inclut la contribution des coffres admin pour tout le monde — c'est le total réel, jamais amputé). */
+/**
+ * Complète une ligne de stock avec la configuration de son item (`/config
+ * item`) : nom tel que configuré, groupe d'affichage, vendable aux PNJ,
+ * visible dans le Stock Général, lien labo, multiplicateur. Sans ça, un
+ * client ne peut pas distinguer une drogue d'un matériel ni regrouper comme
+ * le panneau Discord. `null` partout si l'item n'est plus configuré (stock
+ * orphelin) — la quantité, elle, reste vraie.
+ */
+function avecConfigItem<T extends { item: string }>(guildId: string, rows: T[]) {
+  const items = configStore.get(guildId).ITEMS_BY_NAME;
+  const parCle = new Map(Object.values(items).map(i => [i.name.toLowerCase(), i]));
+  return rows.map(r => {
+    const cfg = parCle.get(String(r.item).toLowerCase());
+    return {
+      ...r,
+      name: cfg?.name ?? null,
+      group: cfg?.stockGroup ?? null,
+      vente: cfg?.vente ?? null,
+      visibleStock: cfg?.visibleStock ?? null,
+      laboLie: cfg?.laboLie ?? null,
+      laboLieRole: cfg?.laboLieRole ?? null,
+      stockMultiplier: cfg?.stockMultiplier ?? null,
+    };
+  });
+}
+
+/** GET /api/stocks — quantité actuelle de chaque item suivi, tous coffres confondus (inclut la contribution des coffres admin pour tout le monde — c'est le total réel, jamais amputé), avec la configuration de chaque item (voir `avecConfigItem`). */
 router.get('/', async (req, res) => {
-  res.json(await db.getAllStocks(req.apiUser!.guildId));
+  const guildId = req.apiUser!.guildId;
+  res.json(avecConfigItem(guildId, await db.getAllStocks(guildId)));
 });
 
 /**
@@ -77,7 +104,7 @@ router.get('/:channelId', async (req, res) => {
     res.status(403).json({ error: 'Accès réservé aux administrateurs pour ce coffre.' });
     return;
   }
-  res.json(await db.getCoffreStocks(apiUser.guildId, channelId));
+  res.json(avecConfigItem(apiUser.guildId, await db.getCoffreStocks(apiUser.guildId, channelId)));
 });
 
 export default router;

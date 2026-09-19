@@ -13,11 +13,13 @@ const router = Router();
 /** GET /api/users — comptes Discord connus de la guilde (userId, dernier pseudo, nom en jeu). Un non-admin ne reçoit que lui-même ; les noms des autres joueurs, il les trouve déjà sur les lignes des routes de groupe (voir `../noms.ts`). */
 router.get('/', async (req, res) => {
   const apiUser = req.apiUser!;
+  const known = await db.getKnownUsers(apiUser.guildId);
   if (!apiUser.isAdmin) {
-    res.json([{ userId: apiUser.id, username: apiUser.username, gameName: null }]);
+    const self = known.find(u => u.userId === apiUser.id);
+    res.json([{ userId: apiUser.id, username: apiUser.username, gameName: self?.gameName ?? null }]);
     return;
   }
-  res.json(await db.getKnownUsers(apiUser.guildId));
+  res.json(known);
 });
 
 export default router;

@@ -25,8 +25,7 @@ import * as configStore from '../../config-store';
 import { activityDisplayLabel } from '../../config-store';
 import { requireSelfOrAdmin } from '../auth';
 
-/** Même fenêtre que `db.getBraquageCount` / `cleanOldBraquages`. */
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const { SEVEN_DAYS_MS } = db;
 
 export const braquagesRouter = Router();
 export const cooldownsRouter = Router();

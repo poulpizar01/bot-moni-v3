@@ -767,7 +767,8 @@ export async function removeCooldown(guildId: string, userId: string, action: st
 
 // ─── BRAQUAGES (fenêtre glissante 7 jours) ───────────────────────────────────
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+/** Exportée pour que `src/api/routes/activites.ts` reste sur la même fenêtre sans la redéfinir en dur. */
+export const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Enregistre un braquage (consomme un slot de la fenêtre glissante de 7 jours). */
 export async function addBraquage(guildId: string, userId: string, action: string): Promise<void> {

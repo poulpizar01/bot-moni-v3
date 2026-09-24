@@ -1340,7 +1340,16 @@ export async function handleListQuotaCommand(interaction: ChatInputCommandIntera
   }
   if (current.length) chunks.push(current);
 
-  const embeds = chunks.map((chunk, i) => new EmbedBuilder()
+  // Discord plafonne un message à 10 embeds — au-delà (des centaines de
+  // membres suivis), tronquer plutôt que laisser l'envoi planter en silence.
+  const totalChunks = chunks.length;
+  const capped = chunks.slice(0, 10);
+  if (totalChunks > 10) {
+    const affiches = capped.reduce((n, c) => n + c.length, 0);
+    capped[capped.length - 1].push(`*+${lines.length - affiches} membres non affichés — affine ta recherche*`);
+  }
+
+  const embeds = capped.map((chunk, i) => new EmbedBuilder()
     .setTitle(i === 0 ? '📋 Suivi des quotas — tous les membres' : null)
     .setColor(0x5865F2)
     .setDescription(chunk.join('\n')));

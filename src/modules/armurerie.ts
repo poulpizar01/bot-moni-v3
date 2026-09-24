@@ -315,15 +315,27 @@ async function buildArmurierieEmbed(guildId: string, armes: Arme[]): Promise<Emb
  * armes triées), déporté ici derrière le bouton "Détail par type" pour ne
  * jamais dépasser la limite Discord de 4096 caractères par description.
  *
+ * Deux budgets s'appliquent à chaque embed, PAS un seul : un budget de
+ * caractères (~3900) ET un budget de lignes ({@link MAX_LIGNES_PAR_EMBED}).
+ * Le budget de lignes n'est pas documenté par Discord — repéré en pratique
+ * (bug remonté par l'utilisateur) : un embed de 2487 caractères/83 lignes
+ * (bien sous les 4096 caractères officiels) se faisait tronquer à l'écran
+ * après la ~81e ligne, identiquement sur desktop, web et mobile, alors que
+ * `interaction.fetchReply()` confirmait que Discord avait bien stocké la
+ * description complète — donc une limite de RENDU côté client, pas une
+ * limite de longueur côté API. D'où une marge de sécurité (70) sous le point
+ * de rupture observé (~81), plutôt que de coller au plus près d'un seuil
+ * qu'on ne connaît que par un seul cas de figure.
+ *
  * Un type est d'abord découpé en un ou plusieurs "blocs" tenant chacun dans
- * un budget de ~3900 caractères, en réinsérant son en-tête `__Type__` à
- * chaque coupure — seul un type à lui seul assez gros pour déborder ce
- * budget produit plusieurs blocs ; dans l'immense majorité des cas (un type
- * qui tient dans le budget), ça ne change rien de visible. Ces blocs sont
- * ensuite empaquetés dans des embeds (même pattern de découpe que /quotas,
- * voir `handleListQuotaCommand` dans quotas.ts), eux-mêmes plafonnés à 10
- * (limite Discord par message) — au-delà, tronque et signale le nombre
- * d'armes non affichées plutôt que de laisser l'envoi planter.
+ * ces deux budgets, en réinsérant son en-tête `__Type__` à chaque coupure —
+ * seul un type à lui seul assez gros pour déborder produit plusieurs blocs ;
+ * dans l'immense majorité des cas (un type qui tient dans les deux budgets),
+ * ça ne change rien de visible. Ces blocs sont ensuite empaquetés dans des
+ * embeds (même pattern de découpe que /quotas, voir `handleListQuotaCommand`
+ * dans quotas.ts), eux-mêmes plafonnés à 10 (limite Discord par message) —
+ * au-delà, tronque et signale le nombre d'armes non affichées plutôt que de
+ * laisser l'envoi planter.
  */
 function buildArmesDetailEmbeds(armes: Arme[]): EmbedBuilder[] {
   const TITRE = '🔫 Détail des armes par type';
@@ -334,18 +346,22 @@ function buildArmesDetailEmbeds(armes: Arme[]): EmbedBuilder[] {
   const { parType, sansType } = groupArmesByType(armes);
   const ligneArme = (a: Arme) => `**${a.nom}** \`${a.reference}\` — ${statutLabel(a)}`;
   const BUDGET = 3900;
+  const MAX_LIGNES_PAR_EMBED = 70;
 
   const splitSection = (label: string, lignes: string[]): string[] => {
     const header = `__${label}__`;
     const pieces: string[] = [];
     let piece = header;
+    let pieceLignes = 1;
     for (const ligne of lignes) {
       const candidate = `${piece}\n${ligne}`;
-      if (candidate.length > BUDGET) {
+      if (candidate.length > BUDGET || pieceLignes + 1 > MAX_LIGNES_PAR_EMBED) {
         pieces.push(piece);
         piece = `${header}\n${ligne}`;
+        pieceLignes = 2;
       } else {
         piece = candidate;
+        pieceLignes += 1;
       }
     }
     pieces.push(piece);
@@ -361,13 +377,18 @@ function buildArmesDetailEmbeds(armes: Arme[]): EmbedBuilder[] {
 
   const chunks: string[][] = [];
   let current: string[] = [];
+  let currentLignes = 0;
   for (const bloc of blocs) {
+    const blocLignes = bloc.split('\n').length;
     const candidateLen = current.length ? current.join('\n\n').length + 2 + bloc.length : bloc.length;
-    if (current.length && candidateLen > BUDGET) {
+    const candidateLignes = currentLignes + blocLignes;
+    if (current.length && (candidateLen > BUDGET || candidateLignes > MAX_LIGNES_PAR_EMBED)) {
       chunks.push(current);
       current = [bloc];
+      currentLignes = blocLignes;
     } else {
       current.push(bloc);
+      currentLignes = candidateLignes;
     }
   }
   if (current.length) chunks.push(current);

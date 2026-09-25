@@ -857,8 +857,10 @@ export async function getTaxe(guildId: string, id: number) {
  * expirée mais pas encore supprimée ne doit PAS bloquer une nouvelle
  * création, d'où le filtre supplémentaire sur `echeance`.
  */
-export async function getActiveTaxeByType(guildId: string, type: string) {
-  const row = await prisma.taxe.findFirst({ where: { guildId, type, actif: true, echeance: { gt: new Date() } } });
+export async function getActiveTaxeByTypeAndNom(guildId: string, type: string, nom: string) {
+  const row = await prisma.taxe.findFirst({
+    where: { guildId, type, nom: { equals: nom, mode: 'insensitive' }, actif: true, echeance: { gt: new Date() } },
+  });
   return row ? mapTaxe(row) : undefined;
 }
 

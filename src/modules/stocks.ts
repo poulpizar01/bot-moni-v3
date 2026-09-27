@@ -182,10 +182,9 @@ function extractText(msg: Message): string {
  * Parse une ligne de log de coffre (retrait/dépôt) et applique le delta au
  * stock si l'item est suivi ; `false` si la ligne ne matche rien ou que
  * l'item est inconnu (voir piège n°1 du projet : orthographe exacte).
- * `channelId` : salon `logs_coffres` d'origine — le delta est appliqué à la
- * fois au total global (`Stock`, inchangé) ET au détail par coffre
- * (`CoffreStock`, voir README section Interopérabilité), jamais l'un sans
- * l'autre.
+ * `channelId` : salon `logs_coffres` d'origine — le delta est appliqué au
+ * stock de ce coffre (`CoffreStock`), le total global étant toujours la
+ * somme des coffres (voir `db.getAllStocks`).
  */
 async function parseAndApply(guildId: string, line: string, channelId: string, log = false): Promise<StockEntry | false> {
   const retireMatch = line.match(RE_RETIRE);
@@ -202,8 +201,7 @@ async function parseAndApply(guildId: string, line: string, channelId: string, l
 
   const action: 'retire' | 'depose' = retireMatch ? 'retire' : 'depose';
   const delta = retireMatch ? -quantite : quantite;
-  const { avant: stockAvant, apres: stockApres } = await db.applyStockDelta(guildId, item, delta);
-  await db.applyCoffreStockDelta(guildId, channelId, item, delta);
+  const { avant: stockAvant, apres: stockApres } = await db.applyStockMovement(guildId, channelId, item, delta);
 
   const entry: StockEntry = { joueur, action, item, quantite, stock_avant: stockAvant, stock_apres: stockApres };
 
@@ -412,7 +410,7 @@ export function getCommands() {
         .setDescription("Force la valeur du stock d'un item (correction manuelle, admin)")
         .addStringOption(opt => opt.setName('item').setDescription("L'item à corriger").setRequired(true).setAutocomplete(true))
         .addIntegerOption(opt => opt.setName('quantite').setDescription('Nouvelle valeur du stock').setRequired(true).setMinValue(0))
-        .addChannelOption(opt => opt.setName('coffre').setDescription('Le coffre à corriger (le total global suit le même delta)').setRequired(true)
+        .addChannelOption(opt => opt.setName('coffre').setDescription('Le coffre à corriger (le total global suit automatiquement)').setRequired(true)
           .addChannelTypes(ChannelType.GuildText)),
     },
     {
@@ -450,7 +448,7 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
 
 /**
  * `/set-stock` (admin) : force la valeur du stock d'un item pour UN coffre
- * précis (le total global suit le même delta, voir `db.setCoffreStock`).
+ * précis (le total global, somme des coffres, suit de lui-même).
  * `coffre` est obligatoire — un `/set-stock` sans coffre écrasait le total
  * global sans jamais l'attribuer à un `CoffreStock`, un résidu non purgé qui
  * s'accumulait ensuite avec toute correction par coffre faite plus tard sur
@@ -471,7 +469,7 @@ export async function handleSetStockCommand(interaction: ChatInputCommandInterac
   const { avant, apres } = await db.setCoffreStock(guildId, coffre.id, item, quantite);
   await updateStockMessage(interaction.client, guildId);
   await interaction.reply({
-    content: `✅ Stock de **${itemLabel}** corrigé pour <#${coffre.id}> : \`${avant.toLocaleString('fr-FR')}\` → \`${apres.toLocaleString('fr-FR')}\` (total global ajusté du même delta).`,
+    content: `✅ Stock de **${itemLabel}** corrigé pour <#${coffre.id}> : \`${avant.toLocaleString('fr-FR')}\` → \`${apres.toLocaleString('fr-FR')}\` (total global recalculé).`,
     flags: MessageFlags.Ephemeral,
   });
 }

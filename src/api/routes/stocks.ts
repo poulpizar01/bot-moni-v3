@@ -2,9 +2,9 @@
  * @file src/api/routes/stocks.ts
  * @description Lecture seule des stocks — résumé global, détail par coffre
  * (salon `logs_coffres`), et historique des mouvements. Le détail par coffre
- * (`CoffreStock`) est un complément du total global (`Stock`, toujours
- * exact) — les deux sont maintenus ensemble à chaque mouvement, voir
- * `stocks.parseAndApply`.
+ * (`CoffreStock`) est la seule donnée stockée ; le total global en est la
+ * somme, recalculée à chaque lecture (voir `db.getAllStocks`) — les deux ne
+ * peuvent donc jamais diverger.
  *
  * Routes statiques `/history`/`/channels` déclarées AVANT `/:channelId` —
  * sinon Express interpréterait `/stocks/history` ou `/stocks/channels`

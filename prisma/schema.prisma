@@ -216,24 +216,12 @@ model ActivityClassementRate {
 
 // ═══ DONNÉES MÉTIER (génériques, indépendantes de la config ci-dessus) ═══
 
-/// Stock total, tous coffres suivis confondus (`/config channel add-log-coffre`)
-/// — c'est celui qu'affiche le panneau "Stock Général". Voir {@link
-/// CoffreStock} pour le détail par coffre (salon de log), suivi séparément
-/// depuis la mise en place de l'API (voir README, section Interopérabilité).
-model Stock {
-  guildId  String @map("guild_id")
-  item     String
-  quantite Int    @default(0)
-
-  @@id([guildId, item])
-  @@map("stocks")
-}
-
-/// Stock détaillé PAR coffre (un salon `logs_coffres`) — complément de
-/// {@link Stock} (le total global), pas un remplacement : les deux sont mis à
-/// jour ensemble à chaque mouvement (voir `stocks.ts`, `applyCoffreStockDelta`
-/// aux côtés de `applyStockDelta`). Vidé et reconstruit lors d'un `/sync-stock`
-/// complet, comme `Stock`.
+/// Stock PAR coffre (un salon `logs_coffres`/`logs_coffres_admin`) — seule
+/// source de vérité du stock : le total global (panneau "Stock Général",
+/// `/api/stocks`) est toujours la somme de ces lignes, jamais un compteur
+/// séparé (voir `db.applyStockMovement`/`db.getAllStocks`) — l'ancienne table
+/// `stocks` divergeait de la somme des coffres (plancher à 0 appliqué de
+/// chaque côté indépendamment). Vidé et reconstruit lors d'un `/sync-stock`.
 model CoffreStock {
   guildId   String @map("guild_id")
   channelId String @map("channel_id")
@@ -241,6 +229,7 @@ model CoffreStock {
   quantite  Int    @default(0)
 
   @@id([guildId, channelId, item])
+  @@index([guildId, item])
   @@map("coffre_stocks")
 }
 

@@ -22,7 +22,6 @@
 import { Router } from 'express';
 import * as db from '../../db';
 import * as configStore from '../../config-store';
-import { activityDisplayLabel } from '../../config-store';
 import { requireSelfOrAdmin } from '../auth';
 
 const { SEVEN_DAYS_MS } = db;
@@ -41,7 +40,7 @@ braquagesRouter.get('/', async (req, res) => {
     const oldest = used >= limit ? await db.getOldestBraquage(guildId, action) : null;
     return {
       action,
-      label: activityDisplayLabel(cfg),
+      label: cfg.label,
       limit,
       used,
       available: Math.max(0, limit - used),
@@ -57,7 +56,7 @@ async function cooldownsDe(guildId: string, userId: string) {
   const types = configStore.get(guildId).ACTIVITY_TYPES;
   return (await db.getActiveCooldowns(guildId))
     .filter(c => c.userId === userId)
-    .map(c => ({ action: c.action, label: types[c.action] ? activityDisplayLabel(types[c.action]) : c.action, expiresAt: c.expires_at }))
+    .map(c => ({ action: c.action, label: types[c.action] ? types[c.action].label : c.action, expiresAt: c.expires_at }))
     .sort((a, b) => a.expiresAt - b.expiresAt);
 }
 

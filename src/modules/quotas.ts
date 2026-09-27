@@ -52,7 +52,7 @@ import {
 } from 'discord.js';
 import * as db from '../db';
 import * as configStore from '../config-store';
-import { activityDisplayLabel, type ActivityTypeConfig } from '../config-store';
+import { type ActivityTypeConfig } from '../config-store';
 import * as alertes from './alertes';
 import * as garages from './garages';
 import { isAdmin } from '../permissions';
@@ -171,7 +171,7 @@ async function buildMainEmbed(guildId: string): Promise<EmbedBuilder> {
     const used = await db.getBraquageCount(guildId, key);
     const dispo = Math.max(0, cfg.braquageWeeklyLimit! - used);
     const icon = dispo > 0 ? '🟢' : '🔴';
-    return `${icon} ${activityDisplayLabel(cfg)} : **${dispo}/${cfg.braquageWeeklyLimit}**`;
+    return `${icon} ${cfg.icon ? `${cfg.icon} ` : ''}${cfg.label} : **${dispo}/${cfg.braquageWeeklyLimit}**`;
   }));
 
   const embed = new EmbedBuilder()
@@ -210,7 +210,7 @@ async function buildQuotaEmbed(guildId: string, userId: string, member: GuildMem
 
   const detail = Object.entries(activityTypes)
     .sort((a, b) => a[1].displayOrder - b[1].displayOrder)
-    .map(([key, cfg]) => [activityDisplayLabel(cfg), map[key]?.count || 0] as const)
+    .map(([key, cfg]) => [cfg.label, map[key]?.count || 0] as const)
     .filter(([, v]) => v > 0)
     .map(([label, v]) => `• ${label}: **${v}**`)
     .join('\n') || '*Aucune activité*';
@@ -424,7 +424,7 @@ export async function getGroupSummaryForRange(guildId: string, range: QuotaRange
   const totals = await db.getGroupActionTotals(guildId, range.since, quantityActionKeys(guildId), range.until);
   return totals.map(({ action, total }) => ({
     action,
-    label: activityTypes[action] ? activityDisplayLabel(activityTypes[action]) : action,
+    label: activityTypes[action] ? activityTypes[action].label : action,
     total,
   }));
 }
@@ -541,7 +541,7 @@ function buildTransactionEmbed(guildId: string, txId: number, userId: string, us
     .setColor(0x57F287)
     .addFields(
       { name: 'Utilisateur', value: `<@${userId}> (${userTag})`, inline: true },
-      { name: 'Action', value: cfg ? activityDisplayLabel(cfg) : action, inline: true },
+      { name: 'Action', value: cfg ? cfg.label : action, inline: true },
       { name: 'Heure', value: formatDateTime(Date.now()), inline: true },
     )
     .setTimestamp();
@@ -622,9 +622,6 @@ function buildButtonRows(guildId: string) {
   for (const rowEntries of direct) {
     const row = new ActionRowBuilder<ButtonBuilder>();
     for (const [key, cfg] of rowEntries) {
-      // Pas d'emoji sur le bouton (cfg.label brut, pas activityDisplayLabel) : cohérent avec
-      // les boutons ATM/Cambu/Supérette/Go Fast/Récolte/Labo, qui n'en ont pas non plus.
-      // L'emoji reste utilisé ailleurs (slots braquages, select de repli — voir activityDisplayLabel).
       row.addComponents(new ButtonBuilder().setCustomId(`act_${key}`).setLabel(cfg.label.slice(0, 80)).setStyle(styleFor(cfg)));
     }
     rows.push(row as ActionRowBuilder<ButtonBuilder | UserSelectMenuBuilder>);
@@ -634,7 +631,7 @@ function buildButtonRows(guildId: string) {
     const select = new StringSelectMenuBuilder()
       .setCustomId('act_more_select')
       .setPlaceholder("Plus d'activités…")
-      .addOptions(overflow.map(([key, cfg]) => ({ label: activityDisplayLabel(cfg).slice(0, 100), value: key })));
+      .addOptions(overflow.map(([key, cfg]) => ({ label: cfg.label.slice(0, 100), value: key })));
     rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select) as unknown as ActionRowBuilder<ButtonBuilder | UserSelectMenuBuilder>);
   }
 
@@ -735,7 +732,7 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
   // activité désactivée (voir buildButtonRows), mais un vieux message de
   // panneau non rafraîchi ou le menu de repli pourraient encore la proposer.
   if (!cfg.enabled) {
-    return replyAutoDelete(interaction, `❌ **${activityDisplayLabel(cfg)}** n'est pas disponible pour le type d'organisation actuel.`);
+    return replyAutoDelete(interaction, `❌ **${cfg.label}** n'est pas disponible pour le type d'organisation actuel.`);
   }
 
   if (cfg.labo) {
@@ -744,7 +741,7 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
       .setPlaceholder('Sélectionner les participants (optionnel)')
       .setMinValues(0).setMaxValues(25);
     return replyAutoDelete(interaction, {
-      content: `🧪 **${activityDisplayLabel(cfg)}** — Sélectionne les participants :`,
+      content: `🧪 **${cfg.label}** — Sélectionne les participants :`,
       components: [new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(select)],
     }, { deleteAfterMs: 60_000 });
   }
@@ -752,14 +749,14 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
   if (cfg.braquageWeeklyLimit) {
     if (!(await checkBraquageLimit(guildId, key))) {
       const used = await db.getBraquageCount(guildId, key);
-      return replyAutoDelete(interaction, `🚫 La limite hebdomadaire de **${activityDisplayLabel(cfg)}** est atteinte (${used}/${cfg.braquageWeeklyLimit} sur 7 jours).`);
+      return replyAutoDelete(interaction, `🚫 La limite hebdomadaire de **${cfg.label}** est atteinte (${used}/${cfg.braquageWeeklyLimit} sur 7 jours).`);
     }
     const select = new UserSelectMenuBuilder()
       .setCustomId(`act_select_${key}`)
       .setPlaceholder('Sélectionner les partenaires (optionnel)')
       .setMinValues(0).setMaxValues(25);
     return replyAutoDelete(interaction, {
-      content: `🔫 **${activityDisplayLabel(cfg)}** — Sélectionne tes partenaires :`,
+      content: `🔫 **${cfg.label}** — Sélectionne tes partenaires :`,
       components: [new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(select)],
     }, { deleteAfterMs: 60_000 });
   }
@@ -769,7 +766,7 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
     const itemHint = c.VENTE_ITEMS.length ? c.VENTE_ITEMS.join(', ') : (c.ALLOWED_ITEMS.length ? c.ALLOWED_ITEMS.join(', ') : 'ex: Cannabis, Cocaïne…');
     const modal = new ModalBuilder()
       .setCustomId(`modal_act_${key}`)
-      .setTitle(activityDisplayLabel(cfg).slice(0, 45))
+      .setTitle(cfg.label.slice(0, 45))
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId('type').setLabel('Type de produit')
@@ -788,13 +785,13 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
   if (cfg.cooldownMs) {
     const remaining = await checkCooldown(guildId, interaction.user.id, key);
     if (remaining !== null) {
-      return replyAutoDelete(interaction, `⏳ Tu es en cooldown pour **${activityDisplayLabel(cfg)}** encore **${formatTime(remaining)}**.`);
+      return replyAutoDelete(interaction, `⏳ Tu es en cooldown pour **${cfg.label}** encore **${formatTime(remaining)}**.`);
     }
   }
 
   const modal = new ModalBuilder()
     .setCustomId(`modal_act_${key}`)
-    .setTitle(`${activityDisplayLabel(cfg)} — Confirmer`.slice(0, 45))
+    .setTitle(`${cfg.label} — Confirmer`.slice(0, 45))
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder().setCustomId('confirm').setLabel('Taper "oui" pour confirmer')
@@ -920,7 +917,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
       const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, { Type: type, Quantité: quantite.toLocaleString('fr-FR') });
       await logActivite(interaction.client, guildId, embed);
       await updatePermanentMessage(interaction.client, guildId);
-      return replyAutoDelete(interaction, `✅ **${activityDisplayLabel(cfg)}** — ${quantite.toLocaleString('fr-FR')} × ${type} enregistrés (ID #${txId}).`);
+      return replyAutoDelete(interaction, `✅ **${cfg.label}** — ${quantite.toLocaleString('fr-FR')} × ${type} enregistrés (ID #${txId}).`);
     }
 
     const confirm = interaction.fields.getTextInputValue('confirm').trim().toLowerCase();
@@ -933,7 +930,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, {});
     await logActivite(interaction.client, guildId, embed);
     await updatePermanentMessage(interaction.client, guildId);
-    return replyAutoDelete(interaction, `✅ **${activityDisplayLabel(cfg)}** enregistré (ID #${txId}).`);
+    return replyAutoDelete(interaction, `✅ **${cfg.label}** enregistré (ID #${txId}).`);
   }
 
   if (id.startsWith('modal_actlabo_')) {
@@ -957,7 +954,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     const filteredPartnerIds = partnerIds.filter(pid => pid !== interaction.user.id);
     const allIds = [interaction.user.id, ...filteredPartnerIds];
 
-    await replyAutoDelete(interaction, `✅ **${activityDisplayLabel(cfg)}** validé. Enregistrement en cours...`);
+    await replyAutoDelete(interaction, `✅ **${cfg.label}** validé. Enregistrement en cours...`);
 
     void (async () => {
       try {
@@ -997,7 +994,7 @@ export async function handleSelect(interaction: UserSelectMenuInteraction): Prom
     const token = selectedIds.length ? createLaboParticipantToken(selectedIds) : '';
     const modal = new ModalBuilder()
       .setCustomId(`modal_actlabo_${key}${token ? `|${token}` : ''}`)
-      .setTitle(`${activityDisplayLabel(cfg)} — Temps restant`.slice(0, 45))
+      .setTitle(`${cfg.label} — Temps restant`.slice(0, 45))
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId('temps_restant').setLabel('Temps restant (en minutes)')
@@ -1024,7 +1021,7 @@ export async function handleSelect(interaction: UserSelectMenuInteraction): Prom
   await updatePermanentMessage(interaction.client, guildId);
 
   return updateAutoDelete(interaction, {
-    content: `✅ **${activityDisplayLabel(cfg)}** enregistré (ID #${txId}). Participants : ${allIds.map(p => `<@${p}>`).join(', ')}.`,
+    content: `✅ **${cfg.label}** enregistré (ID #${txId}). Participants : ${allIds.map(p => `<@${p}>`).join(', ')}.`,
     components: [],
   });
 }
@@ -1070,7 +1067,7 @@ export async function handleSuppCommand(interaction: ChatInputCommandInteraction
     .setColor(0xED4245)
     .addFields(
       { name: 'Supprimée par', value: `<@${interaction.user.id}> (${interaction.user.tag})`, inline: true },
-      { name: 'Action', value: cfg ? activityDisplayLabel(cfg) : tx.action, inline: true },
+      { name: 'Action', value: cfg ? cfg.label : tx.action, inline: true },
       { name: 'Utilisateur', value: `<@${tx.userId}>`, inline: true },
     )
     .setTimestamp();

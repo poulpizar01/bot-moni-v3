@@ -230,6 +230,35 @@ export async function getAllItemSalaryRates(guildId: string) {
   return prisma.itemSalaryRate.findMany({ where: { guildId } });
 }
 
+// ─── SALARY TIERS (config) ───────────────────────────────────────────────────
+
+/** Ajoute une tranche de barème de paie "vente" (`item` null = barème général, `upTo` null = tranche finale) — la validation de l'ordre des bornes est faite par l'appelant (voir `/config palier add`). */
+export async function addSalaryTier(guildId: string, item: string | null, upTo: number | null, amount: number): Promise<void> {
+  await prisma.salaryTier.create({ data: { guildId, item, upTo, amount } });
+}
+
+/** Retire la tranche de borne `upTo` (null = tranche finale) d'un barème. Renvoie le nombre de tranches retirées. */
+export async function removeSalaryTier(guildId: string, item: string | null, upTo: number | null): Promise<number> {
+  const { count } = await prisma.salaryTier.deleteMany({ where: { guildId, item, upTo } });
+  return count;
+}
+
+/** Retire tout le barème d'une cible (`item` null = barème général). Renvoie le nombre de tranches retirées. */
+export async function clearSalaryTiers(guildId: string, item: string | null): Promise<number> {
+  const { count } = await prisma.salaryTier.deleteMany({ where: { guildId, item } });
+  return count;
+}
+
+/** Toutes les tranches d'une guilde, triées par cible puis borne croissante (Postgres place les NULL en dernier sur ASC : la tranche finale sort en dernier de son barème). */
+export async function getAllSalaryTiers(guildId: string) {
+  return prisma.salaryTier.findMany({ where: { guildId }, orderBy: [{ item: 'asc' }, { upTo: 'asc' }] });
+}
+
+/** Tranches d'un seul barème (`item` null = général), triées par borne croissante. */
+export async function getSalaryTiersFor(guildId: string, item: string | null) {
+  return prisma.salaryTier.findMany({ where: { guildId, item }, orderBy: { upTo: 'asc' } });
+}
+
 // ─── CLASSEMENT RATES (config) ────────────────────────────────────────────
 
 /** Fixe (upsert) le nombre de points par unité d'une catégorie de quota. */

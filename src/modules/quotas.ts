@@ -52,7 +52,7 @@ import {
 } from 'discord.js';
 import * as db from '../db';
 import * as configStore from '../config-store';
-import { type ActivityTypeConfig } from '../config-store';
+import { type ActivityTypeConfig, type SalaryTierEntry } from '../config-store';
 import * as alertes from './alertes';
 import * as garages from './garages';
 import { isAdmin } from '../permissions';
@@ -224,24 +224,79 @@ async function buildQuotaEmbed(guildId: string, userId: string, member: GuildMem
 }
 
 /**
+ * Paie progressive d'une quantité sur UN barème trié (voir `SalaryTier` dans
+ * schema.prisma) : chaque tranche [borne précédente, upTo] est payée à SON
+ * taux et les montants s'additionnent, comme un barème d'impôt — 250 unités
+ * avec 0-100→10$, 100-300→15$ rapportent 100×10 + 150×15, jamais 250×15.
+ */
+function computeTierPay(quantite: number, tiers: SalaryTierEntry[]): number {
+  let prevBound = 0;
+  let total = 0;
+  for (const tier of tiers) {
+    const upper = tier.upTo ?? Infinity;
+    total += Math.max(0, Math.min(quantite, upper) - prevBound) * tier.amount;
+    if (quantite <= upper) break;
+    prevBound = upper;
+  }
+  return total;
+}
+
+/** Une ligne de paie "vente" : une drogue ayant son propre palier/taux, ou (`item` null) la quantité mise en commun au barème/taux général. `rate` null = payée au palier. */
+interface VentePayPart {
+  item: string | null;
+  qty: number;
+  rate: number | null;
+  pay: number;
+}
+
+/** Vrai si la paie "vente" doit être détaillée par drogue (taux ou palier propre à un item) — seul cas où les appelants relisent `Transaction` via `getVenteByItemMap`. */
+function hasVenteItemOverrides(c: configStore.BotConfig): boolean {
+  return Object.keys(c.ITEM_SALARY_RATES).length > 0 || Object.keys(c.VENTE_PALIERS.byItem).length > 0;
+}
+
+/**
+ * Paie "vente" découpée en lignes, par priorité : palier de l'item > taux de
+ * l'item > palier général > taux général. `venteByItem` null = aucun
+ * override par item, calcul direct sur le total. Les drogues sans override
+ * sont MISES EN COMMUN avant d'appliquer le barème général : 30 + 80 unités
+ * de deux drogues différentes cumulent 110 unités dans le même barème, elles
+ * ne repartent pas chacune de la première tranche.
+ */
+function computeVentePayParts(totalVente: number, venteByItem: Record<string, number> | null, c: configStore.BotConfig): VentePayPart[] {
+  const generalTiers = c.VENTE_PALIERS.general;
+  const generalRate = c.SALARY_RATES.vente ?? 0;
+  const parts: VentePayPart[] = [];
+  let pooled = totalVente;
+  for (const [item, qty] of Object.entries(venteByItem ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    const tiers = c.VENTE_PALIERS.byItem[item];
+    if (tiers?.length) parts.push({ item, qty, rate: null, pay: computeTierPay(qty, tiers) });
+    else if (c.ITEM_SALARY_RATES[item] != null) parts.push({ item, qty, rate: c.ITEM_SALARY_RATES[item], pay: qty * c.ITEM_SALARY_RATES[item] });
+    else continue;
+    pooled -= qty;
+  }
+  // `totalVente` vient de Stat (semaine en cours) et `venteByItem` de
+  // Transaction : un léger décalage ne doit jamais produire une quantité négative.
+  pooled = Math.max(0, pooled);
+  parts.push(generalTiers.length
+    ? { item: null, qty: pooled, rate: null, pay: computeTierPay(pooled, generalTiers) }
+    : { item: null, qty: pooled, rate: generalRate, pay: pooled * generalRate });
+  return parts;
+}
+
+/**
  * Salaire total à partir des taux configurés (`/config salaire`) : somme,
  * pour chaque catégorie ayant un taux, de `compte de cette catégorie × taux`
- * — sauf "vente", calculée item par item via `venteByItem` (quantité vendue
- * de cet item sur la période) : chaque item utilise son taux spécifique
- * (`itemRates`, `/config salaire set quota_type:vente item:`) s'il en a un,
- * sinon le taux général `rates.vente`. Une catégorie/item sans taux ne
+ * — sauf "vente", déléguée à {@link computeVentePayParts} (paliers
+ * `/config palier` et taux par drogue). Une catégorie sans taux ne
  * contribue rien — voir docstring de fichier.
  */
-function computeSalaire(byQuotaType: Record<string, number>, rates: Record<string, number>, venteByItem: Record<string, number> = {}, itemRates: Record<string, number> = {}): number {
+function computeSalaire(byQuotaType: Record<string, number>, c: configStore.BotConfig, venteByItem: Record<string, number> | null): number {
   let sum = 0;
-  for (const [qt, rate] of Object.entries(rates)) {
+  for (const [qt, rate] of Object.entries(c.SALARY_RATES)) {
     if (qt === 'vente') continue;
     sum += (byQuotaType[qt] ?? 0) * rate;
   }
-  const venteRate = rates.vente ?? 0;
-  for (const [item, qty] of Object.entries(venteByItem)) {
-    sum += qty * (itemRates[item] ?? venteRate);
-  }
+  for (const part of computeVentePayParts(byQuotaType.vente ?? 0, venteByItem, c)) sum += part.pay;
   return sum;
 }
 
@@ -314,9 +369,8 @@ async function getVenteByItemMap(guildId: string, sinceTs: number, untilTs: numb
 async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }>> {
   const c = configStore.get(guildId);
   // Requête Transaction supplémentaire seulement si la guilde utilise un taux
-  // par drogue — sinon `itemRates` est vide et `computeSalaire` retombe de
-  // toute façon sur `venteRate` pour chaque item, la lecture serait jetée.
-  const hasItemOverrides = Object.keys(c.ITEM_SALARY_RATES).length > 0;
+  // ou un palier par drogue — sinon le total "vente" agrégé de Stat suffit.
+  const hasItemOverrides = hasVenteItemOverrides(c);
   const since = hasItemOverrides ? Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0) : 0;
   const [summaries, venteByItemMap] = await Promise.all([
     getAllUserQuotaSummaries(guildId),
@@ -324,7 +378,7 @@ async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string
   ]);
   const results: Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }> = [];
   for (const [userId, { byQuotaType }] of summaries) {
-    const salaire = computeSalaire(byQuotaType, c.SALARY_RATES, venteByItemMap.get(userId), c.ITEM_SALARY_RATES);
+    const salaire = computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null);
     if (salaire > 0) results.push({ userId, salaire, byQuotaType });
   }
   return results.sort((a, b) => b.salaire - a.salaire);
@@ -335,10 +389,10 @@ async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string
 // Les fonctions au-dessus (getUserQuotaSummary, getAllUserQuotaSummaries,
 // getSalaryRanking) lisent le cache `Stat`, qui ne connaît QUE la période en
 // cours (vidé entièrement à chaque reset hebdo, voir weeklyReset) — SAUF
-// exception étroite et volontaire : dès qu'un taux par item existe
-// (`ITEM_SALARY_RATES` non vide), `getSalaryRanking` lit aussi `Transaction`
+// exception étroite et volontaire : dès qu'un taux ou palier par item existe
+// (`hasVenteItemOverrides`), `getSalaryRanking` lit aussi `Transaction`
 // via `getVenteByItemMap`, `Stat` ne gardant qu'un total "vente" agrégé sans
-// détail par drogue (voir docstring de `computeSalaire`). Sans taux par
+// détail par drogue (voir `computeVentePayParts`). Sans taux/palier par
 // item configuré (cas par défaut), aucune lecture supplémentaire n'a lieu.
 // Les fonctions ci-dessous reconstruisent le même calcul depuis `Transaction`
 // (jamais purgée, juste soft-delete) sur une plage [since, until) arbitraire
@@ -349,8 +403,8 @@ async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string
 // cours" (Stat) et "semaine passée" (Transaction) en deux logiques à
 // maintenir en parallèle.
 //
-// ATTENTION : les objectifs (`/config quota`) et taux de paie (`/config
-// salaire`) ne sont PAS historisés — seule la valeur actuelle existe. Ces
+// ATTENTION : les objectifs (`/config quota`), taux de paie (`/config
+// salaire`) et paliers (`/config palier`) ne sont PAS historisés — seule la valeur actuelle existe. Ces
 // fonctions appliquent donc les taux/objectifs ACTUELS à l'activité d'une
 // semaine passée, pas ceux réellement en vigueur à l'époque si l'admin les a
 // changés depuis.
@@ -386,23 +440,23 @@ export async function getAllUserQuotaSummariesForRange(guildId: string, range: Q
 /** Paie d'un joueur (taux actuels appliqués à l'activité de la plage) — voir note ci-dessus sur les taux non historisés. */
 export async function getUserPayForRange(guildId: string, userId: string, range: QuotaRange): Promise<{ salaire: number; byQuotaType: Record<string, number> }> {
   const c = configStore.get(guildId);
-  const hasItemOverrides = Object.keys(c.ITEM_SALARY_RATES).length > 0;
+  const hasItemOverrides = hasVenteItemOverrides(c);
   const [{ byQuotaType }, venteByItemMap] = await Promise.all([
     getUserQuotaSummaryForRange(guildId, userId, range),
     hasItemOverrides ? getVenteByItemMap(guildId, range.since, range.until, userId) : Promise.resolve(new Map<string, Record<string, number>>()),
   ]);
-  return { salaire: computeSalaire(byQuotaType, c.SALARY_RATES, venteByItemMap.get(userId), c.ITEM_SALARY_RATES), byQuotaType };
+  return { salaire: computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null), byQuotaType };
 }
 
 /** Paie de tous les joueurs suivis sur la plage, y compris à 0$ (contrairement à `getSalaryRanking`) — pas triée. */
 export async function getAllUserPayForRange(guildId: string, range: QuotaRange): Promise<Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }>> {
   const c = configStore.get(guildId);
-  const hasItemOverrides = Object.keys(c.ITEM_SALARY_RATES).length > 0;
+  const hasItemOverrides = hasVenteItemOverrides(c);
   const [summaries, venteByItemMap] = await Promise.all([
     getAllUserQuotaSummariesForRange(guildId, range),
     hasItemOverrides ? getVenteByItemMap(guildId, range.since, range.until) : Promise.resolve(new Map<string, Record<string, number>>()),
   ]);
-  return summaries.map(({ userId, byQuotaType }) => ({ userId, salaire: computeSalaire(byQuotaType, c.SALARY_RATES, venteByItemMap.get(userId), c.ITEM_SALARY_RATES), byQuotaType }));
+  return summaries.map(({ userId, byQuotaType }) => ({ userId, salaire: computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null), byQuotaType }));
 }
 
 /** Comme `getClassementRanking`, mais sur une plage arbitraire — mêmes règles (triée décroissant, uniquement points > 0), reconstruite depuis `Transaction` comme les autres `*ForRange` (voir note en tête de section). */
@@ -429,45 +483,46 @@ export async function getGroupSummaryForRange(guildId: string, range: QuotaRange
   }));
 }
 
-/** Embed de paie personnelle : détail par catégorie payante (vente détaillée par item si des taux par item existent) + salaire total + classement. */
+/** Embed de paie personnelle : détail par catégorie payante (vente détaillée par drogue si un taux/palier par item existe) + salaire total + classement. */
 async function buildPayEmbed(guildId: string, userId: string, member: GuildMember | null): Promise<EmbedBuilder> {
   const c = configStore.get(guildId);
   const rates = c.SALARY_RATES;
-  const itemRates = c.ITEM_SALARY_RATES;
-  const hasItemOverrides = Object.keys(itemRates).length > 0;
+  const hasItemOverrides = hasVenteItemOverrides(c);
 
   const since = Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
   const [{ byQuotaType }, venteByItemMap] = await Promise.all([
     getUserQuotaSummary(guildId, userId),
     hasItemOverrides ? getVenteByItemMap(guildId, since, Date.now(), userId) : Promise.resolve(new Map<string, Record<string, number>>()),
   ]);
-  const venteByItem = venteByItemMap.get(userId) ?? {};
-  const salaire = computeSalaire(byQuotaType, rates, venteByItem, itemRates);
+  const venteByItem = hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null;
+  const salaire = computeSalaire(byQuotaType, c, venteByItem);
 
   const embed = new EmbedBuilder().setTitle(`💰 Ma Paie — ${member?.displayName || userId}`).setColor(0xFEE75C);
 
   const categories = new Set(Object.keys(rates));
-  if (hasItemOverrides) categories.add('vente');
+  if (hasItemOverrides || c.VENTE_PALIERS.general.length) categories.add('vente');
   const sortedCategories = [...categories].sort();
   if (!sortedCategories.length) {
     embed.setDescription("*Aucun taux de paie configuré (voir `/config salaire set`).*");
     return embed;
   }
 
-  // "vente" se détaille par item dès qu'un taux par item existe pour cette
-  // guilde (voir /config salaire set item:) — sinon comportement inchangé
-  // (une seule ligne, taux général appliqué au total agrégé du cache Stat).
+  const fmt = (n: number) => Math.round(n).toLocaleString('fr-FR');
   const detail = sortedCategories.map(qt => {
-    if (qt === 'vente' && hasItemOverrides) {
-      const items = Object.keys(venteByItem).sort();
-      if (!items.length) return `• Vente : 0 × ${rates.vente ?? 0}$ = **0$**`;
-      return items.map(item => {
-        const qty = venteByItem[item];
-        const rate = itemRates[item] ?? rates.vente ?? 0;
-        return `• Vente ${item} : ${qty} × ${rate}$ = **${Math.round(qty * rate).toLocaleString('fr-FR')}$**`;
-      }).join('\n');
+    if (qt === 'vente') {
+      const parts = computeVentePayParts(byQuotaType.vente ?? 0, venteByItem, c);
+      // Une ligne "(reste)" seulement si au moins une drogue a été isolée —
+      // sinon elle porterait tout le total sous un libellé trompeur.
+      const isolated = parts.length > 1;
+      return parts
+        .filter(p => p.item != null || !isolated || p.qty > 0)
+        .map(p => {
+          const label = p.item ?? (isolated ? '(reste)' : '');
+          const calc = p.rate == null ? `${p.qty} (palier)` : `${p.qty} × ${p.rate}$`;
+          return `• Vente${label ? ` ${label}` : ''} : ${calc} = **${fmt(p.pay)}$**`;
+        }).join('\n');
     }
-    return `• ${capitalize(qt)} : ${byQuotaType[qt] ?? 0} × ${rates[qt]}$ = **${Math.round((byQuotaType[qt] ?? 0) * rates[qt]).toLocaleString('fr-FR')}$**`;
+    return `• ${capitalize(qt)} : ${byQuotaType[qt] ?? 0} × ${rates[qt]}$ = **${fmt((byQuotaType[qt] ?? 0) * rates[qt])}$**`;
   }).join('\n');
 
   const ranking = await getSalaryRanking(guildId);

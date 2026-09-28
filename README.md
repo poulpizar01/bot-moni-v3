@@ -173,7 +173,7 @@ Plusieurs niveaux d'accès : **membre du serveur Discord** (suffit pour la plupa
 | `GET /api/stocks/:channelId` | Membre/Admin | Stock actuel de chaque item pour UN coffre précis — 403 si ce coffre est un coffre admin et que le requérant ne l'est pas |
 | `GET /api/stocks/history?item=&channelId=&limit=` | Membre/Admin | Derniers mouvements, filtrables par item et/ou coffre (défaut 20, max 200) — les mouvements des coffres admin n'apparaissent que pour un admin (403 si un non-admin les demande explicitement) |
 | `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis, avec leur nom (`name`) |
-| `GET /api/quotas/config?week=` | Membre | De quoi interpréter les autres réponses : plage `[since, until)` résolue, objectifs (`/config quota`) et taux (`/config salaire`, `/config classement`) **actuels**, libellés des activités |
+| `GET /api/quotas/config?week=` | Membre | De quoi interpréter les autres réponses : plage `[since, until)` résolue, objectifs (`/config quota`), taux (`/config salaire`, `/config classement`) et paliers de paie vente (`/config palier`, champ `salaryTiers`) **actuels**, libellés des activités |
 | `GET /api/quotas/:userId?week=` | Soi-même/Admin | Quota d'un joueur précis |
 | `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$, avec leur nom (`name`) |
 | `GET /api/quotas/pay/:userId?week=` | Soi-même/Admin | Paie d'un joueur précis |
@@ -197,7 +197,7 @@ Lecture seule pour l'instant — pas d'écriture depuis l'extérieur (voir docst
 
 Les 6 endpoints `/api/quotas*` et les 2 endpoints `/api/ventes*` acceptent un paramètre `week` (semaine ISO 8601, ex. `2026-W37`, lundi 00:00 UTC → lundi suivant, résolu par `src/api/week.ts`) — sans ce paramètre, ils portent sur la semaine en cours (depuis le dernier reset hebdomadaire). Reconstruit depuis la table `transactions` (jamais purgée, une ligne par déclaration) plutôt que le cache `stats` (vidé entièrement à chaque reset) — voir les fonctions `*ForRange` dans `modules/quotas.ts` et `getVenteTotalsForRange`/`getVenteDetailForUser` dans `db.ts`. Une vente confirmée écrit une `transaction` (`action: 'vente'`) comme n'importe quelle activité, donc le `total` de `/api/ventes` est toujours identique au `vente` d'un quota pour la même plage — une seule vérité.
 
-**Limite à connaître** : les objectifs (`/config quota`) et taux de paie (`/config salaire`) ne sont **pas historisés** — seule la valeur actuelle existe en base. Une requête sur une semaine passée applique donc les objectifs/taux *actuels* à l'activité de cette semaine-là, pas ceux réellement en vigueur à l'époque si l'admin les a changés depuis (n'affecte pas `/api/ventes`, qui ne dépend d'aucun taux). Si ça devient un problème pour `/api/quotas*`, il faudrait historiser `QuotaTarget`/`SalaryRate` (nouvelle table, logique de résolution "valeur en vigueur à telle date") — pas fait pour l'instant.
+**Limite à connaître** : les objectifs (`/config quota`) et taux de paie (`/config salaire`) ne sont **pas historisés** — seule la valeur actuelle existe en base. Une requête sur une semaine passée applique donc les objectifs/taux *actuels* à l'activité de cette semaine-là, pas ceux réellement en vigueur à l'époque si l'admin les a changés depuis (n'affecte pas `/api/ventes`, qui ne dépend d'aucun taux). Même chose pour les paliers de `/config palier`. Si ça devient un problème pour `/api/quotas*`, il faudrait historiser `QuotaTarget`/`SalaryRate` (nouvelle table, logique de résolution "valeur en vigueur à telle date") — pas fait pour l'instant.
 
 ### Types de taxe (`?type=`)
 
@@ -254,6 +254,19 @@ Taux de paie ($ par unité) par catégorie de quota — mêmes catégories que `
 - `/config salaire set <quota_type> <valeur>` / `remove` / `list`
 
 Exemple : `/config salaire set vente 30` → chaque unité vendue rapporte 30$. On peut faire pareil pour `labos`, `recolte`, etc. — indépendamment des objectifs fixés par `/config quota` (une catégorie peut avoir un objectif sans taux de paie, un taux sans objectif, ou les deux).
+
+`/config salaire set vente <valeur> item:<drogue>` fixe un taux propre à une drogue, qui remplace le taux général "vente" pour elle seule.
+
+### `/config palier` — paie progressive de la vente
+Barème par tranches de quantité vendue dans la semaine, **uniquement pour la catégorie `vente`**. Il remplace le taux plat `/config salaire` quand il existe.
+- `/config palier add <valeur> [jusqua] [item]` — ajoute une tranche après la dernière existante. `jusqua` omis = tranche finale, sans limite (elle ferme le barème). Chaque borne doit dépasser la précédente.
+- `/config palier remove [jusqua] [item]` — retire une tranche (`jusqua` omis = la tranche finale).
+- `/config palier clear [item]` — retire tout le barème.
+- `/config palier list` — affiche les barèmes.
+
+**Calcul progressif**, comme un barème d'impôt : chaque tranche est payée à son propre taux. Avec `add 10 jusqua:100`, `add 15 jusqua:300`, `add 20`, vendre 250 unités rapporte `100×10 + 150×15 = 3250$` (jamais `250×15`). Sans tranche finale, les unités au-delà de la dernière borne ne rapportent rien (`list` le signale).
+
+`item` omis = barème général ; sinon barème propre à une drogue. Priorité, drogue par drogue : **palier de la drogue > taux de la drogue > palier général > taux général**. Les drogues sans palier/taux propre sont additionnées avant d'appliquer le barème général (30 + 80 unités de deux drogues = 110 unités dans le même barème, pas deux fois la première tranche).
 
 ### `/config site-externe` — site web autorisé à utiliser l'API REST
 Uniquement pertinent si l'API REST est activée (`API_PORT`, voir "Interopérabilité" plus haut). Chaque serveur Discord (guilde) configure le sien indépendamment.

@@ -56,7 +56,7 @@ const ROLE_TARGETS = [
   { name: 'Rôle accès taxes (back-office web)', value: 'taxes' },
 ];
 
-/** Déclare la commande `/config` et tous ses sous-groupes (channel, role, item, quota, salaire, type-groupe). `guildId` : les choix de `labo_lie` viennent du registre d'activités de CETTE guilde (déjà chargé en cache à ce stade — voir `bootstrapGuild` dans index.ts, qui appelle `configStore.reload()` avant `deployCommandsForGuild`). */
+/** Déclare la commande `/config` et tous ses sous-groupes (channel, role, item, quota, salaire, palier, classement, type-groupe, category, site-externe). `guildId` : les choix de `labo_lie` viennent du registre d'activités de CETTE guilde (déjà chargé en cache à ce stade — voir `bootstrapGuild` dans index.ts, qui appelle `configStore.reload()` avant `deployCommandsForGuild`). */
 export function getCommands(guildId: string) {
   const cmd = new SlashCommandBuilder()
     .setName('config')
@@ -159,6 +159,28 @@ export function getCommands(guildId: string) {
       .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true))
       .addStringOption(o => o.setName('item').setDescription('Optionnel — ne retire que le taux spécifique à cette drogue').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s => s.setName('list').setDescription('Liste les taux de paie configurés')));
+
+  // Groupe séparé de `salaire` et pas imbriqué dedans : Discord n'autorise
+  // pas un groupe de sous-commandes dans un autre (profondeur max 2).
+  cmd.addSubcommandGroup(g => g
+    .setName('palier')
+    .setDescription('Paie progressive de la vente par tranches de quantité (remplace le taux plat)')
+    .addSubcommand(s => s
+      .setName('add')
+      .setDescription('Ajoute une tranche au barème (après la dernière existante)')
+      .addNumberOption(o => o.setName('valeur').setDescription('Montant en $ par unité dans cette tranche').setRequired(true).setMinValue(0))
+      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche — omise = tranche finale, sans limite').setRequired(false).setMinValue(1))
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s => s
+      .setName('remove')
+      .setDescription("Retire une tranche d'un barème")
+      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche à retirer — omise = la tranche finale').setRequired(false).setMinValue(1))
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s => s
+      .setName('clear')
+      .setDescription("Retire tout un barème (général, ou d'une drogue précise)")
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('list').setDescription('Liste les barèmes de paie par palier')));
 
   cmd.addSubcommandGroup(g => g
     .setName('classement')
@@ -302,6 +324,7 @@ export async function handleCommand(interaction: ChatInputCommandInteraction): P
   if (group === 'item') return handleItem(interaction, guildId, sub);
   if (group === 'quota') return handleQuota(interaction, guildId, sub);
   if (group === 'salaire') return handleSalaire(interaction, guildId, sub);
+  if (group === 'palier') return handlePalier(interaction, guildId, sub);
   if (group === 'classement') return handleClassement(interaction, guildId, sub);
   if (group === 'type-groupe') return handleTypeGroupe(interaction, guildId, sub);
   if (group === 'category') return handleCategory(interaction, guildId, sub);
@@ -518,6 +541,77 @@ async function handleSalaire(interaction: ChatInputCommandInteraction, guildId: 
       lines.push(...itemRates.map(r => `**${r.item}** : ${r.amount}$/unité`));
     }
     const embed = new EmbedBuilder().setTitle('⚙️ Taux de paie').setDescription(lines.join('\n')).setColor(0x5865f2);
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  }
+}
+
+/** Une tranche lisible : « 0 → 100 : 10$/unité », « 300+ : 20$/unité ». */
+function formatTiers(tiers: Array<{ upTo: number | null; amount: number }>): string[] {
+  let prev = 0;
+  const lines = tiers.map(t => {
+    const line = t.upTo == null ? `${prev}+ : ${t.amount}$/unité` : `${prev} → ${t.upTo} : ${t.amount}$/unité`;
+    if (t.upTo != null) prev = t.upTo;
+    return line;
+  });
+  // computeTierPay ne paie rien au-delà de la dernière borne finie.
+  if (tiers.length && tiers[tiers.length - 1].upTo != null) lines.push(`⚠️ Pas de tranche finale : au-delà de ${prev}, 0$/unité.`);
+  return lines;
+}
+
+/**
+ * `/config palier add|remove|clear|list` — barème de paie progressif pour la
+ * vente (voir `computeTierPay` dans quotas.ts). Les tranches s'ajoutent dans
+ * l'ordre : chaque borne doit dépasser la précédente, et une tranche finale
+ * (sans `jusqua`) ferme le barème — vérifié ici plutôt qu'en base.
+ */
+async function handlePalier(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
+  const item = interaction.options.getString('item');
+  const target = item ? `**${item}**` : 'général (vente)';
+  if (sub === 'add') {
+    const valeur = interaction.options.getNumber('valeur', true);
+    const jusqua = interaction.options.getInteger('jusqua');
+    const existing = await db.getSalaryTiersFor(guildId, item);
+    if (existing.some(t => t.upTo == null)) {
+      await interaction.reply({ content: `❌ Le barème ${target} a déjà une tranche finale (sans limite). Retire-la d'abord avec \`/config palier remove\` sans \`jusqua\`.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const maxBound = Math.max(0, ...existing.map(t => t.upTo ?? 0));
+    if (jusqua != null && jusqua <= maxBound) {
+      await interaction.reply({ content: `❌ \`jusqua\` doit être strictement supérieur à la dernière borne du barème ${target} (${maxBound}).`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await configStore.mutate(guildId, () => db.addSalaryTier(guildId, item, jusqua, valeur));
+    const range = jusqua == null ? `${maxBound}+` : `${maxBound} → ${jusqua}`;
+    await interaction.reply({ content: `✅ Palier ${target} : ${range} → ${valeur}$/unité.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (sub === 'remove') {
+    const jusqua = interaction.options.getInteger('jusqua');
+    const count = await configStore.mutate(guildId, () => db.removeSalaryTier(guildId, item, jusqua));
+    const which = jusqua == null ? 'finale' : `jusqu'à ${jusqua}`;
+    await interaction.reply({ content: count ? `✅ Tranche ${which} du barème ${target} retirée.` : `❌ Aucune tranche ${which} dans le barème ${target}.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (sub === 'clear') {
+    const count = await configStore.mutate(guildId, () => db.clearSalaryTiers(guildId, item));
+    await interaction.reply({ content: count ? `✅ Barème ${target} retiré (${count} tranche(s)).` : `❌ Aucun barème ${target} configuré.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (sub === 'list') {
+    const { general, byItem } = configStore.get(guildId).VENTE_PALIERS;
+    const items = Object.keys(byItem).sort();
+    if (!general.length && !items.length) {
+      await interaction.reply({ content: 'Aucun barème par palier configuré — la vente est payée au taux plat de `/config salaire`.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const lines: string[] = [];
+    if (general.length) lines.push('__Barème général (vente)__', ...formatTiers(general));
+    for (const it of items) lines.push('', `__${it}__`, ...formatTiers(byItem[it]));
+    const embed = new EmbedBuilder()
+      .setTitle('⚙️ Paliers de paie (vente)')
+      .setDescription(lines.join('\n'))
+      .setFooter({ text: 'Priorité par drogue : palier de la drogue > taux de la drogue > palier général > taux général.' })
+      .setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 }
@@ -927,7 +1021,7 @@ export async function handleAutocomplete(interaction: AutocompleteInteraction): 
 
   let source: string[] = [];
   if (group === 'item') source = (await db.getAllItems(interaction.guildId!)).map(i => i.name);
-  if (group === 'salaire') source = configStore.get(interaction.guildId!).VENTE_ITEMS;
+  if (group === 'salaire' || group === 'palier') source = configStore.get(interaction.guildId!).VENTE_ITEMS;
 
   const results = source.filter(v => v.toLowerCase().includes(query)).slice(0, 25);
   await interaction.respond(results.map(v => ({ name: v, value: v }))).catch(() => null);

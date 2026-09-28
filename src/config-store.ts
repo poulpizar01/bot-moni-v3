@@ -185,12 +185,20 @@ export interface BotConfig {
   SALARY_RATES: Record<string, number>;
   /** $ par unité, par item vendu — override de `SALARY_RATES['vente']` pour cet item précis (voir `/config salaire set item:` et `computeSalaire` dans quotas.ts). Item absent = taux général "vente" appliqué. */
   ITEM_SALARY_RATES: Record<string, number>;
+  /** Barèmes de paie progressifs de la catégorie "vente" (`/config palier`) — `general` pour toutes les drogues, `byItem` pour une drogue précise. Chaque tableau est trié par `upTo` croissant, tranche finale (`upTo` null) en dernier. Priorité par item : palier item > taux item > palier général > taux général (voir `computeVentePay` dans quotas.ts). */
+  VENTE_PALIERS: { general: SalaryTierEntry[]; byItem: Record<string, SalaryTierEntry[]> };
   /** Points par unité, par catégorie de quota — voir `/config classement` et `computeClassement` dans quotas.ts. Catégorie absente = aucun point pour elle. */
   CLASSEMENT_RATES: Record<string, number>;
   /** Points par déclaration, par activité de la famille "actions" — override de `CLASSEMENT_RATES['actions']` pour cette activité précise (voir `/config classement set activite:`). Activité absente = nombre général "actions" appliqué. */
   ACTIVITY_CLASSEMENT_RATES: Record<string, number>;
   /** Tier courant — voir `/config type-groupe` et {@link DEFAULT_GROUP_TIER}. */
   TYPE_GROUPE: GroupTier;
+}
+
+/** Une tranche de barème de paie : payée `amount` $/unité entre la borne de la tranche précédente et `upTo` (null = sans limite). */
+export interface SalaryTierEntry {
+  upTo: number | null;
+  amount: number;
 }
 
 /** Un cache `BotConfig` par guilde — jamais de config globale unique (voir docstring de fichier). */
@@ -276,6 +284,14 @@ export async function reload(guildId: string): Promise<BotConfig> {
   const ITEM_SALARY_RATES: Record<string, number> = {};
   for (const row of await db.getAllItemSalaryRates(guildId)) ITEM_SALARY_RATES[row.item] = row.amount;
 
+  // getAllSalaryTiers trie déjà par borne croissante, tranche finale en dernier.
+  const VENTE_PALIERS: BotConfig['VENTE_PALIERS'] = { general: [], byItem: {} };
+  for (const row of await db.getAllSalaryTiers(guildId)) {
+    const entry = { upTo: row.upTo, amount: row.amount };
+    if (row.item == null) VENTE_PALIERS.general.push(entry);
+    else (VENTE_PALIERS.byItem[row.item] ??= []).push(entry);
+  }
+
   const CLASSEMENT_RATES: Record<string, number> = {};
   for (const row of await db.getAllClassementRates(guildId)) CLASSEMENT_RATES[row.quotaType] = row.amount;
 
@@ -299,6 +315,7 @@ export async function reload(guildId: string): Promise<BotConfig> {
     TAXES_ROLE_ID: rolesByTarget.taxes ?? null,
     SALARY_RATES,
     ITEM_SALARY_RATES,
+    VENTE_PALIERS,
     CLASSEMENT_RATES,
     ACTIVITY_CLASSEMENT_RATES,
     TYPE_GROUPE,

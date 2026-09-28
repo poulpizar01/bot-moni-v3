@@ -186,6 +186,24 @@ model ItemSalaryRate {
   @@map("item_salary_rates")
 }
 
+/// Tranche d'un barème de paie progressif pour la catégorie "vente" — voir
+/// `computeTierPay` dans src/modules/quotas.ts. `item` null = barème général,
+/// sinon propre à cette drogue. Chaque tranche [borne précédente, upTo] est
+/// payée à SON taux (comme un barème d'impôt). `upTo` null = tranche finale
+/// sans limite : au plus une par (guildId, item), vérifié dans le code
+/// (`/config palier add`), pas par une contrainte DB — un NULL n'est jamais
+/// égal à un autre NULL pour un index unique Postgres.
+model SalaryTier {
+  guildId String  @map("guild_id")
+  id      Int     @id @default(autoincrement())
+  item    String?
+  upTo    Int?    @map("up_to")
+  amount  Float
+
+  @@index([guildId, item])
+  @@map("salary_tiers")
+}
+
 /// Points de classement ($ par unité → ici points par unité) par catégorie de
 /// quota — même principe que SalaryRate, pour un classement par points plutôt
 /// que par salaire. Voir `computeClassement` dans src/modules/quotas.ts.

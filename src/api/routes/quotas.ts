@@ -37,8 +37,8 @@ router.get('/', async (req, res) => {
  * INTERPRÉTER les autres réponses de ce groupe, sans le recalculer lui-même :
  * la plage `[since, until)` effectivement résolue (semaine en cours = depuis
  * le dernier reset hebdo, sinon la semaine ISO demandée), les objectifs
- * hebdomadaires (`/config quota`) et les taux de paie (`/config salaire`)
- * ACTUELS — ce sont ceux appliqués à n'importe quelle plage, voir la limite
+ * hebdomadaires (`/config quota`), les taux de paie (`/config salaire`) et
+ * les paliers de paie vente (`/config palier`) ACTUELS — ce sont ceux appliqués à n'importe quelle plage, voir la limite
  * documentée en tête de fichier. Les catégories de quota et leurs libellés
  * viennent du même registre `ACTIVITY_TYPES` que les calculs.
  */
@@ -56,6 +56,7 @@ router.get('/config', async (req, res) => {
     targets: c.QUOTA_TARGETS,
     salaryRates: c.SALARY_RATES,
     itemSalaryRates: c.ITEM_SALARY_RATES,
+    salaryTiers: c.VENTE_PALIERS,
     classementRates: c.CLASSEMENT_RATES,
     activities,
   });

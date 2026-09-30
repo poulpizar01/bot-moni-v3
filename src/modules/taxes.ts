@@ -211,6 +211,24 @@ function typeLabel(type: string): string {
   return ZONE_BY_KEY.get(type) ?? type;
 }
 
+/**
+ * Référentiel des types de taxe pour l'API (`GET /api/taxes/types`) : TOUS
+ * les types fixes et zones connus, tous tiers confondus — pour qu'un client
+ * puisse nommer une taxe orpheline sortie du barème après un changement de
+ * tier. `available` = proposé à la création pour le tier courant.
+ */
+export function getTaxesReferentiel(guildId: string) {
+  const tierKey = configStore.get(guildId).TYPE_GROUPE;
+  const tierLabel = configStore.GROUP_TIERS.find(t => t.key === tierKey)?.label ?? tierKey;
+  const fixesActuelles = new Set<FixedType>(currentTaxesFixes(guildId));
+  const zonesActuelles = new Set(currentZones(guildId));
+  return {
+    tier: { key: tierKey, label: tierLabel },
+    fixed: FIXED_TYPES.map(key => ({ key, label: typeLabel(key), available: key === 'vente' || fixesActuelles.has(key) })),
+    zones: ALL_ZONES.map(zone => ({ key: slugifyZone(zone), label: zone, available: zonesActuelles.has(zone) })),
+  };
+}
+
 // ─── EMBED TAXE ───────────────────────────────────────────────────────────────
 
 /** Embed de détail d'une taxe : type, statut, échéance, paiement, et téléphone/mot de passe si présents. */

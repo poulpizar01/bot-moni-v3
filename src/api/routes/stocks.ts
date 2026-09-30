@@ -6,7 +6,7 @@
  * somme, recalculée à chaque lecture (voir `db.getAllStocks`) — les deux ne
  * peuvent donc jamais diverger.
  *
- * Routes statiques `/history`/`/channels` déclarées AVANT `/:channelId` —
+ * Routes statiques `/history`/`/channels`/`/items` déclarées AVANT `/:channelId` —
  * sinon Express interpréterait `/stocks/history` ou `/stocks/channels`
  * comme une recherche du coffre du même nom (même principe que
  * `/api/quotas`, `/:userId` toujours en dernier).
@@ -87,6 +87,11 @@ router.get('/channels', async (req, res) => {
     ? (await db.getChannelsWithLabel(apiUser.guildId, 'logs_coffres_admin')).map(c => ({ ...c, role: 'logs_coffres_admin' as const }))
     : [];
   res.json([...normaux, ...admin]);
+});
+
+/** GET /api/stocks/items — configuration brute de tous les items suivis (`/config item`), dans l'ordre d'affichage — y compris ceux qui n'ont encore aucun stock. */
+router.get('/items', async (req, res) => {
+  res.json(await db.getAllItems(req.apiUser!.guildId));
 });
 
 /**

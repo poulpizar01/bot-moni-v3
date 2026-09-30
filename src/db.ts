@@ -683,7 +683,17 @@ export async function getFabricationMunitionsHistorique(guildId: string, limite 
     where: { guildId, action: 'fabrication_munitions', deleted: false },
     orderBy: { timestamp: 'desc' },
     take: limite,
-    select: { timestamp: true, quantite: true, username: true },
+    select: { timestamp: true, quantite: true, username: true, userId: true },
+  });
+  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
+}
+
+/** Déclarations de fabrication de munitions depuis `sinceTs`, du plus récent au plus ancien — pas de limite, contrairement à {@link getFabricationMunitionsHistorique} (miroir de {@link getMunitionsVentesDepuis}). */
+export async function getFabricationMunitionsDepuis(guildId: string, sinceTs: number) {
+  const rows = await prisma.transaction.findMany({
+    where: { guildId, action: 'fabrication_munitions', deleted: false, timestamp: { gte: new Date(sinceTs) } },
+    orderBy: { timestamp: 'desc' },
+    select: { timestamp: true, quantite: true, username: true, userId: true },
   });
   return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
 }
@@ -1233,6 +1243,16 @@ export async function setVehiculeEtat(guildId: string, data: { plaque: string; m
 /** Efface le responsable courant d'un véhicule (rangé proprement dans un garage). */
 export async function clearVehiculeEtat(guildId: string, plaque: string): Promise<void> {
   await prisma.vehicule.updateMany({ where: { guildId, plaque }, data: { discordId: null, joueur: null } });
+}
+
+/** Véhicules actuellement sortis (responsable connu, pas encore rangés), du plus récent au plus ancien. */
+export async function getVehiculesSortis(guildId: string) {
+  const rows = await prisma.vehicule.findMany({
+    where: { guildId, joueur: { not: null } },
+    orderBy: { timestamp: 'desc' },
+    select: { plaque: true, modele: true, discordId: true, joueur: true, timestamp: true },
+  });
+  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
 }
 
 /** Enregistre une mise en fourrière et retourne son ID. */

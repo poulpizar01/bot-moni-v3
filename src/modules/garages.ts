@@ -27,8 +27,8 @@ import * as db from '../db';
 import * as configStore from '../config-store';
 import { isAdmin } from '../permissions';
 
-/** Amende indicative par mise en fourrière — valeur fixe, ne bouge jamais. */
-const MONTANT_FOURRIERE = 350;
+/** Amende indicative par mise en fourrière — valeur fixe, ne bouge jamais. Exportée pour `GET /api/garages/impounds`. */
+export const MONTANT_FOURRIERE = 350;
 
 const RE_SORTIE_FOURRIERE = /^\*\*(.+?)\*\* a sorti un\(e\) (.+?) de la fourrière ?: \*\*(.+?)\*\*$/im;
 const RE_SORTIE_GARAGE = /^\*\*(.+?)\*\* a sorti un\(e\) (.+?) (?:du garage \d+|de son garage public) ?: \*\*(.+?)\*\*$/im;

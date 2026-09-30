@@ -17,7 +17,7 @@
  */
 import { Router } from 'express';
 import * as db from '../../db';
-import { getMunitionsSummary } from '../../modules/armurerie';
+import { getMunitionsSummary, getArmeTypes } from '../../modules/armurerie';
 import { avecNoms } from '../noms';
 
 const router = Router();
@@ -60,6 +60,11 @@ router.get('/search', async (req, res) => {
   res.json(armes);
 });
 
+/** GET /api/armurerie/types — référentiel des modèles d'armes (`key`, `label`, `category` informative). */
+router.get('/types', (_req, res) => {
+  res.json(getArmeTypes());
+});
+
 /** GET /api/armurerie/ammo — stock réel pistolet + SMG ; `fabricationType` ('pistolet'/'smg'/null selon le tier) indique lequel des deux les compteurs hebdomadaires indicatifs (`fabriqueesCetteSemaine`/`vendusCetteSemaine`) concernent actuellement. */
 router.get('/ammo', async (req, res) => {
   res.json(await getMunitionsSummary(req.apiUser!.guildId));
@@ -70,6 +75,13 @@ router.get('/ammo/history', async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const sinceReset = Number((await db.getSetting(guildId, 'last_weekly_reset')) || 0);
   res.json(await avecNoms(guildId, await db.getMunitionsVentesDepuis(guildId, sinceReset), 'acheteur_id'));
+});
+
+/** GET /api/armurerie/ammo/production — déclarations de fabrication de munitions depuis le dernier reset hebdomadaire, la plus récente en premier — même fenêtre que `fabriqueesCetteSemaine` de `/ammo`, en détail. */
+router.get('/ammo/production', async (req, res) => {
+  const guildId = req.apiUser!.guildId;
+  const sinceReset = Number((await db.getSetting(guildId, 'last_weekly_reset')) || 0);
+  res.json(await avecNoms(guildId, await db.getFabricationMunitionsDepuis(guildId, sinceReset)));
 });
 
 export default router;

@@ -13,7 +13,7 @@
  * `/config channel list` côté Discord, ou `/api/taxes?type=zone` pour lister
  * les zones existantes, n'a pas besoin d'être connue à l'avance).
  *
- * Ordre des routes : `/` puis `/search`, `/:id` toujours en dernier (même
+ * Ordre des routes : `/` puis `/search`/`/types`, `/:id` toujours en dernier (même
  * convention que les autres groupes de l'API). `/` et `/search` renvoient
  * les infos générales d'une taxe (vue "liste") — `telephone`/`mot_de_passe`
  * sont réservés au détail d'UNE taxe précise (`/:id`, voir `db.getTaxe` vs
@@ -21,7 +21,7 @@
  */
 import { Router } from 'express';
 import * as db from '../../db';
-import { FIXED_TYPES, ZONE_TYPE_KEYS, isZoneType } from '../../modules/taxes';
+import { FIXED_TYPES, ZONE_TYPE_KEYS, isZoneType, getTaxesReferentiel } from '../../modules/taxes';
 
 const router = Router();
 
@@ -85,6 +85,15 @@ router.get('/search', async (req, res) => {
 
   const query = typeof req.query.q === 'string' ? req.query.q : undefined;
   res.json(await db.findTaxes(req.apiUser!.guildId, { types, query, limit: 25 }));
+});
+
+/**
+ * GET /api/taxes/types — référentiel des types fixes et zones (tous tiers,
+ * avec `available` pour le tier courant), voir `getTaxesReferentiel` — évite
+ * à un client de recopier ces listes en dur.
+ */
+router.get('/types', (req, res) => {
+  res.json(getTaxesReferentiel(req.apiUser!.guildId));
 });
 
 /**

@@ -43,7 +43,7 @@ export const CHANNEL_ROLES = [
   'alertes_taxes', 'historique_stock', 'ventes_drogue', 'log_ventes',
   'admin', 'logs_garages', 'labo_heroine', 'labo_sporex',
   'labo_mexicana', 'labo_cannabis', 'labo_cocaine', 'labo_salvia',
-  'labo_branche_cannabis',
+  'labo_branche_cannabis', 'avertissements',
 ] as const;
 
 export type ChannelRole = (typeof CHANNEL_ROLES)[number];

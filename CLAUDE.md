@@ -67,6 +67,15 @@ La **fabrication/vente de munitions** dépend aussi du tier (`MUNITIONS_FABRICAT
 
 `DEFAULT_GROUP_TIER` (tant qu'aucun `/config type-groupe set` n'a jamais été fait) vaut `petite_frappe` — ça correspond aux anciennes valeurs codées en dur (Fleeca/Armurerie 6, Bijouterie/Pinebank 1, Héroïne+Spore X actifs), pour qu'un déploiement existant ne change pas de comportement tant que l'admin n'a pas explicitement choisi un tier.
 
+## Avertissements (`src/modules/avertissements.ts`) — propre à cette instance
+
+Panneau permanent du salon `avertissements` (`/config channel set`), absent de roxwood-network-famille. Boutons, menus et formulaire réservés aux admins (`isAdmin`) ; tout le monde consulte la liste dans l'embed.
+
+- **Numéro jamais stocké** : c'est le rang de l'avertissement parmi ceux de la personne, trié par `date` puis `id` (`db.addAvertissement` renvoie ce rang). Retirer un avertissement renumérote les suivants ; en saisir un plus ancien le fait passer devant. Ne pas ajouter de colonne « numéro » : elle divergerait à la première suppression.
+- **Saisie multiple** : un même formulaire (date, raison) pour 1 à 25 personnes, chacune avec son propre avertissement et son propre numéro. Les personnes choisies sont gardées en mémoire entre le menu et le formulaire (`selections`) : l'identifiant d'un modal (100 caractères) ne peut pas porter 25 IDs.
+- **Ping** : chaque personne avertie est mentionnée dans le salon par un message explicatif supprimé 12h plus tard. L'échéance est stockée en base (setting `avertissements_pings`) et traitée par un cron toutes les 10 min (`deleteExpiredPings`) — jamais un `setTimeout`, qu'un redémarrage ferait oublier. Le salon est protégé contre la suppression par réaction 🗑️.
+- **Purge** : seul un porteur du rôle membre peut être averti ; ses avertissements sont supprimés dès qu'il perd ce rôle (`guildMemberUpdate`) ou quitte le serveur (`guildMemberRemove`, d'où `Partials.GuildMember`), et au démarrage (`reconcile`) pour ce qui s'est passé bot arrêté. Un échec de lecture des membres ne purge rien. Sans rôle membre configuré, rien n'est jamais purgé.
+
 ## Scripts d'investigation & de correction ponctuelle
 
 Pattern établi pour toute opération ad hoc (backfill, vérification de logs, correction manuelle de données) :
@@ -207,6 +216,7 @@ Différences volontaires, à préserver à chaque reprise :
   - `/api/stocks` et `/api/stocks/:channelId` enrichis de la config de chaque item (`avecConfigItem`) ; `/api/users` et `db.getKnownUsers` avec `gameName` ; `/api/garages/*` dans leur forme brute (`getVehiculesSortis`, `{ montantIndicatif, classement }`) ; `/api/quotas/config` expose les paliers sous `salaryTiers` ET `ventePaliers`.
   - Vérifier toute reprise en lançant l'ancienne et la nouvelle API côte à côte sur la copie de prod (client Discord simulé) et en comparant les réponses JSON route par route.
 - **Items par défaut** : nos cinq items seulement (voir section piège n°1).
+- **Avertissements** : module entier propre à cette instance (voir section dédiée) — table `avertissements`, rôle de salon `avertissements`, événements de membres dans `index.ts`.
 - **Manuel** : `MANUEL_URL` pointe vers le manuel de CETTE instance, pas celui de roxwood.
 - **Noms** : `bot-moni-v3` partout (compose, service systemd, base `bot_moni_v3`) ; Caddy plutôt que nginx (`deploy/nginx-*.conf` de roxwood non repris).
 

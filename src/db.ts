@@ -1706,3 +1706,52 @@ export async function updateArmeStatut(guildId: string, id: number, statut: stri
 export async function getArmesPerdue(guildId: string) {
   return prisma.arme.findMany({ where: { guildId, statut: 'perdue' }, orderBy: { nom: 'asc' } });
 }
+
+// ─── AVERTISSEMENTS ───────────────────────────────────────────────────────────
+
+export interface AvertissementRow { id: number; userId: string; date: number; raison: string; auteurId: string }
+
+/** Ordre qui définit le numéro d'un avertissement chez une personne (voir modèle `Avertissement`). */
+const AVERTISSEMENT_ORDER = [{ date: 'asc' as const }, { id: 'asc' as const }];
+
+const mapAvertissement = (r: { id: number; userId: string; date: Date; raison: string; auteurId: string }): AvertissementRow =>
+  ({ id: r.id, userId: r.userId, date: toMs(r.date), raison: r.raison, auteurId: r.auteurId });
+
+/** Enregistre un avertissement et renvoie son numéro chez cette personne (1 pour le premier). */
+export async function addAvertissement(guildId: string, data: { userId: string; date: number; raison: string; auteurId: string }): Promise<number> {
+  return prisma.$transaction(async tx => {
+    const created = await tx.avertissement.create({ data: { guildId, userId: data.userId, date: new Date(data.date), raison: data.raison, auteurId: data.auteurId } });
+    const rows = await tx.avertissement.findMany({ where: { guildId, userId: data.userId }, orderBy: AVERTISSEMENT_ORDER, select: { id: true } });
+    return rows.findIndex(r => r.id === created.id) + 1;
+  });
+}
+
+/** Tous les avertissements d'une guilde, triés par personne puis dans l'ordre de numérotation. */
+export async function getAllAvertissements(guildId: string): Promise<AvertissementRow[]> {
+  const rows = await prisma.avertissement.findMany({ where: { guildId }, orderBy: [{ userId: 'asc' }, ...AVERTISSEMENT_ORDER] });
+  return rows.map(mapAvertissement);
+}
+
+/** Avertissements d'une personne, dans l'ordre de numérotation. */
+export async function getAvertissementsForUser(guildId: string, userId: string): Promise<AvertissementRow[]> {
+  const rows = await prisma.avertissement.findMany({ where: { guildId, userId }, orderBy: AVERTISSEMENT_ORDER });
+  return rows.map(mapAvertissement);
+}
+
+/** Retire un avertissement. Renvoie `false` s'il n'existait plus. */
+export async function deleteAvertissement(guildId: string, id: number): Promise<boolean> {
+  const { count } = await prisma.avertissement.deleteMany({ where: { id, guildId } });
+  return count > 0;
+}
+
+/** Retire tous les avertissements d'une personne, renvoie le nombre retiré. */
+export async function deleteAvertissementsForUser(guildId: string, userId: string): Promise<number> {
+  const { count } = await prisma.avertissement.deleteMany({ where: { guildId, userId } });
+  return count;
+}
+
+/** Personnes ayant au moins un avertissement. */
+export async function getAvertisUserIds(guildId: string): Promise<string[]> {
+  const rows = await prisma.avertissement.findMany({ where: { guildId }, distinct: ['userId'], select: { userId: true } });
+  return rows.map(r => r.userId);
+}

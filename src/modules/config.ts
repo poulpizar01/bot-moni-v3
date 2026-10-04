@@ -50,6 +50,7 @@ import * as stocks from './stocks';
 import * as taxes from './taxes';
 import * as armurerie from './armurerie';
 import * as alertes from './alertes';
+import * as avertissements from './avertissements';
 import { CONFIRME_VENTE_ITEM } from './ventes';
 import { seedDefaultItems } from '../default-items';
 import { upsertPanel } from '../permanent-message';
@@ -315,6 +316,7 @@ async function handleChannel(interaction: ChatInputCommandInteraction, guildId: 
     if (role === 'quotas') await quotas.updatePermanentMessage(interaction.client, guildId);
     if (role === 'taxes') await taxes.initPermanentMessage(interaction.client, guildId);
     if (role === 'documentation') await initDocumentationMessage(interaction.client, guildId);
+    if (role === 'avertissements') await avertissements.initPermanentMessage(interaction.client, guildId);
     // Idem pour le préfixe du salon d'un labo actif pour le tier courant : sans
     // ça, il resterait sans préfixe jusqu'à la première déclaration. Un labo
     // en pleine production garde son 🔴 et son retour au vert programmé.
@@ -757,6 +759,7 @@ const CHANNEL_NAME_BY_ROLE: Partial<Record<configStore.ChannelRole, string>> = {
   labo_cocaine: 'labo-cocaine',
   labo_salvia: 'labo-salvia',
   labo_branche_cannabis: 'labo-branche-cannabis',
+  avertissements: '⚠️・avertissements',
 };
 
 /**
@@ -792,7 +795,7 @@ export async function initDocumentationMessage(client: Client, guildId: string):
         '**Au programme du manuel complet :**\n' +
         "🏴 Types d'organisation\n" + '📦 Stock général\n' + '🎮 Activités & quotas\n' +
         '💉 Ventes de drogue\n' + '🔫 Armurerie\n' + '🛃 Taxes & rackets\n' +
-        '🚗 Garages & fourrière\n' + '🌿 Labos\n' + '🕵️ Administration',
+        '🚗 Garages & fourrière\n' + '🌿 Labos\n' + '⚠️ Avertissements\n' + '🕵️ Administration',
       )
       .setFooter({ text: 'Mis à jour à chaque évolution du bot' })
       .setTimestamp();
@@ -816,7 +819,7 @@ const CHANNEL_DISPLAY_ORDER: readonly configStore.ChannelRole[] = [
   'documentation',
   'quotas', 'ventes_drogue', 'taxes', 'armurerie',
   'labo_sporex', 'labo_heroine', 'labo_mexicana', 'labo_cannabis', 'labo_cocaine', 'labo_salvia', 'labo_branche_cannabis',
-  'stock_general', 'paie', 'bilan',
+  'stock_general', 'paie', 'bilan', 'avertissements',
   'alertes_taxes', 'alertes_braquages', 'alertes_actions',
   'historique_stock', 'log_ventes', 'logs_activites', 'admin',
 ];
@@ -944,6 +947,7 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
     if (!existing.armurerie) await armurerie.updatePermanentMessage(interaction.client, guildId);
     if (!existing.quotas) await quotas.updatePermanentMessage(interaction.client, guildId);
     if (!existing.taxes) await taxes.initPermanentMessage(interaction.client, guildId);
+    if (!existing.avertissements) await avertissements.initPermanentMessage(interaction.client, guildId);
     if (documentationJusteCreee) await initDocumentationMessage(interaction.client, guildId);
     for (const [role] of toCreate) {
       if (role.startsWith('labo_')) await alertes.setLaboStatut(interaction.client, guildId, role, true);

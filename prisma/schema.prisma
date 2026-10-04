@@ -432,3 +432,22 @@ model MunitionVente {
   @@index([guildId, timestamp])
   @@map("munitions_ventes")
 }
+
+/// Avertissements disciplinaires (modules/avertissements.ts). Le numéro d'un
+/// avertissement ("2ᵉ de cette personne") n'est pas stocké : c'est son rang
+/// parmi ceux de la personne, triés par `date` puis `id` — retirer un
+/// avertissement renumérote donc les suivants. Purgés quand la personne perd
+/// le rôle membre ou quitte le serveur (elle ne fait plus partie du groupe).
+model Avertissement {
+  guildId   String   @map("guild_id")
+  id        Int      @id @default(autoincrement())
+  userId    String   @map("user_id")
+  /// Date des faits, saisie par l'admin (jour, minuit heure de Paris).
+  date      DateTime
+  raison    String
+  auteurId  String   @map("auteur_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([guildId, userId])
+  @@map("avertissements")
+}

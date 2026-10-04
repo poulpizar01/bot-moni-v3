@@ -39,6 +39,7 @@ import * as armurerie from './modules/armurerie';
 import * as alertes from './modules/alertes';
 import * as ventes from './modules/ventes';
 import * as garages from './modules/garages';
+import * as avertissements from './modules/avertissements';
 import { startApiServer } from './api/server';
 import { assertAuthEnv } from './api/auth';
 
@@ -51,7 +52,8 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessageReactions,
   ],
-  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+  // GuildMember : `guildMemberRemove` d'un membre absent du cache (purge des avertissements, voir modules/avertissements.ts).
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.GuildMember],
   // Sans ça, discord.js garde en RAM tous les messages vus (jusqu'à 200 par
   // salon par défaut) sans jamais les libérer — sur les salons de logs
   // coffre à fort trafic, ça grossit indéfiniment. Les messages permanents
@@ -165,6 +167,9 @@ async function initGuild(guild: Guild): Promise<void> {
   await step(guildId, 'armurerie.initPermanentMessage', () => armurerie.initPermanentMessage(client, guildId));
   await step(guildId, 'taxes.initPermanentMessage', () => taxes.initPermanentMessage(client, guildId));
   await step(guildId, 'initDocumentationMessage', () => configModule.initDocumentationMessage(client, guildId));
+  await step(guildId, 'avertissements.reconcile', () => avertissements.reconcile(client, guildId));
+  await step(guildId, 'avertissements.initPermanentMessage', () => avertissements.initPermanentMessage(client, guildId));
+  await step(guildId, 'avertissements.deleteExpiredPings', () => avertissements.deleteExpiredPings(client, guildId));
   await step(guildId, 'alertes.initLaboTimers', () => alertes.initLaboTimers(client, guildId));
 }
 
@@ -278,6 +283,9 @@ function scheduleCrons(): void {
   cron.schedule('0 4 * * *', () => forEachActiveGuild(guildId => ventes.purgeOldPendingSales(guildId)), { timezone: 'Europe/Paris' });
   cron.schedule('0 4 * * *', () => forEachActiveGuild(guildId => armurerie.purgeOldMunitionVentes(guildId)), { timezone: 'Europe/Paris' });
   cron.schedule('0 4 * * *', () => forEachActiveGuild(guildId => taxes.purgeOldDeletedTaxes(guildId)), { timezone: 'Europe/Paris' });
+
+  // ── CRON : Suppression des pings d'avertissement de plus de 12h ──────────
+  cron.schedule('*/10 * * * *', () => forEachActiveGuild(guildId => avertissements.deleteExpiredPings(client, guildId)));
 
   // ── CRON : Vérif cooldowns expirés chaque minute ──────────────────────────
   cron.schedule('* * * * *', () => forEachActiveGuild(guildId => alertes.checkExpiredCooldowns(client, guildId)));
@@ -400,6 +408,24 @@ client.on('guildDelete', async (guild) => {
   }
 });
 
+// ─── MEMBRES : purge des avertissements (rôle membre retiré, départ) ─────────
+client.on('guildMemberUpdate', async (_oldMember, newMember) => {
+  try {
+    if (!configStore.has(newMember.guild.id)) return;
+    await avertissements.handleMemberUpdate(client, newMember);
+  } catch (err) {
+    console.error('[guildMemberUpdate] :', (err as Error).message);
+  }
+});
+client.on('guildMemberRemove', async (member) => {
+  try {
+    if (!configStore.has(member.guild.id)) return;
+    await avertissements.handleMemberLeave(client, member);
+  } catch (err) {
+    console.error('[guildMemberRemove] :', (err as Error).message);
+  }
+});
+
 // ─── RÉACTION 🗑️ → SUPPRESSION DU MESSAGE DU BOT ────────────────────────────
 
 /**
@@ -411,7 +437,7 @@ function isProtectedMessage(guildId: string, message: Message): boolean {
   const c = configStore.get(guildId).CHANNELS;
   const protectedChannels = [
     c.stock_general, c.bilan, c.paie, c.historique_stock, c.log_ventes,
-    c.logs_activites, c.ventes_drogue, c.alertes_braquages, c.alertes_actions,
+    c.logs_activites, c.ventes_drogue, c.alertes_braquages, c.alertes_actions, c.avertissements,
   ];
   return protectedChannels.includes(message.channelId)
     || quotas.isQuotaReminderMessage(message)
@@ -521,6 +547,7 @@ client.on('interactionCreate', async (interaction) => {
       if (cid.startsWith('tax_')) return await taxes.handleButton(interaction);
       if (cid.startsWith('arm_')) return await armurerie.handleButton(interaction);
       if (cid.startsWith('vente_')) return await ventes.handleButton(interaction);
+      if (cid.startsWith('avert_')) return await avertissements.handleButton(interaction);
       return;
     }
 
@@ -531,6 +558,7 @@ client.on('interactionCreate', async (interaction) => {
       if (cid.startsWith('modal_tax_')) return await taxes.handleModal(interaction);
       if (cid.startsWith('modal_arm_')) return await armurerie.handleModal(interaction);
       if (cid.startsWith('modal_vente_')) return await ventes.handleModal(interaction);
+      if (cid.startsWith('modal_avert_')) return await avertissements.handleModal(interaction);
       return;
     }
 
@@ -540,12 +568,14 @@ client.on('interactionCreate', async (interaction) => {
       if (cid === 'act_more_select') return await quotas.handleStringSelect(interaction);
       if (cid.startsWith('arm_select_')) return await armurerie.handleSelect(interaction);
       if (cid.startsWith('tax_select_')) return await taxes.handleSelect(interaction);
+      if (cid.startsWith('avert_select_')) return await avertissements.handleStringSelect(interaction);
       return;
     }
 
     if (interaction.isUserSelectMenu()) {
       const cid = interaction.customId;
       if (cid.startsWith('act_select_')) return await quotas.handleSelect(interaction);
+      if (cid.startsWith('avert_select_')) return await avertissements.handleUserSelect(interaction);
       return;
     }
   } catch (err) {

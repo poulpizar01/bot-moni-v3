@@ -59,19 +59,20 @@ export async function getAllChannels(guildId: string) {
   return prisma.channel.findMany({ where: { guildId } });
 }
 
-/** Retourne les salons assignés à un rôle (généralement un seul, sauf 'logs_coffres'). */
-export async function getChannelsByRole(guildId: string, role: string): Promise<string[]> {
-  return (await prisma.channel.findMany({ where: { guildId, role } })).map(r => r.channelId);
-}
-
 /** Remplace le(s) salon(s) d'un rôle à valeur unique (stock_general, quotas, ...) par un seul. */
 export async function setChannelRole(guildId: string, role: string, channelId: string): Promise<void> {
   await prisma.channel.deleteMany({ where: { guildId, role } });
   await prisma.channel.create({ data: { guildId, role, channelId } });
 }
 
-/** Ajoute un salon à un rôle à valeurs multiples (ex. 'logs_coffres'), sans toucher aux autres. `label` optionnel : `undefined` préserve un nom déjà posé sur ce salon plutôt que de l'effacer (voir `/config channel add-log-coffre nom:`). */
-export async function addChannelToRole(guildId: string, role: string, channelId: string, label?: string): Promise<void> {
+/**
+ * Ajoute un salon à un rôle à valeurs multiples (ex. 'logs_coffres'), sans
+ * toucher aux autres. `label` optionnel (ex. "Coffre principal") — ré-ajouter
+ * un salon déjà présent avec un nouveau `label` met juste à jour son nom
+ * (jamais de doublon, upsert sur la clé composite) ; omis, le label existant
+ * n'est pas touché.
+ */
+export async function addChannelToRole(guildId: string, role: string, channelId: string, label?: string | null): Promise<void> {
   await prisma.channel.upsert({
     where: { guildId_role_channelId: { guildId, role, channelId } },
     create: { guildId, role, channelId, label: label ?? null },
@@ -84,7 +85,7 @@ export async function removeChannelFromRole(guildId: string, role: string, chann
   await prisma.channel.deleteMany({ where: { guildId, role, channelId } });
 }
 
-/** Salons d'un rôle à valeurs multiples avec leur nom éventuel (voir `getChannelsByRole` pour la liste brute des IDs). */
+/** Salons d'un rôle à valeurs multiples, avec leur `label` éventuel (voir `/config channel list`). */
 export async function getChannelsWithLabel(guildId: string, role: string): Promise<Array<{ channelId: string; label: string | null }>> {
   const rows = await prisma.channel.findMany({ where: { guildId, role } });
   return rows.map(r => ({ channelId: r.channelId, label: r.label }));
@@ -92,7 +93,7 @@ export async function getChannelsWithLabel(guildId: string, role: string): Promi
 
 // ─── RÔLES DISCORD (config) ──────────────────────────────────────────────────
 
-/** Associe (upsert) un rôle Discord à un usage du bot (ex. 'admin', 'taxes'). */
+/** Associe (upsert) un rôle Discord à un usage du bot ('admin' ou 'membre', voir ROLE_TARGETS dans modules/config.ts). */
 export async function setDiscordRole(guildId: string, target: string, roleId: string): Promise<void> {
   await prisma.discordRole.upsert({
     where: { guildId_target: { guildId, target } },
@@ -115,15 +116,25 @@ export interface ItemInput {
   display_order?: number;
   /** Défaut `true` (contrairement aux autres flags, défaut `false`) : omettre cette option ne doit pas faire disparaître un item du Stock Général. */
   visible_stock?: boolean;
-  /** Clé d'activité labo (ex. "labo_cocaine") si cet item est lié à ce labo — voir `labo_lie_role` pour le sens du lien, et la docstring du modèle Item. */
+  /** Clé d'activité labo (ex. "labo_cocaine") si cet item est LA drogue que ce labo produit, ou un matériau qu'il consomme (voir `labo_lie_role`) — voir docstring du modèle Item. */
   labo_lie?: string | null;
-  /** 'produit' (LA drogue que ce labo produit) ou 'materiau' (une matière première qu'il consomme) — sans effet si `labo_lie` est absent. */
+  /** 'produit' (défaut si `labo_lie` fourni sans précision) ou 'materiau'. Ignoré si `labo_lie` est `null`. */
   labo_lie_role?: 'produit' | 'materiau' | null;
   /** Unités de base représentées par une unité de cet item (ex. 24 pour une boîte de munitions) — voir docstring du modèle Item et `armurerie.weightedStockSum`. Défaut 1 (pas de conversion). */
   stock_multiplier?: number;
 }
 
-/** Ajoute ou remplace entièrement la configuration d'un item suivi (upsert complet, voir docstring de `/config item add`). */
+/**
+ * Ajoute ou remplace la configuration d'un item suivi (upsert, voir docstring
+ * de `/config item add`) — remplacement complet à chaque appel pour tous les
+ * champs SAUF `stockGroup` : `/config item add` ne l'expose pas (trop
+ * générique pour son seul usage réel, la pondération munitions — voir
+ * `default-items.ts`), donc `data.stock_group` vaut toujours `undefined`
+ * quand l'appel vient de cette commande. `undefined` signifie ici "ne pas
+ * toucher au champ existant", jamais "l'effacer" — sinon changer juste le
+ * multiplicateur de "Munition de pistolet" effacerait silencieusement son
+ * groupe. Ne pas généraliser ce pattern aux autres champs.
+ */
 export async function upsertItem(guildId: string, data: ItemInput): Promise<void> {
   await prisma.item.upsert({
     where: { guildId_name: { guildId, name: data.name } },
@@ -139,17 +150,8 @@ export async function upsertItem(guildId: string, data: ItemInput): Promise<void
       stockMultiplier: data.stock_multiplier ?? 1,
     },
     update: {
-      // `stock_group` n'est réglable que par `src/default-items.ts` (jamais
-      // par `/config item add`, cas trop étroit — uniquement les munitions) :
-      // `undefined` ici signifie "ne pas toucher", pas "effacer", pour ne
-      // jamais écraser silencieusement un groupe déjà posé sur cet item.
       ...(data.stock_group !== undefined ? { stockGroup: data.stock_group } : {}),
       vente: !!data.vente,
-      // Comme stock_group juste au-dessus : `undefined` ne touche pas la
-      // valeur existante. `/config item add` n'expose pas cette option —
-      // sans ce garde-fou, chaque appel sur un item déjà configuré (ex. pour
-      // changer un simple flag) réinitialiserait silencieusement l'ordre
-      // posé par `default-items.ts` ou une correction manuelle.
       ...(data.display_order !== undefined ? { displayOrder: data.display_order } : {}),
       visibleStock: data.visible_stock !== false,
       laboLie: data.labo_lie ?? null,
@@ -164,7 +166,7 @@ export async function deleteItem(guildId: string, name: string): Promise<void> {
   await prisma.item.deleteMany({ where: { guildId, name } });
 }
 
-/** Tous les items suivis d'une guilde, triés par ordre d'affichage puis par nom. */
+/** Tous les items suivis d'une guilde, triés par ordre d'affichage puis par ordre d'insertion (jamais par nom — voir `Item.id` dans schema.prisma). */
 export async function getAllItems(guildId: string) {
   return prisma.item.findMany({ where: { guildId }, orderBy: [{ displayOrder: 'asc' }, { id: 'asc' }] });
 }
@@ -211,7 +213,9 @@ export async function getAllSalaryRates(guildId: string) {
   return prisma.salaryRate.findMany({ where: { guildId } });
 }
 
-/** Fixe (upsert) le taux de paie ($ par unité) d'un item précis — override du taux général de la catégorie "vente" pour cet item (voir docstring du modèle `ItemSalaryRate`). */
+// ─── TAUX DE PAIE PAR ITEM (config) ──────────────────────────────────────────
+
+/** Fixe (upsert) le taux de paie ($ par unité) d'UN item vendu, remplaçant le taux général "vente" pour cet item précis. */
 export async function setItemSalaryRate(guildId: string, item: string, amount: number): Promise<void> {
   await prisma.itemSalaryRate.upsert({
     where: { guildId_item: { guildId, item } },
@@ -220,7 +224,7 @@ export async function setItemSalaryRate(guildId: string, item: string, amount: n
   });
 }
 
-/** Retire le taux de paie spécifique d'un item (il retombe sur le taux général de la catégorie "vente"). */
+/** Retire le taux de paie spécifique d'un item (il retombe sur le taux général "vente"). */
 export async function deleteItemSalaryRate(guildId: string, item: string): Promise<void> {
   await prisma.itemSalaryRate.deleteMany({ where: { guildId, item } });
 }
@@ -230,38 +234,36 @@ export async function getAllItemSalaryRates(guildId: string) {
   return prisma.itemSalaryRate.findMany({ where: { guildId } });
 }
 
-// ─── SALARY TIERS (config) ───────────────────────────────────────────────────
+// ─── PALIERS DE PAIE VENTE (config) ──────────────────────────────────────────
 
-/** Ajoute une tranche de barème de paie "vente" (`item` null = barème général, `upTo` null = tranche finale) — la validation de l'ordre des bornes est faite par l'appelant (voir `/config palier add`). */
+/** Ajoute une tranche au barème de paie de la vente (général si `item` est `null`, propre à cet item sinon) — validation de l'ordre/unicité de la tranche finale faite par l'appelant (`modules/config.ts`), pas ici. */
 export async function addSalaryTier(guildId: string, item: string | null, upTo: number | null, amount: number): Promise<void> {
   await prisma.salaryTier.create({ data: { guildId, item, upTo, amount } });
 }
 
-/** Retire la tranche de borne `upTo` (null = tranche finale) d'un barème. Renvoie le nombre de tranches retirées. */
-export async function removeSalaryTier(guildId: string, item: string | null, upTo: number | null): Promise<number> {
-  const { count } = await prisma.salaryTier.deleteMany({ where: { guildId, item, upTo } });
-  return count;
+/** Retire UNE tranche précise (par sa borne haute — `null` cible la tranche finale sans limite) du barème général ou d'un item. */
+export async function removeSalaryTier(guildId: string, item: string | null, upTo: number | null): Promise<void> {
+  await prisma.salaryTier.deleteMany({ where: { guildId, item, upTo } });
 }
 
-/** Retire tout le barème d'une cible (`item` null = barème général). Renvoie le nombre de tranches retirées. */
-export async function clearSalaryTiers(guildId: string, item: string | null): Promise<number> {
-  const { count } = await prisma.salaryTier.deleteMany({ where: { guildId, item } });
-  return count;
+/** Retire tout le barème (général ou celui d'un item précis) — retombe sur le taux plat (`SalaryRate`/`ItemSalaryRate`) s'il existe. */
+export async function clearSalaryTiers(guildId: string, item: string | null): Promise<void> {
+  await prisma.salaryTier.deleteMany({ where: { guildId, item } });
 }
 
-/** Toutes les tranches d'une guilde, triées par cible puis borne croissante (Postgres place les NULL en dernier sur ASC : la tranche finale sort en dernier de son barème). */
+/** Toutes les tranches de tous les barèmes (général + par item) d'une guilde, triées par item puis par borne haute croissante (Postgres place les `NULL` en dernier sur un `ORDER BY ... ASC` — la tranche finale sans limite se retrouve donc naturellement en dernier de son groupe). */
 export async function getAllSalaryTiers(guildId: string) {
   return prisma.salaryTier.findMany({ where: { guildId }, orderBy: [{ item: 'asc' }, { upTo: 'asc' }] });
 }
 
-/** Tranches d'un seul barème (`item` null = général), triées par borne croissante. */
+/** Les tranches du barème d'UNE seule cible (général si `item` est `null`), triées par borne haute croissante. */
 export async function getSalaryTiersFor(guildId: string, item: string | null) {
   return prisma.salaryTier.findMany({ where: { guildId, item }, orderBy: { upTo: 'asc' } });
 }
 
-// ─── CLASSEMENT RATES (config) ────────────────────────────────────────────
+// ─── CLASSEMENT (config) ──────────────────────────────────────────────────────
 
-/** Fixe (upsert) le nombre de points par unité d'une catégorie de quota. */
+/** Fixe (upsert) les points de classement d'une catégorie de quota. */
 export async function setClassementRate(guildId: string, quotaType: string, amount: number): Promise<void> {
   await prisma.classementRate.upsert({
     where: { guildId_quotaType: { guildId, quotaType } },
@@ -270,17 +272,17 @@ export async function setClassementRate(guildId: string, quotaType: string, amou
   });
 }
 
-/** Retire le nombre de points d'une catégorie de quota. */
+/** Retire les points de classement d'une catégorie de quota. */
 export async function deleteClassementRate(guildId: string, quotaType: string): Promise<void> {
   await prisma.classementRate.deleteMany({ where: { guildId, quotaType } });
 }
 
-/** Tous les points de classement configurés pour une guilde. */
+/** Tous les points de classement par catégorie configurés pour une guilde. */
 export async function getAllClassementRates(guildId: string) {
   return prisma.classementRate.findMany({ where: { guildId } });
 }
 
-/** Fixe (upsert) le nombre de points d'une activité précise de la famille "actions" — override du nombre général de cette catégorie (voir docstring du modèle `ActivityClassementRate`). */
+/** Fixe (upsert) les points de classement d'UNE activité de la catégorie "actions", remplaçant le nombre général de cette catégorie pour cette activité précise. */
 export async function setActivityClassementRate(guildId: string, activityKey: string, amount: number): Promise<void> {
   await prisma.activityClassementRate.upsert({
     where: { guildId_activityKey: { guildId, activityKey } },
@@ -289,7 +291,7 @@ export async function setActivityClassementRate(guildId: string, activityKey: st
   });
 }
 
-/** Retire le nombre de points spécifique d'une activité (elle retombe sur le nombre général de la catégorie "actions"). */
+/** Retire les points de classement spécifiques d'une activité (elle retombe sur le nombre général "actions"). */
 export async function deleteActivityClassementRate(guildId: string, activityKey: string): Promise<void> {
   await prisma.activityClassementRate.deleteMany({ where: { guildId, activityKey } });
 }
@@ -301,71 +303,125 @@ export async function getAllActivityClassementRates(guildId: string) {
 
 // ─── STOCKS ─────────────────────────────────────────────────────────────────
 //
-// Seul le stock PAR coffre est stocké (`coffre_stocks`) ; le total global est
-// toujours la somme des coffres, calculée à la lecture. Un compteur global
-// séparé divergeait : chaque compteur étant plafonné à 0 de son côté, un
-// retrait « absorbé » par un coffre déjà à 0 était quand même déduit du
-// global (ex. 510 affiché pour 522 + 18 dans les coffres). Les sommes restent
-// légères : quelques dizaines de lignes par guilde (coffres × items), servies
-// par l'index `(guild_id, item)` — une seule requête agrégée par appel, jamais
-// une requête par coffre.
+// Il n'existe qu'UNE table de stock, `CoffreStock` (détail par salon
+// `logs_coffres`) : le total global n'est jamais stocké, toujours recalculé
+// à la lecture comme la somme des coffres pour cet item. Un total tenu dans
+// une table à part divergerait : chaque table plafonne sa propre valeur à 0
+// (`GREATEST(quantite + delta, 0)`), donc un retrait absorbé côté coffre (déjà
+// à 0 selon le suivi) ne le serait pas côté total (qui a du stock ailleurs).
 
-/** Quantité totale en stock d'un item, tous coffres confondus (0 si jamais mouvementé). */
-export async function getStock(guildId: string, item: string): Promise<number> {
-  const agg = await prisma.coffreStock.aggregate({ where: { guildId, item: item.toLowerCase() }, _sum: { quantite: true } });
-  return agg._sum.quantite ?? 0;
+// Les agrégats ci-dessous ne somment que les coffres passés en `channelIds`
+// (les salons de coffre actuellement suivis, voir `stocks.trackedCoffreIds`) :
+// un coffre retiré de la config garde ses lignes — il retrouve son stock s'il
+// est réajouté — mais ne compte plus, figé, dans le total.
+
+/** Quantité en stock d'un item, tous coffres suivis confondus (0 si jamais mouvementé). */
+export async function getStock(guildId: string, item: string, channelIds: string[]): Promise<number> {
+  const result = await prisma.coffreStock.aggregate({
+    where: { guildId, item: item.toLowerCase(), channelId: { in: channelIds } },
+    _sum: { quantite: true },
+  });
+  return result._sum.quantite ?? 0;
 }
 
-/** Stock total de plusieurs items en une seule requête, individuellement (clé = nom en minuscules, absent si jamais mouvementé) — voir `armurerie.getMunitionsStock`/`weightedStockSum`, qui pondèrent différemment chaque item d'un groupe avant de sommer (contre un `getStock` par item, un N+1 pour un groupe qui peut grossir). */
-export async function getStocksByItems(guildId: string, items: string[]): Promise<Record<string, number>> {
+/** Stock de plusieurs items en une seule requête (clé = nom en minuscules, absent si jamais mouvementé) — voir `armurerie.getMunitionsStock`/`weightedStockSum`, qui pondèrent différemment chaque item d'un groupe avant de sommer (contre un `getStock` par item, un N+1 pour un groupe qui peut grossir). */
+export async function getStocksByItems(guildId: string, items: string[], channelIds: string[]): Promise<Record<string, number>> {
   if (!items.length) return {};
   const rows = await prisma.coffreStock.groupBy({
     by: ['item'],
-    where: { guildId, item: { in: items.map(i => i.toLowerCase()) } },
+    where: { guildId, item: { in: items.map(i => i.toLowerCase()) }, channelId: { in: channelIds } },
     _sum: { quantite: true },
   });
   return Object.fromEntries(rows.map(r => [r.item, r._sum.quantite ?? 0]));
 }
 
-/** Le stock total de tous les items d'une guilde (somme des coffres), trié par nom. */
-export async function getAllStocks(guildId: string): Promise<Array<{ guildId: string; item: string; quantite: number }>> {
+/** Le stock de tous les items d'une guilde (sommé sur les coffres suivis), trié par nom. */
+export async function getAllStocks(guildId: string, channelIds: string[]): Promise<Array<{ guildId: string; item: string; quantite: number }>> {
   const rows = await prisma.coffreStock.groupBy({
     by: ['item'],
-    where: { guildId },
+    where: { guildId, channelId: { in: channelIds } },
     _sum: { quantite: true },
     orderBy: { item: 'asc' },
   });
   return rows.map(r => ({ guildId, item: r.item, quantite: r._sum.quantite ?? 0 }));
 }
 
-/** Supprime tout le stock d'une guilde (resync complète, voir `stocks.fullResync`). */
-export async function resetAllStocks(guildId: string): Promise<void> {
-  await prisma.coffreStock.deleteMany({ where: { guildId } });
+/**
+ * Début d'une resync complète (`stocks.fullResync`), en UNE transaction :
+ * stock par coffre et historique vidés, curseurs des salons repartis de `0`.
+ * Un arrêt au milieu ne peut pas laisser un stock vidé avec des curseurs
+ * intacts, que le rattrapage ne reconstruirait jamais.
+ */
+export async function resetStocksForResync(guildId: string, cursorKeys: string[]): Promise<void> {
+  await prisma.$transaction([
+    prisma.coffreStock.deleteMany({ where: { guildId } }),
+    prisma.stockHistory.deleteMany({ where: { guildId } }),
+    ...cursorKeys.map(key => prisma.setting.upsert({
+      where: { guildId_key: { guildId, key } },
+      create: { guildId, key, value: '0' },
+      update: { value: '0' },
+    })),
+  ]);
 }
 
+// ─── STOCK PAR COFFRE ─────────────────────────────────────────────────────────
+//
+// Détail par salon `logs_coffres` (voir modèle CoffreStock) — SEULE source de
+// vérité pour le stock (voir commentaire ci-dessus).
+
 /**
- * Applique un delta au stock d'un item POUR UN COFFRE DONNÉ et retourne le
- * total global avant/après (somme des coffres), le tout en une seule requête
- * SQL. L'upsert lit la valeur précédente dans la même instruction : deux
- * mouvements concurrents sur le même coffre/item ne peuvent pas s'écraser.
- * La somme des AUTRES coffres est lue à part puis additionnée à la nouvelle
- * valeur de ce coffre — un CTE ne voit pas les lignes qu'il modifie lui-même,
- * une somme directe sur `coffre_stocks` renverrait l'ancienne valeur.
+ * Applique un delta au stock d'UN coffre précis, de façon atomique (upsert +
+ * valeur précédente lue dans la même instruction — deux mouvements
+ * concurrents sur le même item/coffre ne peuvent pas s'écraser comme le
+ * ferait un lire-puis-écrire en deux requêtes séparées), et retourne le total
+ * GLOBAL avant/après (somme de tous les coffres pour cet item), pas juste ce
+ * coffre — c'est ce qu'affichent l'historique et `historique_stock`. Un CTE
+ * ne voit pas les lignes que la même requête modifie : la somme des AUTRES
+ * coffres (`autres`, qui exclut CE coffre) est donc calculée séparément puis
+ * additionnée à la valeur avant/après de ce coffre, plutôt que de resommer
+ * `coffre_stocks` après coup (qui renverrait l'ancienne valeur pour ce
+ * coffre). Exécutée dans la transaction de {@link applyStockMessage}.
  */
-export async function applyStockMovement(guildId: string, channelId: string, item: string, delta: number): Promise<{ avant: number; apres: number }> {
+async function stockMovementQuery(client: Pick<Prisma.TransactionClient, '$queryRaw'>, guildId: string, channelId: string, item: string, delta: number): Promise<{ avant: number; apres: number }> {
   const key = item.toLowerCase();
-  const rows = await prisma.$queryRaw<Array<{ avant: number; apres: number }>>`
+  const rows = await client.$queryRaw<Array<{ avant: number; apres: number }>>`
     WITH prev AS (
       SELECT quantite FROM coffre_stocks WHERE guild_id = ${guildId} AND channel_id = ${channelId} AND item = ${key}
     ), autres AS (
-      SELECT COALESCE(SUM(quantite), 0) AS total FROM coffre_stocks WHERE guild_id = ${guildId} AND item = ${key} AND channel_id <> ${channelId}
+      SELECT COALESCE(SUM(quantite), 0)::int AS total FROM coffre_stocks
+      WHERE guild_id = ${guildId} AND item = ${key} AND channel_id != ${channelId}
     ), upserted AS (
       INSERT INTO coffre_stocks (guild_id, channel_id, item, quantite) VALUES (${guildId}, ${channelId}, ${key}, GREATEST(${delta}, 0))
       ON CONFLICT (guild_id, channel_id, item) DO UPDATE SET quantite = GREATEST(coffre_stocks.quantite + ${delta}, 0)
       RETURNING quantite
     )
-    SELECT ((SELECT total FROM autres) + COALESCE((SELECT quantite FROM prev), 0))::int AS avant,
-           ((SELECT total FROM autres) + (SELECT quantite FROM upserted))::int AS apres
+    SELECT
+      (SELECT total FROM autres) + COALESCE((SELECT quantite FROM prev), 0) AS avant,
+      (SELECT total FROM autres) + (SELECT quantite FROM upserted) AS apres
+  `;
+  return { avant: rows[0]?.avant ?? 0, apres: rows[0]?.apres ?? 0 };
+}
+
+/**
+ * Force la valeur du stock d'un item POUR UN COFFRE DONNÉ (correction
+ * manuelle, `/set-stock ... coffre:`) — SET absolu, pas un delta (contraste
+ * avec {@link applyStockMessage}, additive). Même pattern atomique (upsert +
+ * valeur précédente en une seule requête) pour ne pas écraser un mouvement
+ * réel concurrent sur ce même coffre/item. Le total global suit tout seul à
+ * la lecture, aucun appel complémentaire nécessaire.
+ */
+export async function setCoffreStock(guildId: string, channelId: string, item: string, quantite: number): Promise<{ avant: number; apres: number }> {
+  const key = item.toLowerCase();
+  const qty = Math.max(0, quantite);
+  const rows = await prisma.$queryRaw<Array<{ avant: number; apres: number }>>`
+    WITH prev AS (
+      SELECT quantite FROM coffre_stocks WHERE guild_id = ${guildId} AND channel_id = ${channelId} AND item = ${key}
+    ), upserted AS (
+      INSERT INTO coffre_stocks (guild_id, channel_id, item, quantite) VALUES (${guildId}, ${channelId}, ${key}, ${qty})
+      ON CONFLICT (guild_id, channel_id, item) DO UPDATE SET quantite = ${qty}
+      RETURNING quantite
+    )
+    SELECT COALESCE((SELECT quantite FROM prev), 0)::int AS avant, (SELECT quantite FROM upserted)::int AS apres
   `;
   return { avant: rows[0]?.avant ?? 0, apres: rows[0]?.apres ?? 0 };
 }
@@ -375,74 +431,62 @@ export async function getCoffreStocks(guildId: string, channelId: string) {
   return prisma.coffreStock.findMany({ where: { guildId, channelId }, orderBy: { item: 'asc' } });
 }
 
-/** Stock d'UN item pour UN coffre précis (0 si jamais initialisé). */
-export async function getCoffreStock(guildId: string, channelId: string, item: string): Promise<number> {
-  const row = await prisma.coffreStock.findUnique({ where: { guildId_channelId_item: { guildId, channelId, item: item.toLowerCase() } } });
-  return row ? row.quantite : 0;
-}
-
-/**
- * Corrige le stock d'un item pour UN coffre précis à la valeur donnée
- * (`/set-stock ... coffre:`) — le total global suit de lui-même, puisqu'il
- * est la somme des coffres. Le set + la lecture de l'ancienne valeur se font
- * en une seule requête atomique : un mouvement réel concurrent sur ce
- * coffre/item ne peut pas se glisser entre une lecture et une écriture
- * séparées.
- */
-export async function setCoffreStock(guildId: string, channelId: string, item: string, qty: number): Promise<{ avant: number; apres: number }> {
-  const key = item.toLowerCase();
-  const quantite = Math.max(0, qty);
-  const rows = await prisma.$queryRaw<Array<{ avant: number; apres: number }>>`
-    WITH prev AS (
-      SELECT quantite FROM coffre_stocks WHERE guild_id = ${guildId} AND channel_id = ${channelId} AND item = ${key}
-    ), upserted AS (
-      INSERT INTO coffre_stocks (guild_id, channel_id, item, quantite) VALUES (${guildId}, ${channelId}, ${key}, ${quantite})
-      ON CONFLICT (guild_id, channel_id, item) DO UPDATE SET quantite = ${quantite}
-      RETURNING quantite
-    )
-    SELECT COALESCE((SELECT quantite FROM prev), 0)::int AS avant, (SELECT quantite FROM upserted)::int AS apres
-  `;
-  return { avant: rows[0]?.avant ?? 0, apres: quantite };
-}
-
-/** Supprime tout l'historique de mouvements de stock d'une guilde (resync complète). */
-export async function clearStockHistory(guildId: string): Promise<void> {
-  await prisma.stockHistory.deleteMany({ where: { guildId } });
-}
-
 // ─── STOCK HISTORY ───────────────────────────────────────────────────────────
 
-export interface StockHistoryInput {
-  timestamp: number;
+export interface StockMovementInput {
   joueur: string;
-  action: string;
+  action: 'retire' | 'depose';
   item: string;
   quantite: number;
-  stock_avant: number;
-  stock_apres: number;
-  /** Salon `logs_coffres` d'origine (voir modèle CoffreStock) — absent pour un appel qui ne le connaît pas. */
-  channel_id?: string | null;
 }
 
-/** Journalise un mouvement de stock et plafonne l'historique de la guilde à 500 entrées (les plus anciennes sont purgées). */
-export async function addStockHistory(guildId: string, data: StockHistoryInput): Promise<void> {
-  await prisma.stockHistory.create({
-    data: {
-      guildId,
-      timestamp: new Date(data.timestamp),
-      joueur: data.joueur,
-      action: data.action,
-      item: data.item,
-      quantite: data.quantite,
-      stockAvant: data.stock_avant,
-      stockApres: data.stock_apres,
-      channelId: data.channel_id ?? null,
-    },
+/** Mouvement appliqué, avec le stock global (tous coffres) avant et après. */
+export type AppliedStockMovement = StockMovementInput & { stock_avant: number; stock_apres: number };
+
+/**
+ * Applique en UNE transaction tous les mouvements d'un message de log de
+ * coffre, leur historique, et l'avancée du curseur `last_stock_msg_<salon>` —
+ * un arrêt du process au milieu ne laisse donc ni message marqué traité sans
+ * mouvement, ni message à moitié appliqué qui serait rejoué en double. Le
+ * curseur ne peut qu'avancer : un message dont l'ID ne lui est pas postérieur
+ * a déjà été appliqué (temps réel et rattrapage peuvent livrer le même), et
+ * la fonction retourne alors `null` sans rien écrire.
+ */
+export async function applyStockMessage(
+  guildId: string, channelId: string, messageId: string, movements: StockMovementInput[], timestamp: number,
+): Promise<AppliedStockMovement[] | null> {
+  const key = `last_stock_msg_${channelId}`;
+  const applied = await prisma.$transaction(async tx => {
+    const cursor = await tx.setting.findUnique({ where: { guildId_key: { guildId, key } } });
+    if (cursor && BigInt(messageId) <= BigInt(cursor.value)) return null;
+
+    const done: AppliedStockMovement[] = [];
+    for (const m of movements) {
+      const { avant, apres } = await stockMovementQuery(tx, guildId, channelId, m.item, m.action === 'retire' ? -m.quantite : m.quantite);
+      await tx.stockHistory.create({
+        data: {
+          guildId, timestamp: new Date(timestamp), joueur: m.joueur, action: m.action, item: m.item,
+          quantite: m.quantite, stockAvant: avant, stockApres: apres, channelId,
+        },
+      });
+      done.push({ ...m, stock_avant: avant, stock_apres: apres });
+    }
+    await tx.setting.upsert({
+      where: { guildId_key: { guildId, key } },
+      create: { guildId, key, value: messageId },
+      update: { value: messageId },
+    });
+    return done;
   });
-  // Plafonne l'historique de CETTE guilde à 500 entrées (les plus anciennes
-  // sont purgées) — le `where: { guildId }` est indispensable ici : sans lui,
-  // le tri global par `id` autoincrémenté purgerait les plus vieilles lignes
-  // d'une AUTRE guilde selon l'ordre d'insertion, pas celles de `guildId`.
+  // Le plafond de l'historique est indicatif (rien ne dépend d'un total
+  // exact) : un tirage 1/20 le maintient proche de 500 sans requête de
+  // nettoyage à chaque mouvement de coffre, le chemin le plus fréquent du bot.
+  if (applied?.length && Math.random() < 0.05) await pruneStockHistory(guildId);
+  return applied;
+}
+
+/** Plafonne l'historique de stock d'une guilde à ~500 entrées (les plus anciennes sont purgées). */
+async function pruneStockHistory(guildId: string): Promise<void> {
   const excess = await prisma.stockHistory.findMany({
     where: { guildId },
     orderBy: { id: 'desc' },
@@ -451,7 +495,7 @@ export async function addStockHistory(guildId: string, data: StockHistoryInput):
     take: 1000,
   });
   if (excess.length) {
-    await prisma.stockHistory.deleteMany({ where: { id: { in: excess.map(r => r.id) } } });
+    await prisma.stockHistory.deleteMany({ where: { guildId, id: { in: excess.map(r => r.id) } } });
   }
 }
 
@@ -522,9 +566,137 @@ export async function getTransaction(guildId: string, id: number) {
   return row ? mapTransaction(row) : undefined;
 }
 
-/** Soft-delete une transaction (utilisé par `/supp`) en conservant qui l'a supprimée. */
-export async function deleteTransaction(guildId: string, id: number, deletedBy: string): Promise<void> {
-  await prisma.transaction.updateMany({ where: { id, guildId }, data: { deleted: true, deletedBy } });
+/** Verrou transactionnel par clé (libéré au commit) : sérialise deux transactions qui lisent puis écrivent la même ressource logique. */
+async function lockKey(tx: Prisma.TransactionClient, key: string): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+}
+
+/**
+ * Verrou partagé sur `Stat` d'une guilde, pris par toute écriture qui crédite
+ * ou décrémente une stat. Le reset hebdomadaire prend le même en exclusif
+ * (voir {@link performWeeklyReset}) : aucune déclaration ne peut être à
+ * cheval sur le reset, comptée deux fois ou dans aucune semaine.
+ */
+async function lockStatsShared(tx: Prisma.TransactionClient, guildId: string): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(hashtext(${`stats:${guildId}`}))`;
+}
+
+interface ActivityInput {
+  userId: string;
+  username: string;
+  action: string;
+  quantite?: number;
+  type?: string | null;
+  partenaires?: string[];
+  tempsRestant?: string | null;
+  /** Quantité créditée à chaque participant (déclarant + partenaires) dans `Stat`. */
+  statDelta: number;
+  /** Limite de braquage à faire respecter (fenêtre glissante de 7 jours) — omis pour une activité sans limite. */
+  braquageLimit?: number | null;
+  /** Cooldown à vérifier puis poser pour le déclarant — omis pour une activité sans cooldown. */
+  cooldownMs?: number | null;
+}
+
+export type ActivityResult =
+  | { ok: true; txId: number }
+  | { ok: false; reason: 'limite'; used: number }
+  | { ok: false; reason: 'cooldown'; remainingMs: number };
+
+/**
+ * Enregistre une déclaration d'activité en UNE transaction : limite de
+ * braquage et cooldown revérifiés sous verrou au moment de l'écriture (la
+ * vérification faite à l'ouverture du modal/menu ne vaut plus rien 60 s plus
+ * tard), puis `Transaction`, `Stat` de chaque participant, slot de braquage
+ * et cooldown. Le braquage porte exactement l'horodatage de sa transaction :
+ * c'est ce qui permet à `/supp` de libérer LE slot de la transaction annulée
+ * (voir {@link suppTransaction}).
+ */
+export async function recordActivity(guildId: string, data: ActivityInput): Promise<ActivityResult> {
+  return prisma.$transaction(async (tx): Promise<ActivityResult> => {
+    await lockStatsShared(tx, guildId);
+    const now = new Date();
+    if (data.braquageLimit != null) {
+      await lockKey(tx, `braquage:${guildId}:${data.action}`);
+      const used = await tx.braquage.count({ where: { guildId, action: data.action, timestamp: { gte: new Date(now.getTime() - SEVEN_DAYS_MS) } } });
+      if (used >= data.braquageLimit) return { ok: false, reason: 'limite', used };
+    }
+    if (data.cooldownMs) {
+      await lockKey(tx, `cooldown:${guildId}:${data.userId}:${data.action}`);
+      const cd = await tx.cooldown.findUnique({ where: { guildId_userId_action: { guildId, userId: data.userId, action: data.action } } });
+      if (cd && cd.expiresAt.getTime() > now.getTime()) return { ok: false, reason: 'cooldown', remainingMs: cd.expiresAt.getTime() - now.getTime() };
+    }
+
+    const partenaires = data.partenaires ?? [];
+    const row = await tx.transaction.create({
+      data: {
+        guildId, userId: data.userId, username: data.username, action: data.action,
+        quantite: data.quantite ?? 0, type: data.type ?? null,
+        partenaires: JSON.stringify(partenaires), tempsRestant: data.tempsRestant ?? null, timestamp: now,
+      },
+    });
+    for (const uid of [data.userId, ...partenaires]) {
+      await tx.stat.upsert({
+        where: { guildId_userId_action: { guildId, userId: uid, action: data.action } },
+        create: { guildId, userId: uid, action: data.action, count: data.statDelta },
+        update: { count: { increment: data.statDelta } },
+      });
+    }
+    if (data.braquageLimit != null) {
+      await tx.braquage.create({ data: { guildId, userId: data.userId, action: data.action, timestamp: now } });
+    }
+    if (data.cooldownMs) {
+      const expiresAt = new Date(now.getTime() + data.cooldownMs);
+      await tx.cooldown.upsert({
+        where: { guildId_userId_action: { guildId, userId: data.userId, action: data.action } },
+        create: { guildId, userId: data.userId, action: data.action, expiresAt, notified: false },
+        update: { expiresAt, notified: false },
+      });
+    }
+    return { ok: true, txId: row.id };
+  });
+}
+
+/**
+ * Annule une transaction (`/supp`) en UNE transaction DB : le marquage
+ * `deleted` est conditionnel (deux `/supp` simultanés sur le même ID ne
+ * décrémentent qu'une fois), `Stat` n'est décrémenté que si la transaction
+ * appartient à la période en cours (`sinceTs` = dernier reset hebdomadaire —
+ * `Stat` ne contient rien d'antérieur), et le slot de braquage libéré est
+ * celui de CETTE transaction (même horodatage, voir {@link recordActivity}).
+ * Un braquage enregistré sans horodatage commun avec sa transaction n'a pas
+ * de correspondance exacte : c'est alors le plus récent du déclarant encore
+ * dans la fenêtre de 7 jours qui est libéré.
+ * @returns `false` si la transaction n'existe pas ou était déjà supprimée.
+ */
+export async function suppTransaction(
+  guildId: string, id: number, deletedBy: string,
+  opts: { statUserIds: string[]; statDelta: number; sinceTs: number; freeBraquage: boolean },
+): Promise<boolean> {
+  return prisma.$transaction(async tx => {
+    await lockStatsShared(tx, guildId);
+    const row = await tx.transaction.findFirst({ where: { id, guildId, deleted: false } });
+    if (!row) return false;
+    const { count } = await tx.transaction.updateMany({ where: { id, guildId, deleted: false }, data: { deleted: true, deletedBy } });
+    if (count !== 1) return false;
+
+    if (row.timestamp.getTime() >= opts.sinceTs) {
+      for (const uid of opts.statUserIds) {
+        await tx.$executeRaw`
+          UPDATE stats SET count = GREATEST(count - ${opts.statDelta}, 0)
+          WHERE guild_id = ${guildId} AND user_id = ${uid} AND action = ${row.action}
+        `;
+      }
+    }
+    if (opts.freeBraquage) {
+      const braquage = await tx.braquage.findFirst({ where: { guildId, userId: row.userId, action: row.action, timestamp: row.timestamp } })
+        ?? await tx.braquage.findFirst({
+          where: { guildId, userId: row.userId, action: row.action, timestamp: { gte: new Date(Date.now() - SEVEN_DAYS_MS) } },
+          orderBy: { timestamp: 'desc' },
+        });
+      if (braquage) await tx.braquage.deleteMany({ where: { id: braquage.id, guildId } });
+    }
+    return true;
+  });
 }
 
 /** Transactions non supprimées d'une guilde depuis `since`, de la plus récente à la plus ancienne. */
@@ -548,28 +720,20 @@ export async function getAllStats(guildId: string) {
   return prisma.stat.findMany({ where: { guildId } });
 }
 
-/** Stats d'un joueur sous forme de carte `action → { count, points }`. */
-export async function getUserStatMap(guildId: string, userId: string): Promise<Record<string, { count: number; points: number }>> {
+/** Stats d'un joueur sous forme de carte `action → { count }`. */
+export async function getUserStatMap(guildId: string, userId: string): Promise<Record<string, { count: number }>> {
   const rows = await getUserStats(guildId, userId);
-  const map: Record<string, { count: number; points: number }> = {};
-  for (const r of rows) map[r.action] = { count: r.count, points: r.points };
+  const map: Record<string, { count: number }> = {};
+  for (const r of rows) map[r.action] = { count: r.count };
   return map;
-}
-
-/** Total de points par joueur d'une guilde, tous suivis, trié décroissant. */
-export async function getAllUserTotals(guildId: string): Promise<Array<{ user_id: string; total_points: number }>> {
-  const rows = await prisma.stat.groupBy({ by: ['userId'], where: { guildId }, _sum: { points: true } });
-  return rows
-    .map(r => ({ user_id: r.userId, total_points: r._sum.points ?? 0 }))
-    .sort((a, b) => b.total_points - a.total_points);
 }
 
 /**
  * Retourne le nombre d'événements par type d'action entre `sinceTs` et
- * `untilTs` (exclu, défaut maintenant — donc "depuis sinceTs" par défaut),
- * tous participants confondus (une transaction = un événement). Les clés
- * listées dans `quantityActions` sont sommées par quantité plutôt que
- * comptées.
+ * `untilTs` (exclu, défaut maintenant — donc "depuis sinceTs" par défaut,
+ * comme avant), tous participants confondus (une transaction = un
+ * événement). Les clés listées dans `quantityActions` sont sommées par
+ * quantité plutôt que comptées.
  */
 export async function getGroupActionTotals(guildId: string, sinceTs = 0, quantityActions: string[] = [], untilTs: number = Date.now()): Promise<Array<{ action: string; total: number }>> {
   const rows = await prisma.transaction.findMany({
@@ -592,45 +756,41 @@ export async function getGroupActionTotals(guildId: string, sinceTs = 0, quantit
  * `modules/quotas.ts`, fonctions `*ForRange`, et `src/api/routes/quotas.ts`).
  * `userId` optionnel filtre sur un seul joueur (évite de tout charger puis
  * filtrer en mémoire pour une vue "un seul joueur").
+ *
+ * Un événement labo/braquage crédite le déclarant ET chaque `partenaires`
+ * (même règle que le crédit de `Stat` dans `recordActivity`, voir `modules/quotas.ts`
+ * `handleModal`/`handleSelect`) — sans ça, un partenaire apparaîtrait dans
+ * son quota/sa paie du panneau Discord live mais disparaîtrait de l'API pour
+ * une semaine passée, alors que `Transaction` est censée reconstruire
+ * exactement ce que `Stat` donnerait. `partenaires` n'inclut jamais le
+ * déclarant lui-même (déjà filtré à la création, voir `quotas.ts`), donc pas
+ * de double-crédit.
  */
 export async function getUserActionTotals(guildId: string, sinceTs: number, untilTs: number, quantityActions: string[] = [], userId?: string): Promise<Array<{ userId: string; action: string; total: number }>> {
   const rows = await prisma.transaction.findMany({
-    where: { guildId, deleted: false, timestamp: { gte: new Date(sinceTs), lt: new Date(untilTs) }, ...(userId ? { userId } : {}) },
-    select: { userId: true, action: true, quantite: true },
+    where: {
+      guildId, deleted: false, timestamp: { gte: new Date(sinceTs), lt: new Date(untilTs) },
+      // Substring sur le JSON stocké, entre guillemets pour éviter qu'un ID
+      // soit un faux positif de sous-chaîne d'un autre — un `contains` évite
+      // de charger toute la guilde juste pour retrouver les transactions où
+      // ce joueur n'est que partenaire (pas déclarant).
+      ...(userId ? { OR: [{ userId }, { partenaires: { contains: `"${userId}"` } }] } : {}),
+    },
+    select: { userId: true, action: true, quantite: true, partenaires: true },
   });
   const totals = new Map<string, { userId: string; action: string; total: number }>();
-  for (const r of rows) {
-    const key = `${r.userId}|${r.action}`;
-    const add = quantityActions.includes(r.action) ? r.quantite : 1;
+  const credit = (uid: string, action: string, add: number) => {
+    const key = `${uid}|${action}`;
     const existing = totals.get(key);
     if (existing) existing.total += add;
-    else totals.set(key, { userId: r.userId, action: r.action, total: add });
-  }
-  return [...totals.values()];
-}
-
-/**
- * Quantités vendues par item sur [sinceTs, untilTs), par joueur — pour le
- * taux de paie par item (voir `computeSalaire`/{@link ItemSalaryRate}). Le
- * cache `Stat` ne connaît que le total "vente" tous items confondus (une
- * seule ligne par joueur), jamais la répartition par drogue : cette requête
- * relit donc toujours `Transaction`, y compris pour la période en cours
- * (contrairement au reste du calcul de paie, qui distingue période en cours
- * — `Stat` — et semaine passée — `Transaction`, voir docstring de fichier de
- * `modules/quotas.ts`). `userId` optionnel filtre sur un seul joueur.
- */
-export async function getVenteTotalsByItem(guildId: string, sinceTs: number, untilTs: number, userId?: string): Promise<Array<{ userId: string; item: string; total: number }>> {
-  const rows = await prisma.transaction.findMany({
-    where: { guildId, action: 'vente', deleted: false, timestamp: { gte: new Date(sinceTs), lt: new Date(untilTs) }, ...(userId ? { userId } : {}) },
-    select: { userId: true, type: true, quantite: true },
-  });
-  const totals = new Map<string, { userId: string; item: string; total: number }>();
+    else totals.set(key, { userId: uid, action, total: add });
+  };
   for (const r of rows) {
-    const item = r.type || '';
-    const key = `${r.userId}|${item}`;
-    const existing = totals.get(key);
-    if (existing) existing.total += r.quantite;
-    else totals.set(key, { userId: r.userId, item, total: r.quantite });
+    const add = quantityActions.includes(r.action) ? r.quantite : 1;
+    let partenaires: string[] = [];
+    try { partenaires = JSON.parse(r.partenaires); } catch { /* ignore */ }
+    const participants = userId ? [userId] : [r.userId, ...partenaires];
+    for (const uid of participants) credit(uid, r.action, add);
   }
   return [...totals.values()];
 }
@@ -642,6 +802,16 @@ export async function getMunitionsFabriqueesDepuis(guildId: string, sinceTs: num
     _sum: { quantite: true },
   });
   return agg._sum.quantite ?? 0;
+}
+
+/** Déclarations de fabrication de munitions depuis `sinceTs` (détail ligne par ligne, pas juste le total), du plus récent au plus ancien — pas de limite, contrairement à {@link getFabricationMunitionsHistorique}. Pendant de {@link getMunitionsVentesDepuis} côté fabrication. */
+export async function getFabricationMunitionsDepuis(guildId: string, sinceTs: number) {
+  const rows = await prisma.transaction.findMany({
+    where: { guildId, action: 'fabrication_munitions', deleted: false, timestamp: { gte: new Date(sinceTs) } },
+    orderBy: { timestamp: 'desc' },
+    select: { timestamp: true, quantite: true, username: true, userId: true },
+  });
+  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
 }
 
 /** Enregistre une vente de munitions. */
@@ -688,16 +858,6 @@ export async function getFabricationMunitionsHistorique(guildId: string, limite 
   return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
 }
 
-/** Déclarations de fabrication de munitions depuis `sinceTs`, du plus récent au plus ancien — pas de limite, contrairement à {@link getFabricationMunitionsHistorique} (miroir de {@link getMunitionsVentesDepuis}). */
-export async function getFabricationMunitionsDepuis(guildId: string, sinceTs: number) {
-  const rows = await prisma.transaction.findMany({
-    where: { guildId, action: 'fabrication_munitions', deleted: false, timestamp: { gte: new Date(sinceTs) } },
-    orderBy: { timestamp: 'desc' },
-    select: { timestamp: true, quantite: true, username: true, userId: true },
-  });
-  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
-}
-
 /** Dernières ventes de munitions, du plus récent au plus ancien. */
 export async function getMunitionsVentesHistorique(guildId: string, limite = 15) {
   const rows = await prisma.munitionVente.findMany({
@@ -723,31 +883,81 @@ export async function deleteOldMunitionVentes(guildId: string, beforeTs: number)
   return count;
 }
 
-/** Incrémente (upsert) le compteur et les points d'une stat pour un joueur/action. */
-export async function incrementStat(guildId: string, userId: string, action: string, countDelta = 1, pointsDelta = 0): Promise<void> {
-  await prisma.stat.upsert({
-    where: { guildId_userId_action: { guildId, userId, action } },
-    create: { guildId, userId, action, count: countDelta, points: pointsDelta },
-    update: { count: { increment: countDelta }, points: { increment: pointsDelta } },
-  });
+/** Une semaine close qui reste à publier (voir `quotas.checkWeeklyReset`) : sa période, et les étapes déjà postées. */
+export interface PendingPublication { since: number; until: number; bilan: boolean; paie: boolean; fourrieres: boolean }
+
+/** Semaines closes restant à publier, de la plus ancienne à la plus récente. */
+export async function getPendingPublications(guildId: string, key: string): Promise<PendingPublication[]> {
+  const raw = await getSetting(guildId, key);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [];
+  }
 }
 
-/** Décrémente une stat existante (utilisé par `/supp`), jamais sous zéro ; no-op si la ligne n'existe pas. */
-export async function decrementStat(guildId: string, userId: string, action: string, countDelta = 1, pointsDelta = 0): Promise<void> {
-  const row = await prisma.stat.findUnique({ where: { guildId_userId_action: { guildId, userId, action } } });
-  if (!row) return;
-  await prisma.stat.update({
-    where: { guildId_userId_action: { guildId, userId, action } },
-    data: {
-      count: Math.max(0, row.count - countDelta),
-      points: Math.max(0, row.points - pointsDelta),
-    },
-  });
+/** Remplace la liste des semaines restant à publier (supprimée si vide). */
+export async function setPendingPublications(guildId: string, key: string, list: PendingPublication[]): Promise<void> {
+  if (!list.length) await deleteSetting(guildId, key);
+  else await setSetting(guildId, key, JSON.stringify(list));
 }
 
-/** Supprime toutes les stats d'une guilde (reset hebdomadaire). */
-export async function resetAllStats(guildId: string): Promise<void> {
-  await prisma.stat.deleteMany({ where: { guildId } });
+/**
+ * Reset hebdomadaire, en UNE transaction, sous le verrou exclusif de `Stat`
+ * (voir {@link lockStatsShared}) :
+ * - `Stat` est reconstruit depuis les `Transaction` postérieures à `untilTs`
+ *   (la frontière du dimanche 19h, pas l'heure du passage du cron) : une
+ *   déclaration faite entre 19h et le reset effectif compte dans la nouvelle
+ *   semaine, exactement comme pour `?week=` côté API ;
+ * - `last_weekly_reset` passe à `untilTs` ;
+ * - une période à publier par semaine close est AJOUTÉE à `publicationKey` —
+ *   jamais une publication encore en attente écrasée.
+ * `quantityActions` : activités comptées en quantité plutôt qu'en nombre
+ * (même règle que {@link getUserActionTotals}).
+ */
+export async function performWeeklyReset(
+  guildId: string, resetKey: string, publicationKey: string, periods: Array<{ since: number; until: number }>, quantityActions: string[],
+): Promise<void> {
+  const untilTs = periods[periods.length - 1].until;
+  await prisma.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`stats:${guildId}`}))`;
+
+    const after = await tx.transaction.findMany({
+      where: { guildId, deleted: false, timestamp: { gte: new Date(untilTs) } },
+      select: { userId: true, action: true, quantite: true, partenaires: true },
+    });
+    const counts = new Map<string, { userId: string; action: string; count: number }>();
+    for (const t of after) {
+      const add = quantityActions.includes(t.action) ? t.quantite : 1;
+      let partenaires: string[] = [];
+      try { partenaires = JSON.parse(t.partenaires); } catch { /* ignore */ }
+      for (const userId of [t.userId, ...partenaires]) {
+        const key = `${userId}|${t.action}`;
+        const existing = counts.get(key);
+        if (existing) existing.count += add;
+        else counts.set(key, { userId, action: t.action, count: add });
+      }
+    }
+    await tx.stat.deleteMany({ where: { guildId } });
+    if (counts.size) await tx.stat.createMany({ data: [...counts.values()].map(c => ({ guildId, ...c })) });
+
+    const existing = await tx.setting.findUnique({ where: { guildId_key: { guildId, key: publicationKey } } });
+    let pending: PendingPublication[] = [];
+    if (existing) {
+      try { const parsed = JSON.parse(existing.value); pending = Array.isArray(parsed) ? parsed : [parsed]; } catch { /* illisible : remplacée */ }
+    }
+    pending.push(...periods.map(period => ({ ...period, bilan: false, paie: false, fourrieres: false })));
+
+    const upsert = (key: string, value: string) => tx.setting.upsert({
+      where: { guildId_key: { guildId, key } },
+      create: { guildId, key, value },
+      update: { value },
+    });
+    await upsert(resetKey, String(untilTs));
+    await upsert(publicationKey, JSON.stringify(pending));
+  });
 }
 
 // ─── COOLDOWNS ───────────────────────────────────────────────────────────────
@@ -758,25 +968,17 @@ export async function getCooldown(guildId: string, userId: string, action: strin
   return row ? toMs(row.expiresAt) : 0;
 }
 
-/** Fixe (upsert) le cooldown d'un joueur/action et réinitialise son flag `notified`. */
-export async function setCooldown(guildId: string, userId: string, action: string, expiresAt: number): Promise<void> {
-  await prisma.cooldown.upsert({
-    where: { guildId_userId_action: { guildId, userId, action } },
-    create: { guildId, userId, action, expiresAt: new Date(expiresAt), notified: false },
-    update: { expiresAt: new Date(expiresAt), notified: false },
-  });
-}
 
-/** Tous les cooldowns encore actifs (non expirés) d'une guilde. */
-export async function getActiveCooldowns(guildId: string) {
+/** Tous les cooldowns encore actifs (non expirés) d'une guilde — voir `/api/quotas/cooldowns`, seule utilisatrice actuelle. */
+export async function getActiveCooldowns(guildId: string): Promise<Array<{ userId: string; action: string; expiresAt: number }>> {
   const rows = await prisma.cooldown.findMany({ where: { guildId, expiresAt: { gt: new Date() } } });
-  return rows.map(r => ({ ...r, expires_at: toMs(r.expiresAt) }));
+  return rows.map(r => ({ userId: r.userId, action: r.action, expiresAt: toMs(r.expiresAt) }));
 }
 
 /** Cooldowns d'une guilde expirés dont l'alerte de fin n'a pas encore été envoyée. */
-export async function getExpiredUnnotifiedCooldowns(guildId: string) {
+export async function getExpiredUnnotifiedCooldowns(guildId: string): Promise<Array<{ userId: string; action: string; expiresAt: number }>> {
   const rows = await prisma.cooldown.findMany({ where: { guildId, expiresAt: { lte: new Date() }, notified: false } });
-  return rows.map(r => ({ ...r, expires_at: toMs(r.expiresAt) }));
+  return rows.map(r => ({ userId: r.userId, action: r.action, expiresAt: toMs(r.expiresAt) }));
 }
 
 /** Marque un cooldown comme déjà notifié (évite une double alerte de fin de cooldown). */
@@ -784,29 +986,39 @@ export async function markCooldownNotified(guildId: string, userId: string, acti
   await prisma.cooldown.updateMany({ where: { guildId, userId, action }, data: { notified: true } });
 }
 
-/** Supprime le cooldown d'un joueur/action. */
-export async function removeCooldown(guildId: string, userId: string, action: string): Promise<void> {
-  await prisma.cooldown.deleteMany({ where: { guildId, userId, action } });
-}
-
 // ─── BRAQUAGES (fenêtre glissante 7 jours) ───────────────────────────────────
 
-/** Exportée pour que `src/api/routes/activites.ts` reste sur la même fenêtre sans la redéfinir en dur. */
 export const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** Enregistre un braquage (consomme un slot de la fenêtre glissante de 7 jours). */
-export async function addBraquage(guildId: string, userId: string, action: string): Promise<void> {
-  await prisma.braquage.create({ data: { guildId, userId, action, timestamp: new Date() } });
-}
 
 /** Nombre de braquages d'un type donné dans les 7 derniers jours, pour une guilde. */
 export async function getBraquageCount(guildId: string, action: string): Promise<number> {
   return prisma.braquage.count({ where: { guildId, action, timestamp: { gte: new Date(Date.now() - SEVEN_DAYS_MS) } } });
 }
 
-/** Purge les entrées de braquage sorties de la fenêtre glissante de 7 jours, toutes guildes confondues — la fenêtre glissante rend le filtrage par guilde inutile ici (une entrée hors fenêtre l'est pour toutes). */
-export async function cleanOldBraquages(): Promise<void> {
-  await prisma.braquage.deleteMany({ where: { timestamp: { lt: new Date(Date.now() - SEVEN_DAYS_MS) } } });
+/**
+ * Comme {@link getBraquageCount}, mais pour plusieurs actions en une seule
+ * requête (`groupBy`) — utilisé partout où le panneau affiche TOUTES les
+ * activités de braquage à la fois (`quotas.buildMainEmbed`/`handleMinuterie`),
+ * plutôt qu'un `getBraquageCount` par activité à chaque rafraîchissement
+ * (déclenché après chaque déclaration/vente/`/supp`, un hot path). Une action
+ * sans aucun braquage dans la fenêtre est simplement absente de l'objet
+ * retourné (0 implicite pour l'appelant).
+ */
+export async function getBraquageCounts(guildId: string, actions: string[]): Promise<Record<string, number>> {
+  if (!actions.length) return {};
+  const rows = await prisma.braquage.groupBy({
+    by: ['action'],
+    where: { guildId, action: { in: actions }, timestamp: { gte: new Date(Date.now() - SEVEN_DAYS_MS) } },
+    _count: { _all: true },
+  });
+  const counts: Record<string, number> = {};
+  for (const r of rows) counts[r.action] = r._count._all;
+  return counts;
+}
+
+/** Purge les entrées de braquage d'une guilde sorties de la fenêtre glissante de 7 jours. */
+export async function cleanOldBraquages(guildId: string): Promise<void> {
+  await prisma.braquage.deleteMany({ where: { guildId, timestamp: { lt: new Date(Date.now() - SEVEN_DAYS_MS) } } });
 }
 
 /** Timestamp (ms) du braquage le plus ancien encore dans la fenêtre de 7 jours pour une action, ou `null`. */
@@ -816,18 +1028,6 @@ export async function getOldestBraquage(guildId: string, action: string): Promis
     orderBy: { timestamp: 'asc' },
   });
   return row ? toMs(row.timestamp) : null;
-}
-
-/**
- * Supprime l'entrée de braquage la plus récente pour (userId, action), pour
- * libérer le slot hebdomadaire qu'elle consommait — utilisé par `/supp`
- * quand la transaction annulée est un braquage. Les entrées de `braquages`
- * n'étant pas liées à une transaction précise, on cible la plus récente :
- * `/supp` corrige presque toujours une erreur juste après coup.
- */
-export async function removeMostRecentBraquage(guildId: string, userId: string, action: string): Promise<void> {
-  const row = await prisma.braquage.findFirst({ where: { guildId, userId, action }, orderBy: { timestamp: 'desc' } });
-  if (row) await prisma.braquage.deleteMany({ where: { id: row.id, guildId } });
 }
 
 // ─── TAXES ───────────────────────────────────────────────────────────────────
@@ -846,26 +1046,18 @@ function mapTaxe<T extends { echeance: Date }>(t: T) {
   return { ...t, echeance: toMs(t.echeance) };
 }
 
-/** Comme `mapTaxe`, mais sans `telephone`/`motDePasse` — pour les vues "liste" (`GET /api/taxes`, `/search`), qui ne montrent que les infos générales. Le détail complet (avec ces deux champs) reste réservé à `GET /api/taxes/:id` (voir `getTaxe`). */
+/**
+ * Comme {@link mapTaxe}, mais retire `telephone`/`motDePasse` — utilisée
+ * UNIQUEMENT par `findTaxes` (liste/recherche, voir `src/api/routes/taxes.ts`
+ * `GET /api/taxes`/`GET /api/taxes/search`), jamais par `getTaxe` (détail
+ * d'UNE taxe, `GET /api/taxes/:id`, qui a besoin de tout pour l'usage
+ * Discord — fiche de taxe, renouvellement...). `id` reste présent : sans
+ * lui, impossible pour un client de savoir quel id appeler ensuite sur
+ * `/:id` pour obtenir le détail complet.
+ */
 function mapTaxeSummary<T extends { echeance: Date; telephone: string | null; motDePasse: string | null }>(t: T) {
   const { telephone, motDePasse, ...rest } = mapTaxe(t);
   return rest;
-}
-
-/** Crée une taxe et retourne son ID. */
-export async function addTaxe(guildId: string, data: TaxeInput): Promise<number> {
-  const row = await prisma.taxe.create({
-    data: {
-      guildId,
-      nom: data.nom,
-      type: data.type,
-      telephone: data.telephone ?? null,
-      echeance: new Date(data.echeance),
-      motDePasse: data.mot_de_passe ?? null,
-      paye: data.paye !== false,
-    },
-  });
-  return row.id;
 }
 
 /** Une taxe active (non soft-deleted) par ID, ou `undefined`. */
@@ -875,11 +1067,14 @@ export async function getTaxe(guildId: string, id: number) {
 }
 
 /**
- * Taxe active ET non expirée pour un type donné, ou undefined — utilisé pour
- * bloquer la création d'une nouvelle taxe tant qu'une autre du même type est
- * encore en cours. `actif` (soft-delete) ne suffit pas seul : une taxe
- * expirée mais pas encore supprimée ne doit PAS bloquer une nouvelle
- * création, d'où le filtre supplémentaire sur `echeance`.
+ * Taxe active ET non expirée pour un type ET un nom de groupe donnés (nom
+ * comparé insensible à la casse), ou undefined — utilisé pour bloquer la
+ * création d'une nouvelle taxe tant qu'une autre du MÊME groupe sur ce même
+ * type est encore en cours. Deux groupes différents peuvent chacun avoir
+ * leur propre taxe active sur le même type/zone en parallèle — voir
+ * docstring de `modules/taxes.ts`. `actif` (soft-delete) ne suffit pas seul :
+ * une taxe expirée mais pas encore supprimée ne doit PAS bloquer une
+ * nouvelle création, d'où le filtre supplémentaire sur `echeance`.
  */
 export async function getActiveTaxeByTypeAndNom(guildId: string, type: string, nom: string) {
   const row = await prisma.taxe.findFirst({
@@ -922,9 +1117,8 @@ export interface FindTaxesOptions {
  * combine filtre par type(s), par état (en cours/expirée), et par nom, selon
  * les options fournies. Base de `GET /api/taxes` (list, filtres type/état)
  * et `GET /api/taxes/search` (recherche par nom dans un type donné) — voir
- * `src/api/routes/taxes.ts`. Remplace `getAllTaxes`/`getExpiredTaxes` pour
- * ces deux usages (gardées telles quelles pour leurs appelants existants,
- * qui n'ont pas besoin de cette flexibilité).
+ * `src/api/routes/taxes.ts`. `getAllTaxes`/`getExpiredTaxes` couvrent les
+ * besoins plus simples du module Discord.
  */
 export async function findTaxes(guildId: string, opts: FindTaxesOptions = {}) {
   const now = new Date();
@@ -943,14 +1137,62 @@ export async function findTaxes(guildId: string, opts: FindTaxesOptions = {}) {
   return rows.map(mapTaxeSummary);
 }
 
-/** Ajoute `days` jours à l'échéance d'une taxe (au moins depuis maintenant) et retourne la nouvelle échéance, ou `null` si introuvable. */
-export async function renewTaxe(guildId: string, id: number, days: number): Promise<number | null> {
-  const taxe = await getTaxe(guildId, id);
-  if (!taxe) return null;
-  const base = Math.max(Date.now(), taxe.echeance);
-  const newDate = base + days * 24 * 60 * 60 * 1000;
-  await prisma.taxe.updateMany({ where: { id, guildId }, data: { echeance: new Date(newDate), alerteSent: false, paye: false } });
-  return newDate;
+/**
+ * Ajoute `days` jours à l'échéance d'une taxe (au moins depuis maintenant).
+ * Lecture et écriture sous verrou dans une même transaction : deux
+ * renouvellements simultanés s'additionnent au lieu de partir de la même
+ * échéance. `paye` est l'état posé avec le renouvellement, en une seule
+ * écriture. Renouveler une taxe expirée la réactive : si `unique` (tout type
+ * sauf `vente`), c'est refusé quand le même groupe a déjà une autre taxe
+ * active sur ce type — vérifié sous le verrou de création de
+ * {@link addTaxeIfFree}, pour qu'une création simultanée ne passe pas entre les deux.
+ * @returns La nouvelle échéance, `{ conflit }` avec la taxe active concurrente, ou `null` si introuvable.
+ */
+export async function renewTaxe(
+  guildId: string, id: number, days: number, paye: boolean, unique: boolean,
+): Promise<number | { conflit: { nom: string; echeance: number } } | null> {
+  return prisma.$transaction(async tx => {
+    await lockKey(tx, `taxe:${guildId}:${id}`);
+    const taxe = await tx.taxe.findFirst({ where: { id, guildId, actif: true } });
+    if (!taxe) return null;
+    if (unique && taxe.echeance.getTime() <= Date.now()) {
+      await lockKey(tx, `taxe-creation:${guildId}:${taxe.type}:${taxe.nom.toLowerCase()}`);
+      const active = await tx.taxe.findFirst({
+        where: { guildId, type: taxe.type, nom: { equals: taxe.nom, mode: 'insensitive' }, actif: true, echeance: { gt: new Date() }, id: { not: id } },
+      });
+      if (active) return { conflit: { nom: active.nom, echeance: active.echeance.getTime() } };
+    }
+    const base = Math.max(Date.now(), taxe.echeance.getTime());
+    const newDate = base + days * 24 * 60 * 60 * 1000;
+    await tx.taxe.updateMany({ where: { id, guildId }, data: { echeance: new Date(newDate), alerteSent: false, paye } });
+    return newDate;
+  });
+}
+
+/**
+ * Crée une taxe sauf si le même groupe en a déjà une active et non expirée
+ * sur ce type — vérification et création sous verrou dans une même
+ * transaction, pour que deux soumissions simultanées n'en créent pas deux.
+ * `unique: false` (taxe `vente`, cumulable) crée sans vérifier.
+ * @returns L'ID créé, ou `null` si une taxe active existe déjà.
+ */
+export async function addTaxeIfFree(guildId: string, data: TaxeInput, unique: boolean): Promise<number | null> {
+  return prisma.$transaction(async tx => {
+    if (unique) {
+      await lockKey(tx, `taxe-creation:${guildId}:${data.type}:${data.nom.toLowerCase()}`);
+      const existing = await tx.taxe.findFirst({
+        where: { guildId, type: data.type, nom: { equals: data.nom, mode: 'insensitive' }, actif: true, echeance: { gt: new Date() } },
+      });
+      if (existing) return null;
+    }
+    const row = await tx.taxe.create({
+      data: {
+        guildId, nom: data.nom, type: data.type, telephone: data.telephone ?? null,
+        echeance: new Date(data.echeance), motDePasse: data.mot_de_passe ?? null, paye: data.paye !== false,
+      },
+    });
+    return row.id;
+  });
 }
 
 /** Marque une taxe comme payée ou non. */
@@ -961,6 +1203,12 @@ export async function setTaxePaye(guildId: string, id: number, paye: boolean): P
 /** Soft-delete une taxe (`actif: false`). */
 export async function deleteTaxe(guildId: string, id: number): Promise<void> {
   await prisma.taxe.updateMany({ where: { id, guildId }, data: { actif: false } });
+}
+
+/** Purge les taxes supprimées (soft-delete) dont l'échéance est antérieure à `beforeTs` : plus rien ne les lit, ni le module Discord ni l'API. Retourne le nombre supprimé. */
+export async function deleteOldInactiveTaxes(guildId: string, beforeTs: number): Promise<number> {
+  const { count } = await prisma.taxe.deleteMany({ where: { guildId, actif: false, echeance: { lt: new Date(beforeTs) } } });
+  return count;
 }
 
 /** Marque l'alerte d'expiration d'une taxe comme envoyée (évite une double alerte). */
@@ -1000,42 +1248,51 @@ export async function deleteUserMapping(guildId: string, gameName: string, disco
 }
 
 /**
- * Comptes Discord connus de la guilde, pour `GET /api/users` : union des
- * `userId` de `Transaction` (nom affiché = `username` le plus récent non
- * vide, déjà trié par `timestamp: 'desc'`) et des `discordId` de
- * `UserMapping` (fallback sur le(s) `gameName` associé(s) si ce compte n'a
- * aucune `Transaction`). `gameName` : le premier nom en jeu associé via
- * `/adduser`, ou `null` — c'est lui qu'un site affiche de préférence au
- * pseudo Discord. Purement DB, aucun appel au client Discord — le nom
- * affiché peut donc être un pseudo Discord périmé, jamais résolu en direct.
+ * Comptes Discord connus de cette guilde, pour peupler un sélecteur de
+ * joueur côté site externe (voir `GET /api/users`) — union des déclarants de
+ * `Transaction` (jamais purgée) et des joueurs mappés (`UserMapping`).
+ * Purement DB, pas d'appel au client Discord : le nom affiché privilégie le
+ * dernier tag Discord connu (`Transaction.username`, posé à chaque
+ * déclaration d'activité) ; à défaut (jamais rien déclaré, seulement mappé
+ * via `/adduser`), retombe sur le(s) nom(s) en jeu associés. Un compte qui ne
+ * figure plus dans aucune des deux sources (mapping supprimé, jamais
+ * déclaré) disparaît simplement de la liste — pas une erreur, voir les
+ * autres fonctions `getVente*`/`getUserActionTotals` qui gèrent déjà un
+ * `userId` sans aucune donnée en renvoyant un résultat vide. `gameName` : le
+ * premier nom en jeu associé via `/adduser`, ou `null` — c'est lui que le
+ * site externe affiche de préférence au pseudo Discord (voir `api/noms.ts`).
+ * `deleted: false`
+ * — même filtre que toutes les autres lectures de `Transaction` (voir
+ * `getAllTransactions`/`getGroupActionTotals`/`getUserActionTotals`/
+ * `getVenteTotalsForRange`) : un joueur dont l'unique déclaration a été
+ * supprimée (`/supp`) ne doit pas rester "connu" ici alors que toutes les
+ * autres routes API (`/api/quotas/:userId`, `/api/ventes/:userId`) le
+ * traitent déjà comme n'ayant jamais rien déclaré.
  */
 export async function getKnownUsers(guildId: string): Promise<Array<{ userId: string; username: string; gameName: string | null }>> {
+  // Une ligne par joueur (son pseudo le plus récent), calculée par la base :
+  // `Transaction` n'est jamais purgée, la charger entière grossirait sans fin.
   const [transactions, mappings] = await Promise.all([
-    prisma.transaction.findMany({
-      where: { guildId, deleted: false, username: { not: '' } },
-      select: { userId: true, username: true },
-      orderBy: { timestamp: 'desc' },
-    }),
+    prisma.$queryRaw<Array<{ user_id: string; username: string }>>`
+      SELECT DISTINCT ON (user_id) user_id, username FROM transactions
+      WHERE guild_id = ${guildId} AND deleted = false AND username <> ''
+      ORDER BY user_id, timestamp DESC
+    `,
     prisma.userMapping.findMany({ where: { guildId }, select: { discordId: true, gameName: true } }),
   ]);
 
-  const byId = new Map<string, string>();
-  for (const t of transactions) {
-    if (!byId.has(t.userId)) byId.set(t.userId, t.username);
-  }
+  const latestUsername = new Map<string, string>(transactions.map(t => [t.user_id, t.username]));
 
-  const gameNamesById = new Map<string, string[]>();
+  const gameNamesByUser = new Map<string, string[]>();
   for (const m of mappings) {
-    const arr = gameNamesById.get(m.discordId) ?? [];
+    const arr = gameNamesByUser.get(m.discordId) ?? [];
     arr.push(m.gameName);
-    gameNamesById.set(m.discordId, arr);
-  }
-  for (const [discordId, gameNames] of gameNamesById) {
-    if (!byId.has(discordId)) byId.set(discordId, gameNames.join(', '));
+    gameNamesByUser.set(m.discordId, arr);
   }
 
-  return [...byId.entries()]
-    .map(([userId, username]) => ({ userId, username, gameName: gameNamesById.get(userId)?.[0] ?? null }))
+  const allIds = new Set<string>([...latestUsername.keys(), ...gameNamesByUser.keys()]);
+  return [...allIds]
+    .map(userId => ({ userId, username: latestUsername.get(userId) ?? gameNamesByUser.get(userId)!.join(', '), gameName: gameNamesByUser.get(userId)?.[0] ?? null }))
     .sort((a, b) => a.username.localeCompare(b.username));
 }
 
@@ -1063,6 +1320,7 @@ export async function createPendingSale(guildId: string, data: PendingSaleInput)
       discordId: data.discord_id ?? null,
       item: data.item,
       quantite: data.quantite,
+      quantiteRetiree: data.quantite,
       timestamp: new Date(data.timestamp),
     },
   });
@@ -1080,14 +1338,38 @@ export async function updatePendingSaleMessage(guildId: string, id: number, mess
   await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { messageId, channelId } });
 }
 
-/** Change le statut d'une vente en attente ('en_attente', 'declare', 'repose', 'confirme', 'ignore', 'expire'...). */
-export async function updatePendingSaleStatut(guildId: string, id: number, statut: string): Promise<void> {
-  await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { statut } });
+/**
+ * Fait passer une vente en attente à `statut`, SEULEMENT si elle est encore
+ * dans l'un des statuts `from` — une transition concurrente (bouton, dépôt,
+ * expiration) ne peut donc pas écraser celle qui a gagné, ni faire revenir en
+ * `declare` une vente déjà reposée ou confirmée.
+ * @returns `false` si la vente n'était plus dans un statut attendu (rien n'est écrit).
+ */
+export async function transitionPendingSale(guildId: string, id: number, from: string[], statut: string): Promise<boolean> {
+  const { count } = await prisma.pendingSale.updateMany({
+    where: { id, guildId, statut: { in: from }, confirmed: false },
+    data: { statut, ...(statut === 'confirme' ? { confirmed: true } : {}) },
+  });
+  return count === 1;
 }
 
-/** Corrige la quantité d'une vente en attente. */
-export async function updatePendingSaleQuantite(guildId: string, id: number, quantite: number): Promise<void> {
-  await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { quantite } });
+/**
+ * Correction manuelle de la quantité vendue (bouton "Modifier la quantité"),
+ * seulement si la vente est encore `en_attente` et que la quantité ne dépasse
+ * pas le retrait réel AU MOMENT d'écrire — sous le même verrou que
+ * {@link applyRedeposit}, un redépôt simultané ne peut pas s'intercaler.
+ * Ne touche pas `quantiteRetiree`, une correction n'étant pas un mouvement de coffre.
+ * @returns `false` si la vente n'était plus en attente ou que le retrait réel est désormais inférieur.
+ */
+export async function updatePendingSaleQuantite(guildId: string, id: number, quantite: number): Promise<boolean> {
+  return prisma.$transaction(async tx => {
+    await lockKey(tx, `vente:${guildId}:${id}`);
+    const { count } = await tx.pendingSale.updateMany({
+      where: { id, guildId, statut: 'en_attente', confirmed: false, quantiteRetiree: { gte: quantite } },
+      data: { quantite },
+    });
+    return count === 1;
+  });
 }
 
 /** Associe (rétroactivement) un compte Discord à une vente en attente. */
@@ -1095,9 +1377,43 @@ export async function updatePendingSaleDiscordId(guildId: string, id: number, di
   await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { discordId } });
 }
 
-/** Marque une vente en attente comme confirmée. */
-export async function confirmPendingSale(guildId: string, id: number): Promise<void> {
-  await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { confirmed: true, statut: 'confirme' } });
+/**
+ * Confirme une vente DÉCLARÉE et crédite le quota/la paie du joueur
+ * (catégorie `vente`) en une seule transaction DB. La confirmation est
+ * conditionnelle au statut `declare` et le crédit ne se fait que si elle a
+ * réellement modifié la ligne : deux dépôts d'argent traités en même temps ne
+ * créditent donc la vente qu'une fois, et un arrêt entre les deux écritures
+ * ne laisse pas une vente "confirmée" sans crédit. La quantité créditée est
+ * celle lue dans la transaction, sous le verrou de la vente. Sans
+ * `discordId` sur la vente, elle est confirmée sans crédit (rien à
+ * attribuer — une alerte est postée par l'appelant). `timestamp` : heure du
+ * dépôt d'argent, pas du traitement — une vente rattrapée après un arrêt
+ * compte dans la semaine où elle a eu lieu.
+ * @returns La quantité confirmée, ou `null` si la vente n'était plus déclarée.
+ */
+export async function confirmDeclaredSale(guildId: string, saleId: number, timestamp: number): Promise<number | null> {
+  return prisma.$transaction(async tx => {
+    await lockStatsShared(tx, guildId);
+    await lockKey(tx, `vente:${guildId}:${saleId}`);
+    const sale = await tx.pendingSale.findFirst({ where: { id: saleId, guildId } });
+    if (!sale) return null;
+    const { count } = await tx.pendingSale.updateMany({
+      where: { id: saleId, guildId, statut: 'declare', confirmed: false },
+      data: { confirmed: true, statut: 'confirme' },
+    });
+    if (count !== 1) return null;
+    if (!sale.discordId) return sale.quantite;
+
+    await tx.transaction.create({
+      data: { guildId, userId: sale.discordId, username: sale.joueur, action: 'vente', quantite: sale.quantite, type: sale.item, partenaires: '[]', timestamp: new Date(timestamp) },
+    });
+    await tx.stat.upsert({
+      where: { guildId_userId_action: { guildId, userId: sale.discordId, action: 'vente' } },
+      create: { guildId, userId: sale.discordId, action: 'vente', count: sale.quantite },
+      update: { count: { increment: sale.quantite } },
+    });
+    return sale.quantite;
+  });
 }
 
 /** Vente en attente accumulable (même joueur/item, pas encore confirmée) depuis `since`, la plus récente. */
@@ -1109,23 +1425,12 @@ export async function getPendingSaleForAccumulation(guildId: string, joueur: str
   return row ? mapPendingSale(row) : undefined;
 }
 
-/** Cumule une nouvelle quantité sur une vente en attente existante et rafraîchit son timestamp. */
-export async function accumulatePendingSale(guildId: string, id: number, quantite: number, timestamp: number): Promise<void> {
-  await prisma.pendingSale.updateMany({ where: { id, guildId }, data: { quantite, timestamp: new Date(timestamp) } });
-}
-
 /**
- * Vente la plus récente (statut 'en_attente' OU 'declare', même joueur/item, pas
- * encore confirmée) depuis `since` — utilisée pour rattacher un redépôt de
- * drogue à la bonne vente même après que le joueur a déjà cliqué "Déclarer"
- * (ex : déclaré par erreur, puis redépose la drogue au lieu de payer). Sans
- * ça, la correction n'intervient qu'au bout de {@link WINDOW_MS} via
- * `getExpiredPendingSales` (qui expire aussi 'declare') plutôt qu'aussitôt le
- * redépôt détecté — incident réel du 12/09 sur l'ancien bot (deux retraits de
- * 35 déclarés, un seul réellement vendu, l'autre redéposé dans la minute).
- * Distincte de `getPendingSaleForAccumulation` (limitée à 'en_attente', pour
- * cumuler plusieurs retraits successifs) : celle-ci couvre aussi 'declare'
- * pour permettre la réduction/l'annulation d'une vente déjà déclarée.
+ * Vente active (statut `en_attente` OU `declare`, pas encore confirmée) la
+ * plus récente pour ce joueur/item depuis `since` — utilisée par un redépôt
+ * pour retrouver la vente à réduire/annuler, y compris après que le joueur a
+ * déjà cliqué "Déclarer" (contrairement à {@link getPendingSaleForAccumulation},
+ * qui reste `en_attente` seule pour l'accumulation d'un nouveau retrait).
  */
 export async function getPendingSaleForReduction(guildId: string, joueur: string, item: string, since: number) {
   const row = await prisma.pendingSale.findFirst({
@@ -1135,13 +1440,80 @@ export async function getPendingSaleForReduction(guildId: string, joueur: string
   return row ? mapPendingSale(row) : undefined;
 }
 
-/** Ventes déclarées d'un joueur en attente de confirmation (dépôt d'argent) depuis `since`. */
-export async function getPendingSalesForConfirmation(guildId: string, joueur: string, since: number) {
+/**
+ * Cumule un nouveau retrait sur une vente encore `en_attente` : `quantite` et
+ * `quantiteRetiree` sont incrémentées (jamais écrites en valeur absolue
+ * depuis une lecture antérieure), la fenêtre de la vente est rafraîchie.
+ * @returns La nouvelle quantité, ou `null` si la vente n'était plus en attente.
+ */
+export async function accumulatePendingSale(guildId: string, id: number, retrait: number, timestamp: number): Promise<number | null> {
+  return prisma.$transaction(async tx => {
+    const { count } = await tx.pendingSale.updateMany({
+      where: { id, guildId, statut: 'en_attente', confirmed: false },
+      data: { quantite: { increment: retrait }, quantiteRetiree: { increment: retrait }, timestamp: new Date(timestamp) },
+    });
+    if (count !== 1) return null;
+    const row = await tx.pendingSale.findFirst({ where: { id, guildId } });
+    return row ? row.quantite : null;
+  });
+}
+
+/**
+ * Applique un redépôt de drogue à une vente active (`en_attente` ou
+ * `declare`). `quantiteRetiree` suit le coffre réel ; la quantité vendue ne
+ * peut pas dépasser ce qui reste réellement dehors, mais une correction
+ * manuelle à la baisse déjà faite est conservée (`min`) — sans quoi un
+ * retrait de 100 corrigé à 60 puis 40 redéposés donnerait 20 au lieu de 60.
+ * Plus rien dehors : la vente est annulée (`ignore`).
+ * @returns Le nouvel état, ou `null` si la vente n'était plus active.
+ */
+export async function applyRedeposit(guildId: string, id: number, redepot: number): Promise<{ quantite: number; annulee: boolean; statut: string } | null> {
+  return prisma.$transaction(async tx => {
+    await lockKey(tx, `vente:${guildId}:${id}`);
+    const sale = await tx.pendingSale.findFirst({ where: { id, guildId, statut: { in: ['en_attente', 'declare'] }, confirmed: false } });
+    if (!sale) return null;
+    const dehors = sale.quantiteRetiree - redepot;
+    if (dehors <= 0) {
+      await tx.pendingSale.updateMany({ where: { id, guildId }, data: { statut: 'ignore', quantiteRetiree: 0 } });
+      return { quantite: 0, annulee: true, statut: sale.statut };
+    }
+    const quantite = Math.min(sale.quantite, dehors);
+    await tx.pendingSale.updateMany({
+      where: { id, guildId },
+      data: { quantite, quantiteRetiree: dehors, ...(sale.statut === 'en_attente' ? { timestamp: new Date() } : {}) },
+    });
+    return { quantite, annulee: false, statut: sale.statut };
+  });
+}
+
+/** Ventes déclarées d'un joueur en attente de confirmation (dépôt d'argent) dans `[since, until]`. */
+export async function getPendingSalesForConfirmation(guildId: string, joueur: string, since: number, until: number) {
   const rows = await prisma.pendingSale.findMany({
-    where: { guildId, joueur, statut: 'declare', confirmed: false, timestamp: { gte: new Date(since) } },
+    where: { guildId, joueur, statut: 'declare', confirmed: false, timestamp: { gte: new Date(since), lte: new Date(until) } },
     orderBy: { timestamp: 'asc' },
   });
   return rows.map(mapPendingSale);
+}
+
+/**
+ * Applique un redépôt à une vente REPOSÉE : elle n'est vérifiée (confirmée)
+ * que lorsque tout ce qui était sorti est revenu. Un redépôt partiel réduit
+ * `quantiteRetiree` et la laisse en attente de la suite — sans quoi redéposer
+ * 1 unité sur 100 validerait la vente et ferait disparaître les 99 autres du suivi.
+ * @returns `null` si la vente n'était plus reposée, sinon ce qui reste dehors (0 = vérifiée).
+ */
+export async function applyReposeRedeposit(guildId: string, id: number, redepot: number): Promise<{ reste: number } | null> {
+  return prisma.$transaction(async tx => {
+    await lockKey(tx, `vente:${guildId}:${id}`);
+    const sale = await tx.pendingSale.findFirst({ where: { id, guildId, statut: 'repose', confirmed: false } });
+    if (!sale) return null;
+    const reste = Math.max(0, sale.quantiteRetiree - redepot);
+    await tx.pendingSale.updateMany({
+      where: { id, guildId },
+      data: reste === 0 ? { quantiteRetiree: 0, statut: 'confirme', confirmed: true } : { quantiteRetiree: reste },
+    });
+    return { reste };
+  });
 }
 
 /** Vente reposée d'un joueur/item en attente de vérification depuis `since`, la plus récente. */
@@ -1162,7 +1534,7 @@ export async function getPendingSaleRepose(guildId: string, joueur: string, item
  */
 export async function getExpiredPendingSales(guildId: string, before: number) {
   const rows = await prisma.pendingSale.findMany({
-    where: { guildId, statut: { in: ['en_attente', 'declare', 'repose'] }, timestamp: { lt: new Date(before) }, messageId: { not: null } },
+    where: { guildId, statut: { in: ['en_attente', 'declare', 'repose'] }, timestamp: { lt: new Date(before) } },
   });
   return rows.map(mapPendingSale);
 }
@@ -1217,12 +1589,35 @@ export async function getVenteDetailForUser(guildId: string, userId: string, sin
   return rows.map(r => ({ item: r.type ?? 'inconnu', quantite: r._sum.quantite ?? 0 }));
 }
 
+/**
+ * Détail par item vendu (`Transaction.type`) pour TOUS les joueurs sur une
+ * plage — comme `getVenteDetailForUser` mais sans filtrer un joueur précis.
+ * N'a de sens d'être appelée que si au moins un taux de paie par item est
+ * configuré pour la guilde (voir `quotas.getVenteByItemMap`), jamais par
+ * défaut : c'est une lecture `Transaction` supplémentaire que le panneau
+ * Discord live n'a normalement jamais besoin de faire.
+ */
+export async function getVenteDetailAllUsers(guildId: string, sinceTs: number, untilTs: number): Promise<Array<{ userId: string; item: string; quantite: number }>> {
+  const rows = await prisma.transaction.groupBy({
+    by: ['userId', 'type'],
+    where: { guildId, deleted: false, action: 'vente', timestamp: { gte: new Date(sinceTs), lt: new Date(untilTs) } },
+    _sum: { quantite: true },
+  });
+  return rows.map(r => ({ userId: r.userId, item: r.type ?? 'inconnu', quantite: r._sum.quantite ?? 0 }));
+}
+
 // ─── VÉHICULES / FOURRIÈRE ────────────────────────────────────────────────────
 
 /** État courant (responsable) d'un véhicule par plaque, ou `undefined` si jamais vu. */
 export async function getVehiculeEtat(guildId: string, plaque: string) {
   const row = await prisma.vehicule.findUnique({ where: { guildId_plaque: { guildId, plaque } } });
   return row ? { ...row, timestamp: toMs(row.timestamp) } : undefined;
+}
+
+/** Véhicules actuellement sortis et pas encore rangés (`joueur` non `null`, voir `clearVehiculeEtat`) — pour `/api/garages/vehicles`, le plus récemment sorti en premier. */
+export async function getVehiculesSortis(guildId: string) {
+  const rows = await prisma.vehicule.findMany({ where: { guildId, joueur: { not: null } }, orderBy: { timestamp: 'desc' } });
+  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
 }
 
 /** Fixe (upsert) le responsable courant d'un véhicule. */
@@ -1245,16 +1640,6 @@ export async function clearVehiculeEtat(guildId: string, plaque: string): Promis
   await prisma.vehicule.updateMany({ where: { guildId, plaque }, data: { discordId: null, joueur: null } });
 }
 
-/** Véhicules actuellement sortis (responsable connu, pas encore rangés), du plus récent au plus ancien. */
-export async function getVehiculesSortis(guildId: string) {
-  const rows = await prisma.vehicule.findMany({
-    where: { guildId, joueur: { not: null } },
-    orderBy: { timestamp: 'desc' },
-    select: { plaque: true, modele: true, discordId: true, joueur: true, timestamp: true },
-  });
-  return rows.map(r => ({ ...r, timestamp: toMs(r.timestamp) }));
-}
-
 /** Enregistre une mise en fourrière et retourne son ID. */
 export async function addFourriere(guildId: string, data: { discord_id?: string | null; joueur: string; plaque: string; modele?: string | null; timestamp?: number }): Promise<number> {
   const row = await prisma.fourriere.create({
@@ -1270,9 +1655,12 @@ export async function addFourriere(guildId: string, data: { discord_id?: string 
   return row.id;
 }
 
-/** Classement cumulé des mises en fourrière d'une guilde par joueur, décroissant. */
-export async function getFourriereClassement(guildId: string): Promise<Array<{ discord_id: string | null; joueur: string; total: number }>> {
-  const rows = await prisma.fourriere.findMany({ where: { guildId }, select: { discordId: true, joueur: true } });
+/** Classement des mises en fourrière d'une guilde par joueur, décroissant — antérieures à `untilTs` si fourni (archive d'une semaine close). */
+export async function getFourriereClassement(guildId: string, untilTs?: number): Promise<Array<{ discord_id: string | null; joueur: string; total: number }>> {
+  const rows = await prisma.fourriere.findMany({
+    where: { guildId, ...(untilTs !== undefined ? { timestamp: { lt: new Date(untilTs) } } : {}) },
+    select: { discordId: true, joueur: true },
+  });
   const totals = new Map<string, { discord_id: string | null; joueur: string; total: number }>();
   for (const r of rows) {
     // Préfixe `unmapped_` : sans lui, tous les joueurs jamais mappés à un
@@ -1286,9 +1674,9 @@ export async function getFourriereClassement(guildId: string): Promise<Array<{ d
   return [...totals.values()].sort((a, b) => b.total - a.total);
 }
 
-/** Supprime tout l'historique de mises en fourrière d'une guilde (reset hebdomadaire du classement). */
-export async function clearFourrieres(guildId: string): Promise<void> {
-  await prisma.fourriere.deleteMany({ where: { guildId } });
+/** Supprime les mises en fourrière d'une guilde antérieures à `untilTs` (reset hebdomadaire du classement) — celles de la semaine en cours restent. */
+export async function clearFourrieres(guildId: string, untilTs: number): Promise<void> {
+  await prisma.fourriere.deleteMany({ where: { guildId, timestamp: { lt: new Date(untilTs) } } });
 }
 
 // ─── ARMURERIE ────────────────────────────────────────────────────────────────
@@ -1297,11 +1685,6 @@ export async function clearFourrieres(guildId: string): Promise<void> {
 export async function addArme(guildId: string, nom: string, reference: string, type: string): Promise<number> {
   const row = await prisma.arme.create({ data: { guildId, nom, reference, type } });
   return row.id;
-}
-
-/** Change le type (clé de `ARME_TYPES`) d'une arme existante. */
-export async function updateArmeType(guildId: string, id: number, type: string): Promise<void> {
-  await prisma.arme.updateMany({ where: { id, guildId }, data: { type } });
 }
 
 /** Toutes les armes d'une guilde, triées par nom. */
@@ -1317,11 +1700,6 @@ export async function getArme(guildId: string, id: number) {
 /** Change le statut ('en_stock' | 'pretee' | 'perdue') d'une arme, et à qui elle est prêtée le cas échéant. */
 export async function updateArmeStatut(guildId: string, id: number, statut: string, preteeA: string | null = null): Promise<void> {
   await prisma.arme.updateMany({ where: { id, guildId }, data: { statut, preteeA } });
-}
-
-/** Supprime définitivement une arme. */
-export async function deleteArme(guildId: string, id: number): Promise<void> {
-  await prisma.arme.deleteMany({ where: { id, guildId } });
 }
 
 /** Toutes les armes au statut 'perdue' d'une guilde, triées par nom. */

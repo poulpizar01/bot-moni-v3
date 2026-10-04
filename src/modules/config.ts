@@ -24,7 +24,9 @@
  * Chaque sous-commande `add`/`set` fait un upsert complet de la ligne
  * concernée : les champs optionnels omis reprennent leur valeur par défaut,
  * pas leur ancienne valeur. Ré-exécuter la commande avec des options
- * différentes remplace donc entièrement la configuration de cette entrée.
+ * différentes remplace donc entièrement la configuration de cette entrée —
+ * sauf, pour `/config item add`, le groupe de stock et l'ordre d'affichage,
+ * qu'elle n'expose pas et que `db.upsertItem` conserve.
  */
 import {
   SlashCommandBuilder,
@@ -32,12 +34,12 @@ import {
   MessageFlags,
   ChannelType,
   EmbedBuilder,
-  ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  type Client,
+  ActionRowBuilder,
   type ChatInputCommandInteraction,
   type AutocompleteInteraction,
+  type Client,
   type Guild,
 } from 'discord.js';
 import * as db from '../db';
@@ -50,13 +52,37 @@ import * as armurerie from './armurerie';
 import * as alertes from './alertes';
 import { CONFIRME_VENTE_ITEM } from './ventes';
 import { seedDefaultItems } from '../default-items';
+import { upsertPanel } from '../permanent-message';
 
 const ROLE_TARGETS = [
   { name: 'Rôle admin (commandes sensibles)', value: 'admin' },
+  { name: 'Rôle membre (back-office web)', value: 'membre' },
   { name: 'Rôle accès taxes (back-office web)', value: 'taxes' },
 ];
 
-/** Déclare la commande `/config` et tous ses sous-groupes (channel, role, item, quota, salaire, palier, classement, type-groupe, category, site-externe). `guildId` : les choix de `labo_lie` viennent du registre d'activités de CETTE guilde (déjà chargé en cache à ce stade — voir `bootstrapGuild` dans index.ts, qui appelle `configStore.reload()` avant `deployCommandsForGuild`). */
+/**
+ * Catégories de quota du registre d'activités. Proposées en choix fermés à la
+ * création (une faute de frappe créerait une catégorie que rien ne
+ * remplit) ; les sous-commandes `remove` restent en saisie libre, pour
+ * pouvoir retirer une valeur ancienne qui n'en ferait plus partie.
+ */
+function quotaTypeChoices(guildId: string): Array<{ name: string; value: string }> {
+  const types = new Set(Object.values(configStore.get(guildId).ACTIVITY_TYPES).map(cfg => cfg.quotaType).filter((qt): qt is string => !!qt));
+  return [...types].sort().map(qt => ({ name: qt, value: qt }));
+}
+
+/**
+ * Nom exact d'un item suivi, retrouvé sans tenir compte de la casse — `null`
+ * s'il n'est pas suivi. Un taux ou un palier par item enregistré sous un nom
+ * mal orthographié ne correspondrait jamais à aucune vente, sans aucune
+ * erreur (piège n°1 appliqué à la paie).
+ */
+function canonicalItem(guildId: string, saisie: string): string | null {
+  const lower = saisie.trim().toLowerCase();
+  return configStore.get(guildId).ALLOWED_ITEMS.find(name => name.toLowerCase() === lower) ?? null;
+}
+
+/** Déclare la commande `/config` et tous ses sous-groupes (channel, role, item, quota, salaire, palier, classement, category, type-groupe, site-externe). `guildId` : les choix de `labo_lie` viennent du registre d'activités de CETTE guilde (déjà chargé en cache à ce stade — voir `prepareGuild` dans index.ts, qui appelle `configStore.reload()` avant `deployCommandsForGuild`). */
 export function getCommands(guildId: string) {
   const cmd = new SlashCommandBuilder()
     .setName('config')
@@ -88,7 +114,8 @@ export function getCommands(guildId: string) {
       .setName('add-log-coffre-admin')
       .setDescription('Ajoute un salon à la liste des logs de coffre admin surveillés (badge 🛡️)')
       .addChannelOption(o => o.setName('salon').setDescription('Salon Discord').setRequired(true)
-        .addChannelTypes(ChannelType.GuildText)))
+        .addChannelTypes(ChannelType.GuildText))
+      .addStringOption(o => o.setName('nom').setDescription('Nom pour distinguer ce coffre des autres — optionnel').setRequired(false)))
     .addSubcommand(s => s
       .setName('remove-log-coffre-admin')
       .setDescription('Retire un salon de la liste des logs de coffre admin surveillés')
@@ -116,11 +143,11 @@ export function getCommands(guildId: string) {
       .addStringOption(o => o.setName('nom').setDescription("Nom exact tel qu'écrit dans les logs FiveM").setRequired(true))
       .addBooleanOption(o => o.setName('vente_pnj').setDescription('Déclarable en vente aux PNJ (marché noir) — pas une vente entre joueurs (défaut : non)').setRequired(false))
       .addBooleanOption(o => o.setName('visible_stock').setDescription('Afficher dans le message Stock Général (défaut : oui — le stock reste suivi même à non)').setRequired(false))
-      .addStringOption(o => o.setName('labo_associe').setDescription('Cet item est associé à ce labo (voir role_labo pour le sens du lien) — optionnel').setRequired(false)
+      .addStringOption(o => o.setName('labo_associe').setDescription('Cet item est lié à ce labo (voir role_labo pour le sens du lien) — optionnel').setRequired(false)
         .addChoices(...Object.entries(configStore.get(guildId).ACTIVITY_TYPES).filter(([, cfg]) => cfg.labo).map(([key, cfg]) => ({ name: cfg.label, value: key }))))
-      .addStringOption(o => o.setName('role_labo').setDescription('Sens du lien : drogue produite (exclut vente PNJ) ou matériau consommé (défaut : produit)').setRequired(false)
+      .addStringOption(o => o.setName('role_labo').setDescription('Sens du lien : drogue produite (exclut vente PNJ) ou matériau consommé (défaut produit)').setRequired(false)
         .addChoices({ name: 'Produit (la drogue que ce labo fabrique)', value: 'produit' }, { name: 'Matériau (consommé par ce labo)', value: 'materiau' }))
-      .addIntegerOption(o => o.setName('multiplicateur').setDescription("Unités de base par unité de cet item (ex. 24 pour une boîte de munitions — défaut : 1)").setRequired(false).setMinValue(1)))
+      .addIntegerOption(o => o.setName('multiplicateur').setDescription('Unités de base par unité (ex. 24 pour une boîte de munitions — défaut 1)').setRequired(false).setMinValue(1)))
     .addSubcommand(s => s
       .setName('remove')
       .setDescription('Retire un item suivi')
@@ -136,7 +163,7 @@ export function getCommands(guildId: string) {
     .addSubcommand(s => s
       .setName('set')
       .setDescription("Fixe l'objectif hebdomadaire d'une catégorie de quota")
-      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota (actions, vente, recolte, labos)').setRequired(true))
+      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true).addChoices(...quotaTypeChoices(guildId)))
       .addIntegerOption(o => o.setName('valeur').setDescription('Objectif hebdomadaire').setRequired(true).setMinValue(0)))
     .addSubcommand(s => s
       .setName('remove')
@@ -149,52 +176,50 @@ export function getCommands(guildId: string) {
     .setDescription('Taux de paie ($ par unité) par catégorie de quota')
     .addSubcommand(s => s
       .setName('set')
-      .setDescription("Fixe le taux de paie ($ par unité) d'une catégorie de quota, ou d'un item précis pour vente")
-      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota (actions, vente, recolte, labos)').setRequired(true))
+      .setDescription("Fixe le taux de paie ($ par unité) d'une catégorie de quota")
+      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true).addChoices(...quotaTypeChoices(guildId)))
       .addNumberOption(o => o.setName('valeur').setDescription('Montant en $ par unité').setRequired(true).setMinValue(0))
       .addStringOption(o => o.setName('item').setDescription('Optionnel — limite ce taux à cette drogue (quota_type doit être "vente")').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s => s
       .setName('remove')
-      .setDescription("Retire le taux de paie d'une catégorie de quota, ou d'un item précis")
+      .setDescription("Retire le taux de paie d'une catégorie de quota (elle ne génère plus de paie)")
       .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true))
       .addStringOption(o => o.setName('item').setDescription('Optionnel — ne retire que le taux spécifique à cette drogue').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s => s.setName('list').setDescription('Liste les taux de paie configurés')));
 
-  // Groupe séparé de `salaire` et pas imbriqué dedans : Discord n'autorise
-  // pas un groupe de sous-commandes dans un autre (profondeur max 2).
   cmd.addSubcommandGroup(g => g
     .setName('palier')
-    .setDescription('Paie progressive de la vente par tranches de quantité (remplace le taux plat)')
+    .setDescription('Barème de paie progressif pour la vente de drogue (tranches de quantité)')
     .addSubcommand(s => s
       .setName('add')
-      .setDescription('Ajoute une tranche au barème (après la dernière existante)')
-      .addNumberOption(o => o.setName('valeur').setDescription('Montant en $ par unité dans cette tranche').setRequired(true).setMinValue(0))
-      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche — omise = tranche finale, sans limite').setRequired(false).setMinValue(1))
-      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
+      .setDescription("Ajoute une tranche au barème de la vente (ou d'une drogue précise)")
+      .addNumberOption(o => o.setName('valeur').setDescription('Montant en $ par unité pour cette tranche').setRequired(true).setMinValue(0))
+      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche (unités) — omis = tranche finale, sans limite').setRequired(false).setMinValue(1))
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — limite ce barème à cette drogue (sinon barème général "vente")').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s => s
       .setName('remove')
-      .setDescription("Retire une tranche d'un barème")
-      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche à retirer — omise = la tranche finale').setRequired(false).setMinValue(1))
-      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
+      .setDescription('Retire une tranche précise du barème (par sa borne haute)')
+      .addIntegerOption(o => o.setName('jusqua').setDescription('Borne haute de la tranche à retirer — omis = retire la tranche finale (sans limite)').setRequired(false))
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — cible le barème de cette drogue précise').setRequired(false).setAutocomplete(true)))
     .addSubcommand(s => s
       .setName('clear')
-      .setDescription("Retire tout un barème (général, ou d'une drogue précise)")
-      .addStringOption(o => o.setName('item').setDescription('Optionnel — barème propre à cette drogue (sinon barème général)').setRequired(false).setAutocomplete(true)))
-    .addSubcommand(s => s.setName('list').setDescription('Liste les barèmes de paie par palier')));
+      .setDescription("Retire tout le barème (général ou d'une drogue) — retombe sur le taux plat")
+      .addStringOption(o => o.setName('item').setDescription('Optionnel — cible le barème de cette drogue précise').setRequired(false).setAutocomplete(true)))
+    .addSubcommand(s => s.setName('list').setDescription('Liste tous les paliers de paie configurés (vente)')));
 
   cmd.addSubcommandGroup(g => g
     .setName('classement')
-    .setDescription('Points de classement par catégorie de quota (granularité par activité pour "actions")')
+    .setDescription('Points de classement (indépendants de la paie) par catégorie de quota')
     .addSubcommand(s => s
       .setName('set')
-      .setDescription('Fixe le nombre de points d\'une catégorie de quota, ou d\'une activité précise pour "actions"')
-      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota (actions, vente, recolte, labos)').setRequired(true))
-      .addIntegerOption(o => o.setName('valeur').setDescription('Points par unité/déclaration').setRequired(true).setMinValue(0))
+      .setDescription("Fixe les points de classement d'une catégorie de quota")
+      .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true).addChoices(...quotaTypeChoices(guildId)))
+      .addIntegerOption(o => o.setName('valeur').setDescription('Points par unité').setRequired(true).setMinValue(0))
       .addStringOption(o => o.setName('activite').setDescription('Optionnel — limite ces points à cette activité (quota_type doit être "actions")').setRequired(false)
         .addChoices(...Object.entries(configStore.get(guildId).ACTIVITY_TYPES).filter(([, cfg]) => cfg.quotaType === 'actions').map(([key, cfg]) => ({ name: cfg.label, value: key })))))
     .addSubcommand(s => s
       .setName('remove')
-      .setDescription('Retire les points d\'une catégorie de quota, ou d\'une activité précise')
+      .setDescription("Retire les points de classement d'une catégorie de quota")
       .addStringOption(o => o.setName('quota_type').setDescription('Catégorie de quota').setRequired(true))
       .addStringOption(o => o.setName('activite').setDescription('Optionnel — ne retire que les points spécifiques à cette activité').setRequired(false)
         .addChoices(...Object.entries(configStore.get(guildId).ACTIVITY_TYPES).filter(([, cfg]) => cfg.quotaType === 'actions').map(([key, cfg]) => ({ name: cfg.label, value: key })))))
@@ -243,65 +268,6 @@ function isNativeAdmin(interaction: ChatInputCommandInteraction): boolean {
     interaction.member.permissions.has(PermissionFlagsBits.Administrator));
 }
 
-/**
- * URL du manuel complet (dossier des opérations, généré en HTML) — un lien
- * en dur plutôt qu'un `Setting` : ce n'est pas une donnée qui varie d'une
- * guilde à l'autre comme le reste de `/config`, c'est LA documentation de ce
- * déploiement. À mettre à jour manuellement si le manuel est republié.
- */
-const MANUEL_URL = 'https://claude.ai/code/artifact/775af8d1-811e-4de0-a32f-9cb16b5859e2';
-
-/**
- * Poste (ou met à jour) le message d'accueil du salon `documentation` : un
- * résumé de ce que fait le bot, avec un bouton vers {@link MANUEL_URL}.
- * Même pattern que les autres panneaux (édite le message stocké si présent,
- * en poste un nouveau sinon) — sauf que son contenu ne dépend d'aucune
- * donnée de guilde, pas besoin de le rafraîchir sur un événement.
- */
-export async function initDocumentationMessage(client: Client, guildId: string): Promise<void> {
-  const channelId = configStore.get(guildId).CHANNELS.documentation;
-  if (!channelId) return;
-  try {
-    const channel = await client.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isSendable()) return;
-
-    const embed = new EmbedBuilder()
-      .setTitle('📚 Bienvenue dans le dossier de l\'organisation')
-      .setColor(0xcf9f2e)
-      .setDescription(
-        "Ce salon regroupe tout ce qu'il faut savoir sur le bot : comment déclarer une activité, vendre, " +
-        "gérer l'armurerie, poser une taxe, et comment un admin reconfigure tout ça depuis Discord.\n\n" +
-        '**Au programme du manuel complet :**\n' +
-        "🏴 Types d'organisation\n" +
-        '📦 Stock général\n' +
-        '🎮 Activités & quotas\n' +
-        '💉 Ventes de drogue\n' +
-        '🔫 Armurerie\n' +
-        '🛃 Taxes & rackets\n' +
-        '🚗 Garages & fourrière\n' +
-        '🌿 Labos\n' +
-        '🕵️ Administration',
-      )
-      .setFooter({ text: 'Mis à jour à chaque évolution du bot' })
-      .setTimestamp();
-
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setLabel('📖 Ouvrir le manuel complet').setStyle(ButtonStyle.Link).setURL(MANUEL_URL),
-    );
-
-    const storedId = await db.getSetting(guildId, 'documentation_message_id');
-    if (storedId) {
-      const msg = await channel.messages.fetch(storedId).catch(() => null);
-      if (msg) { await msg.edit({ embeds: [embed], components: [row] }); return; }
-    }
-
-    const newMsg = await channel.send({ embeds: [embed], components: [row] });
-    await db.setSetting(guildId, 'documentation_message_id', newMsg.id);
-  } catch (err) {
-    console.error(`[config] initDocumentationMessage(${guildId}):`, (err as Error).message);
-  }
-}
-
 /** Point d'entrée de `/config` : vérifie la permission `Administrator`, puis route vers le handler du sous-groupe concerné. */
 export async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   const guildId = interaction.guildId!;
@@ -314,7 +280,7 @@ export async function handleCommand(interaction: ChatInputCommandInteraction): P
   // quelqu'un touche /config, quel que soit le moment (y compris un bot déjà
   // en cours d'exécution depuis un moment) — no-op si déjà fait, voir
   // seedDefaultItems.
-  await seedDefaultItems(guildId);
+  if (await seedDefaultItems(guildId)) await stocks.updateStockMessage(interaction.client, guildId);
 
   const group = interaction.options.getSubcommandGroup();
   const sub = interaction.options.getSubcommand();
@@ -348,22 +314,24 @@ async function handleChannel(interaction: ChatInputCommandInteraction, guildId: 
     if (role === 'armurerie') await armurerie.updatePermanentMessage(interaction.client, guildId);
     if (role === 'quotas') await quotas.updatePermanentMessage(interaction.client, guildId);
     if (role === 'taxes') await taxes.initPermanentMessage(interaction.client, guildId);
-    // Idem pour le préfixe 🟢 d'un salon de labo : sans ça, il resterait sans
-    // préfixe (ni rouge ni vert) jusqu'à la première déclaration de ce labo.
-    // No-op silencieux si ce labo n'est pas actif pour le tier courant.
-    if (role.startsWith('labo_')) await alertes.setLaboStatut(interaction.client, guildId, role, true);
     if (role === 'documentation') await initDocumentationMessage(interaction.client, guildId);
+    // Idem pour le préfixe du salon d'un labo actif pour le tier courant : sans
+    // ça, il resterait sans préfixe jusqu'à la première déclaration. Un labo
+    // en pleine production garde son 🔴 et son retour au vert programmé.
+    if (role.startsWith('labo_') && configStore.get(guildId).ACTIVITY_TYPES[role]?.enabled) {
+      await alertes.refreshLaboStatut(interaction.client, guildId, role);
+    }
     await interaction.reply({ content: `✅ Salon **${role}** → <#${salon.id}>`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'add-log-coffre' || sub === 'remove-log-coffre' || sub === 'add-log-coffre-admin' || sub === 'remove-log-coffre-admin') {
     const role = sub.endsWith('-admin') ? 'logs_coffres_admin' : 'logs_coffres';
-    // Un salon ne peut être QUE l'un ou l'autre, jamais les deux à la fois —
-    // sinon ses mouvements sont rejoués deux fois par catchUpMissedMessages/
-    // fullResync (voir coffreLogChannelIds dans stocks.ts).
     const otherRole = role === 'logs_coffres_admin' ? 'logs_coffres' : 'logs_coffres_admin';
     const salon = interaction.options.getChannel('salon', true);
     const nom = interaction.options.getString('nom') ?? undefined;
+    // Un salon ne peut être que l'un OU l'autre, jamais les deux — sinon
+    // coffreLogChannelIds() le traiterait deux fois (stocks.ts) et doublerait
+    // ses mouvements à chaque rattrapage/resync.
     if (sub.startsWith('add-') && configStore.get(guildId).CHANNELS[otherRole].includes(salon.id)) {
       const otherLabel = otherRole === 'logs_coffres_admin' ? 'coffre admin' : 'coffre';
       const otherRemoveSub = otherRole === 'logs_coffres_admin' ? 'remove-log-coffre-admin' : 'remove-log-coffre';
@@ -376,16 +344,18 @@ async function handleChannel(interaction: ChatInputCommandInteraction, guildId: 
     await configStore.mutate(guildId, () => sub.startsWith('add-')
       ? db.addChannelToRole(guildId, role, salon.id, nom)
       : db.removeChannelFromRole(guildId, role, salon.id));
+    // Le stock d'un coffre retiré ne compte plus dans le total (voir db.getStock).
+    await stocks.updateStockMessage(interaction.client, guildId);
     const total = configStore.get(guildId).CHANNELS[role].length;
-    const label = role === 'logs_coffres_admin' ? 'coffre admin' : 'coffre';
-    const nomSuffix = nom ? ` — nommé **${nom}**` : '';
-    await interaction.reply({ content: `✅ Logs de ${label} : ${total} salon(s) surveillé(s)${sub.startsWith('add-') ? nomSuffix : ''}.`, flags: MessageFlags.Ephemeral });
+    const roleLabel = role === 'logs_coffres_admin' ? 'coffre admin' : 'coffre';
+    const nomSuffix = sub.startsWith('add-') && nom ? ` — nommé **${nom}**` : '';
+    await interaction.reply({ content: `✅ Logs de ${roleLabel} : ${total} salon(s) surveillé(s)${nomSuffix}.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'list') {
     const c = configStore.get(guildId).CHANNELS;
     const lines = configStore.CHANNEL_ROLES.map(role => `**${role}** : ${c[role] ? `<#${c[role]}>` : '_non configuré_'}`);
-    const formatCoffres = async (role: string) => {
+    const formatCoffres = async (role: 'logs_coffres' | 'logs_coffres_admin') => {
       const salons = await db.getChannelsWithLabel(guildId, role);
       if (!salons.length) return '_aucun_';
       return salons.map(s => `<#${s.channelId}>${s.label ? ` (${s.label})` : ''}`).join(', ');
@@ -410,7 +380,8 @@ async function handleRole(interaction: ChatInputCommandInteraction, guildId: str
     const c = configStore.get(guildId);
     const lines = [
       `**admin** : ${c.ADMIN_ROLE_ID ? `<@&${c.ADMIN_ROLE_ID}>` : '_non configuré (permissions Discord natives utilisées)_'}`,
-      `**taxes** : ${c.TAXES_ROLE_ID ? `<@&${c.TAXES_ROLE_ID}>` : '_non configuré_'}`,
+      `**membre** : ${c.MEMBER_ROLE_ID ? `<@&${c.MEMBER_ROLE_ID}>` : '_non configuré — ⚠️ seuls les admins ont accès au back-office web_'}`,
+      `**taxes** : ${c.TAXES_ROLE_ID ? `<@&${c.TAXES_ROLE_ID}>` : '_non configuré (admins uniquement)_'}`,
     ];
     const embed = new EmbedBuilder().setTitle('⚙️ Rôles configurés').setDescription(lines.join('\n')).setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -420,24 +391,28 @@ async function handleRole(interaction: ChatInputCommandInteraction, guildId: str
 /** `/config item add|remove|list`. */
 async function handleItem(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
   if (sub === 'add') {
-    const nom = interaction.options.getString('nom', true);
+    const nom = interaction.options.getString('nom', true).trim();
+    // Le stock étant indexé sans tenir compte de la casse, deux items qui ne
+    // diffèrent que par elle partageraient la même quantité et seraient
+    // comptés deux fois dans les totaux.
+    const homonyme = Object.keys(configStore.get(guildId).ITEMS_BY_NAME).find(name => name !== nom && name.toLowerCase() === nom.toLowerCase());
+    if (homonyme) {
+      await interaction.reply({ content: `❌ L'item **${homonyme}** existe déjà avec une autre casse. Garde l'orthographe exacte des logs de coffre : retire l'un des deux (\`/config item remove\`) avant d'enregistrer l'autre.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const ventePnj = interaction.options.getBoolean('vente_pnj') ?? false;
     const stockGeneral = interaction.options.getBoolean('visible_stock') ?? true;
     const laboLie = interaction.options.getString('labo_associe');
-    const laboLieRole = interaction.options.getString('role_labo') as 'produit' | 'materiau' | null;
+    const roleLabo = interaction.options.getString('role_labo') as 'produit' | 'materiau' | null;
     const multiplicateur = interaction.options.getInteger('multiplicateur') ?? 1;
-    // `stock_group` n'est réglable que par `src/default-items.ts` (cas trop
-    // étroit — uniquement les munitions) : absent ici pour qu'upsertItem
-    // préserve un éventuel groupe déjà posé sur cet item plutôt que de
-    // l'écraser (voir docstring d'upsertItem).
-    await configStore.mutate(guildId, () => db.upsertItem(guildId, { name: nom, vente: ventePnj, visible_stock: stockGeneral, labo_lie: laboLie, labo_lie_role: laboLieRole, stock_multiplier: multiplicateur }));
-    // Sans ça, un item tout juste ajouté/masqué/lié n'apparaîtrait
+    await configStore.mutate(guildId, () => db.upsertItem(guildId, { name: nom, vente: ventePnj, visible_stock: stockGeneral, labo_lie: laboLie, labo_lie_role: roleLabo, stock_multiplier: multiplicateur }));
+    // Sans ça, un item tout juste ajouté/masqué/regroupé n'apparaîtrait
     // correctement dans le Stock Général (et l'armurerie, si lié aux
     // munitions) qu'au prochain mouvement de coffre — pas immédiat.
     await stocks.updateStockMessage(interaction.client, guildId);
     const laboLabel = laboLie ? configStore.get(guildId).ACTIVITY_TYPES[laboLie]?.label : null;
-    const laboLieDesc = laboLabel ? ` — ${laboLieRole === 'materiau' ? 'matériau de' : 'produit par'} ${laboLabel}` : '';
-    await interaction.reply({ content: `✅ Item **${nom}** enregistré${ventePnj ? ' — vente PNJ' : ''}${!stockGeneral ? ' — masqué du Stock Général (stock toujours suivi)' : ''}${laboLieDesc}${multiplicateur !== 1 ? ` — ×${multiplicateur} dans son groupe` : ''}.`, flags: MessageFlags.Ephemeral });
+    const roleLaboSuffix = laboLie ? (roleLabo === 'materiau' ? ' (matériau)' : ' (produit)') : '';
+    await interaction.reply({ content: `✅ Item **${nom}** enregistré${ventePnj ? ' — vente PNJ' : ''}${!stockGeneral ? ' — masqué du Stock Général (stock toujours suivi)' : ''}${laboLabel ? ` — lié à ${laboLabel}${roleLaboSuffix}` : ''}${multiplicateur !== 1 ? ` — ×${multiplicateur} dans son groupe` : ''}.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'remove') {
@@ -458,14 +433,14 @@ async function handleItem(interaction: ChatInputCommandInteraction, guildId: str
     const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
     const lines = items.slice(0, 60).map(i => {
       const laboLabel = i.laboLie ? activityTypes[i.laboLie]?.label ?? i.laboLie : null;
-      const laboIcon = i.laboLieRole === 'materiau' ? '🧱' : '🧪';
+      const laboEmoji = i.laboLieRole === 'materiau' ? '🧱' : '🧪';
       const confirmeVente = i.name.toLowerCase() === CONFIRME_VENTE_ITEM.toLowerCase();
-      return `**${i.name}**${i.stockGroup ? ` _(${i.stockGroup})_` : ''}${i.vente ? ' 💰' : ''}${confirmeVente ? ' 🪙' : ''}${!i.visibleStock ? ' 🙈' : ''}${laboLabel ? ` ${laboIcon}${laboLabel}` : ''}${i.stockMultiplier !== 1 ? ` ×${i.stockMultiplier}` : ''}`;
+      return `**${i.name}**${i.stockGroup ? ` _(${i.stockGroup})_` : ''}${i.vente ? ' 💰' : ''}${confirmeVente ? ' 🪙' : ''}${!i.visibleStock ? ' 🙈' : ''}${laboLabel ? ` ${laboEmoji}${laboLabel}` : ''}${i.stockMultiplier !== 1 ? ` ×${i.stockMultiplier}` : ''}`;
     });
     const embed = new EmbedBuilder()
       .setTitle(`⚙️ Items suivis (${items.length})`)
       .setDescription(lines.join('\n').slice(0, 4000))
-      .setFooter({ text: '💰 vente PNJ · 🪙 confirme les ventes · 🙈 masqué du Stock Général · 🧪 produit par un labo (vente PNJ exclue si actif) · 🧱 matériau consommé par un labo · ×N unités de base par unité dans son groupe' })
+      .setFooter({ text: '💰 vente PNJ · 🪙 confirme les ventes · 🙈 masqué du Stock Général · 🧪 produit d\'un labo (vente PNJ exclue si actif pour le tier) · 🧱 matériau d\'un labo · ×N unités de base par unité dans son groupe' })
       .setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
@@ -477,12 +452,15 @@ async function handleQuota(interaction: ChatInputCommandInteraction, guildId: st
     const quotaType = interaction.options.getString('quota_type', true);
     const valeur = interaction.options.getInteger('valeur', true);
     await configStore.mutate(guildId, () => db.setQuotaTarget(guildId, quotaType, valeur));
+    // Le rappel du dimanche affiche l'objectif vente et qui est en dessous.
+    if (quotaType === 'vente') await quotas.syncQuotaReminder(interaction.client, guildId);
     await interaction.reply({ content: `✅ Objectif **${quotaType}** → ${valeur}/semaine.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'remove') {
     const quotaType = interaction.options.getString('quota_type', true);
     await configStore.mutate(guildId, () => db.deleteQuotaTarget(guildId, quotaType));
+    if (quotaType === 'vente') await quotas.syncQuotaReminder(interaction.client, guildId);
     await interaction.reply({ content: `✅ Objectif **${quotaType}** retiré.`, flags: MessageFlags.Ephemeral });
     return;
   }
@@ -498,23 +476,28 @@ async function handleQuota(interaction: ChatInputCommandInteraction, guildId: st
   }
 }
 
-/** `/config salaire set|remove|list` — l'option `item` (optionnelle, seulement valide avec quota_type "vente") cible un taux spécifique à une drogue plutôt que le taux général de la catégorie (voir `computeSalaire` dans quotas.ts). */
+/** `/config salaire set|remove|list` — `item` optionnel (uniquement avec `quota_type: vente`) fixe/retire un taux spécifique à une drogue, qui remplace le taux général "vente" pour elle seule. */
 async function handleSalaire(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
   if (sub === 'set') {
     const quotaType = interaction.options.getString('quota_type', true);
     const valeur = interaction.options.getNumber('valeur', true);
-    const item = interaction.options.getString('item');
-    if (item) {
-      if (quotaType !== 'vente') {
-        await interaction.reply({ content: '❌ `item` n\'est utilisable qu\'avec `quota_type: vente`.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await configStore.mutate(guildId, () => db.setItemSalaryRate(guildId, item, valeur));
-      await interaction.reply({ content: `✅ Taux de paie **${item}** → ${valeur}$/unité (remplace le taux général "vente" pour cet item).`, flags: MessageFlags.Ephemeral });
+    const saisie = interaction.options.getString('item');
+    if (saisie && quotaType !== 'vente') {
+      await interaction.reply({ content: "❌ `item` n'est utilisable qu'avec `quota_type: vente`.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await configStore.mutate(guildId, () => db.setSalaryRate(guildId, quotaType, valeur));
-    await interaction.reply({ content: `✅ Taux de paie **${quotaType}** → ${valeur}$/unité.`, flags: MessageFlags.Ephemeral });
+    const item = saisie ? canonicalItem(guildId, saisie) : null;
+    if (saisie && !item) {
+      await interaction.reply({ content: `❌ **${saisie}** n'est pas un item suivi (voir \`/config item list\`) : ce taux ne s'appliquerait à aucune vente.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (item) {
+      await configStore.mutate(guildId, () => db.setItemSalaryRate(guildId, item, valeur));
+      await interaction.reply({ content: `✅ Taux de paie **${item}** → ${valeur}$/unité (remplace le taux général "vente" pour cet item).`, flags: MessageFlags.Ephemeral });
+    } else {
+      await configStore.mutate(guildId, () => db.setSalaryRate(guildId, quotaType, valeur));
+      await interaction.reply({ content: `✅ Taux de paie **${quotaType}** → ${valeur}$/unité.`, flags: MessageFlags.Ephemeral });
+    }
     return;
   }
   if (sub === 'remove') {
@@ -522,118 +505,137 @@ async function handleSalaire(interaction: ChatInputCommandInteraction, guildId: 
     const item = interaction.options.getString('item');
     if (item) {
       await configStore.mutate(guildId, () => db.deleteItemSalaryRate(guildId, item));
-      await interaction.reply({ content: `✅ Taux de paie spécifique **${item}** retiré (retombe sur le taux général "vente").`, flags: MessageFlags.Ephemeral });
-      return;
+      await interaction.reply({ content: `✅ Taux de paie spécifique de **${item}** retiré (retombe sur le taux général "vente").`, flags: MessageFlags.Ephemeral });
+    } else {
+      await configStore.mutate(guildId, () => db.deleteSalaryRate(guildId, quotaType));
+      await interaction.reply({ content: `✅ Taux de paie **${quotaType}** retiré.`, flags: MessageFlags.Ephemeral });
     }
-    await configStore.mutate(guildId, () => db.deleteSalaryRate(guildId, quotaType));
-    await interaction.reply({ content: `✅ Taux de paie **${quotaType}** retiré.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'list') {
-    const [rates, itemRates] = await Promise.all([db.getAllSalaryRates(guildId), db.getAllItemSalaryRates(guildId)]);
+    const rates = await db.getAllSalaryRates(guildId);
+    const itemRates = await db.getAllItemSalaryRates(guildId);
     if (rates.length === 0 && itemRates.length === 0) {
       await interaction.reply({ content: 'Aucun taux de paie configuré.', flags: MessageFlags.Ephemeral });
       return;
     }
-    const lines = rates.map(r => `**${r.quotaType}** : ${r.amount}$/unité`);
-    if (itemRates.length) {
-      lines.push('', '__Taux par drogue (override de "vente")__');
-      lines.push(...itemRates.map(r => `**${r.item}** : ${r.amount}$/unité`));
-    }
+    const lines = [
+      ...rates.map(r => `**${r.quotaType}** : ${r.amount}$/unité`),
+      ...itemRates.map(r => `**${r.item}** (vente) : ${r.amount}$/unité`),
+    ];
     const embed = new EmbedBuilder().setTitle('⚙️ Taux de paie').setDescription(lines.join('\n')).setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 }
 
-/** Une tranche lisible : « 0 → 100 : 10$/unité », « 300+ : 20$/unité ». */
-function formatTiers(tiers: Array<{ upTo: number | null; amount: number }>): string[] {
+/** Formatte les tranches d'UN barème (déjà triées par `upTo` croissant, la dernière ayant `upTo: null`) en lignes "borne basse → borne haute : montant$/unité", la borne basse de chaque tranche étant la borne haute de la précédente. */
+function formatTierLines(tiers: Array<{ upTo: number | null; amount: number }>): string[] {
   let prev = 0;
   const lines = tiers.map(t => {
     const line = t.upTo == null ? `${prev}+ : ${t.amount}$/unité` : `${prev} → ${t.upTo} : ${t.amount}$/unité`;
-    if (t.upTo != null) prev = t.upTo;
+    prev = t.upTo ?? prev;
     return line;
   });
-  // computeTierPay ne paie rien au-delà de la dernière borne finie.
-  if (tiers.length && tiers[tiers.length - 1].upTo != null) lines.push(`⚠️ Pas de tranche finale : au-delà de ${prev}, 0$/unité.`);
+  // Sans tranche finale, `quotas.computeTierPay` prolonge la dernière au-delà de sa borne.
+  const last = tiers[tiers.length - 1];
+  if (last && last.upTo != null) lines.push(`${last.upTo}+ : ${last.amount}$/unité _(pas de tranche finale : la dernière s'applique)_`);
   return lines;
 }
 
 /**
  * `/config palier add|remove|clear|list` — barème de paie progressif pour la
- * vente (voir `computeTierPay` dans quotas.ts). Les tranches s'ajoutent dans
- * l'ordre : chaque borne doit dépasser la précédente, et une tranche finale
- * (sans `jusqua`) ferme le barème — vérifié ici plutôt qu'en base.
+ * vente de drogue (`item` optionnel cible une drogue précise, sinon le
+ * barème général "vente"). Coexiste avec `/config salaire ... item:` (taux
+ * plat) : un item avec son propre barème prime sur son propre taux plat, qui
+ * prime sur le barème général, qui prime sur le taux plat général (voir
+ * `quotas.computeVentePay`).
  */
 async function handlePalier(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
-  const item = interaction.options.getString('item');
-  const target = item ? `**${item}**` : 'général (vente)';
   if (sub === 'add') {
-    const valeur = interaction.options.getNumber('valeur', true);
+    const saisie = interaction.options.getString('item');
+    const item = saisie ? canonicalItem(guildId, saisie) : null;
+    if (saisie && !item) {
+      await interaction.reply({ content: `❌ **${saisie}** n'est pas un item suivi (voir \`/config item list\`) : ce barème ne s'appliquerait à aucune vente.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const jusqua = interaction.options.getInteger('jusqua');
+    const valeur = interaction.options.getNumber('valeur', true);
     const existing = await db.getSalaryTiersFor(guildId, item);
-    if (existing.some(t => t.upTo == null)) {
-      await interaction.reply({ content: `❌ Le barème ${target} a déjà une tranche finale (sans limite). Retire-la d'abord avec \`/config palier remove\` sans \`jusqua\`.`, flags: MessageFlags.Ephemeral });
+    const cible = item ? `**${item}**` : 'général "vente"';
+
+    if (existing.some(t => t.upTo === null)) {
+      await interaction.reply({ content: `❌ Le barème ${cible} a déjà une tranche finale (sans limite) — retire-la d'abord (\`/config palier remove\`, \`jusqua\` omis) avant d'en ajouter une autre.`, flags: MessageFlags.Ephemeral });
       return;
     }
-    const maxBound = Math.max(0, ...existing.map(t => t.upTo ?? 0));
-    if (jusqua != null && jusqua <= maxBound) {
-      await interaction.reply({ content: `❌ \`jusqua\` doit être strictement supérieur à la dernière borne du barème ${target} (${maxBound}).`, flags: MessageFlags.Ephemeral });
-      return;
+    if (jusqua != null) {
+      const maxFinite = existing.reduce((max, t) => Math.max(max, t.upTo ?? 0), 0);
+      if (jusqua <= maxFinite) {
+        await interaction.reply({ content: `❌ La borne doit être strictement supérieure à la dernière tranche existante du barème ${cible} (\`${maxFinite}\`).`, flags: MessageFlags.Ephemeral });
+        return;
+      }
     }
+
     await configStore.mutate(guildId, () => db.addSalaryTier(guildId, item, jusqua, valeur));
-    const range = jusqua == null ? `${maxBound}+` : `${maxBound} → ${jusqua}`;
-    await interaction.reply({ content: `✅ Palier ${target} : ${range} → ${valeur}$/unité.`, flags: MessageFlags.Ephemeral });
+    const tranche = jusqua != null ? `jusqu'à ${jusqua} unités` : 'au-delà (tranche finale, sans limite)';
+    const sansFinale = jusqua != null ? `\nℹ️ Pas encore de tranche finale (sans limite) : au-delà de ${jusqua} unités, le taux de cette tranche s'applique.` : '';
+    await interaction.reply({ content: `✅ Tranche ajoutée au barème ${cible} : ${tranche} → ${valeur}$/unité.${sansFinale}`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'remove') {
+    const item = interaction.options.getString('item');
     const jusqua = interaction.options.getInteger('jusqua');
-    const count = await configStore.mutate(guildId, () => db.removeSalaryTier(guildId, item, jusqua));
-    const which = jusqua == null ? 'finale' : `jusqu'à ${jusqua}`;
-    await interaction.reply({ content: count ? `✅ Tranche ${which} du barème ${target} retirée.` : `❌ Aucune tranche ${which} dans le barème ${target}.`, flags: MessageFlags.Ephemeral });
+    const cible = item ? `**${item}**` : 'général "vente"';
+    await configStore.mutate(guildId, () => db.removeSalaryTier(guildId, item, jusqua));
+    const tranche = jusqua != null ? `jusqu'à ${jusqua} unités` : 'finale (sans limite)';
+    await interaction.reply({ content: `✅ Tranche ${tranche} retirée du barème ${cible}.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'clear') {
-    const count = await configStore.mutate(guildId, () => db.clearSalaryTiers(guildId, item));
-    await interaction.reply({ content: count ? `✅ Barème ${target} retiré (${count} tranche(s)).` : `❌ Aucun barème ${target} configuré.`, flags: MessageFlags.Ephemeral });
+    const item = interaction.options.getString('item');
+    const cible = item ? `**${item}**` : 'général "vente"';
+    await configStore.mutate(guildId, () => db.clearSalaryTiers(guildId, item));
+    await interaction.reply({ content: `✅ Barème ${cible} entièrement retiré (retombe sur le taux plat, voir \`/config salaire\`, s'il existe).`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'list') {
-    const { general, byItem } = configStore.get(guildId).VENTE_PALIERS;
-    const items = Object.keys(byItem).sort();
-    if (!general.length && !items.length) {
-      await interaction.reply({ content: 'Aucun barème par palier configuré — la vente est payée au taux plat de `/config salaire`.', flags: MessageFlags.Ephemeral });
+    const rows = await db.getAllSalaryTiers(guildId);
+    if (!rows.length) {
+      await interaction.reply({ content: 'Aucun palier de paie configuré.', flags: MessageFlags.Ephemeral });
       return;
     }
-    const lines: string[] = [];
-    if (general.length) lines.push('__Barème général (vente)__', ...formatTiers(general));
-    for (const it of items) lines.push('', `__${it}__`, ...formatTiers(byItem[it]));
-    const embed = new EmbedBuilder()
-      .setTitle('⚙️ Paliers de paie (vente)')
-      .setDescription(lines.join('\n'))
-      .setFooter({ text: 'Priorité par drogue : palier de la drogue > taux de la drogue > palier général > taux général.' })
-      .setColor(0x5865f2);
+    const general = rows.filter(r => r.item === null);
+    const byItem = new Map<string, typeof rows>();
+    for (const r of rows) {
+      if (r.item === null) continue;
+      byItem.set(r.item, [...(byItem.get(r.item) ?? []), r]);
+    }
+    const lines = [
+      ...(general.length ? [`**Général (vente)**`, ...formatTierLines(general)] : []),
+      ...[...byItem.entries()].flatMap(([item, tiers]) => [`**${item}**`, ...formatTierLines(tiers)]),
+    ];
+    const embed = new EmbedBuilder().setTitle('⚙️ Paliers de paie (vente)').setDescription(lines.join('\n')).setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 }
 
-/** `/config classement set|remove|list` — l'option `activite` (optionnelle, seulement valide avec quota_type "actions") cible les points d'une activité précise plutôt que le nombre général de la catégorie (voir `computeClassement` dans quotas.ts). */
+/** `/config classement set|remove|list` — `activite` optionnel (uniquement avec `quota_type: actions`) fixe/retire des points spécifiques à une activité, qui remplacent le nombre général "actions" pour elle seule. */
 async function handleClassement(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
   if (sub === 'set') {
     const quotaType = interaction.options.getString('quota_type', true);
     const valeur = interaction.options.getInteger('valeur', true);
     const activite = interaction.options.getString('activite');
-    if (activite) {
-      if (quotaType !== 'actions') {
-        await interaction.reply({ content: '❌ `activite` n\'est utilisable qu\'avec `quota_type: actions`.', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await configStore.mutate(guildId, () => db.setActivityClassementRate(guildId, activite, valeur));
-      const label = configStore.get(guildId).ACTIVITY_TYPES[activite]?.label ?? activite;
-      await interaction.reply({ content: `✅ Points **${label}** → ${valeur} pt(s) (remplace le nombre général "actions" pour cette activité).`, flags: MessageFlags.Ephemeral });
+    if (activite && quotaType !== 'actions') {
+      await interaction.reply({ content: "❌ `activite` n'est utilisable qu'avec `quota_type: actions`.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await configStore.mutate(guildId, () => db.setClassementRate(guildId, quotaType, valeur));
-    await interaction.reply({ content: `✅ Points **${quotaType}** → ${valeur} pt(s)/unité.`, flags: MessageFlags.Ephemeral });
+    if (activite) {
+      await configStore.mutate(guildId, () => db.setActivityClassementRate(guildId, activite, valeur));
+      const label = configStore.get(guildId).ACTIVITY_TYPES[activite]?.label ?? activite;
+      await interaction.reply({ content: `✅ Points de classement **${label}** → ${valeur} pt/unité (remplace le nombre général "actions" pour cette activité).`, flags: MessageFlags.Ephemeral });
+    } else {
+      await configStore.mutate(guildId, () => db.setClassementRate(guildId, quotaType, valeur));
+      await interaction.reply({ content: `✅ Points de classement **${quotaType}** → ${valeur} pt/unité.`, flags: MessageFlags.Ephemeral });
+    }
     return;
   }
   if (sub === 'remove') {
@@ -642,25 +644,25 @@ async function handleClassement(interaction: ChatInputCommandInteraction, guildI
     if (activite) {
       await configStore.mutate(guildId, () => db.deleteActivityClassementRate(guildId, activite));
       const label = configStore.get(guildId).ACTIVITY_TYPES[activite]?.label ?? activite;
-      await interaction.reply({ content: `✅ Points spécifiques **${label}** retirés (retombe sur le nombre général "actions").`, flags: MessageFlags.Ephemeral });
-      return;
+      await interaction.reply({ content: `✅ Points de classement spécifiques de **${label}** retirés (retombent sur le nombre général "actions").`, flags: MessageFlags.Ephemeral });
+    } else {
+      await configStore.mutate(guildId, () => db.deleteClassementRate(guildId, quotaType));
+      await interaction.reply({ content: `✅ Points de classement **${quotaType}** retirés.`, flags: MessageFlags.Ephemeral });
     }
-    await configStore.mutate(guildId, () => db.deleteClassementRate(guildId, quotaType));
-    await interaction.reply({ content: `✅ Points **${quotaType}** retirés.`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (sub === 'list') {
-    const [rates, activityRates] = await Promise.all([db.getAllClassementRates(guildId), db.getAllActivityClassementRates(guildId)]);
+    const rates = await db.getAllClassementRates(guildId);
+    const activityRates = await db.getAllActivityClassementRates(guildId);
     if (rates.length === 0 && activityRates.length === 0) {
       await interaction.reply({ content: 'Aucun point de classement configuré.', flags: MessageFlags.Ephemeral });
       return;
     }
     const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
-    const lines = rates.map(r => `**${r.quotaType}** : ${r.amount} pt(s)/unité`);
-    if (activityRates.length) {
-      lines.push('', '__Points par activité (override de "actions")__');
-      lines.push(...activityRates.map(r => `**${activityTypes[r.activityKey]?.label ?? r.activityKey}** : ${r.amount} pt(s)`));
-    }
+    const lines = [
+      ...rates.map(r => `**${r.quotaType}** : ${r.amount} pt/unité`),
+      ...activityRates.map(r => `**${activityTypes[r.activityKey]?.label ?? r.activityKey}** (actions) : ${r.amount} pt/unité`),
+    ];
     const embed = new EmbedBuilder().setTitle('⚙️ Points de classement').setDescription(lines.join('\n')).setColor(0x5865f2);
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
@@ -670,21 +672,22 @@ async function handleClassement(interaction: ChatInputCommandInteraction, guildI
 async function handleTypeGroupe(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
   if (sub === 'set') {
     const tier = interaction.options.getString('tier', true) as configStore.GroupTier;
+    // Les salons de labo à créer/supprimer sont des opérations Discord async
+    // (peuvent dépasser 3s) — deferReply plutôt qu'un reply direct.
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
     await configStore.mutate(guildId, () => db.setSetting(guildId, configStore.TYPE_GROUPE_SETTING_KEY, tier));
     await quotas.updatePermanentMessage(interaction.client, guildId);
-    // Le tier change VENTE_ITEMS/LABO_ITEMS (voir config-store.ts), qui pilotent
-    // les champs "Drogue à vendre"/"Drogue de production" du Stock Général —
-    // sans ce refresh, ce message resterait faux jusqu'au prochain mouvement.
+    // Le tier change VENTE_ITEMS/LABO_ITEMS/MATERIAL_ITEMS (voir config-store.ts),
+    // qui pilotent les champs "Drogues à vendre"/"Drogues de production"/
+    // "Matériaux de production" du Stock Général — sans ce refresh, ce
+    // message resterait faux jusqu'au prochain mouvement.
     await stocks.updateStockMessage(interaction.client, guildId);
     // Le tier change aussi les zones/taxes fixes proposées à la création (voir
     // taxes.ts) — sans ce refresh, le panneau taxes resterait figé sur les
     // boutons de l'ancien tier jusqu'au prochain redémarrage du bot.
     await taxes.initPermanentMessage(interaction.client, guildId);
-    // Ne garde/crée que les salons de labo pertinents pour ce tier — voir
-    // docstring de `syncLaboChannels` (sinon tous les salons de labo, de tous
-    // les tiers, restent créés en permanence quel que soit le tier actif).
+    // Salons de labo : supprime ceux qui ne sont plus valides pour ce tier,
+    // crée ceux qui le deviennent (voir docstring de syncLaboChannels).
     await syncLaboChannels(interaction, guildId, tier);
     const label = configStore.GROUP_TIERS.find(t => t.key === tier)?.label ?? tier;
     await interaction.editReply({ content: `✅ Type d'organisation → **${label}**. Panneau d'activités, Stock Général, panneau Taxes et salons de labo mis à jour.` });
@@ -725,15 +728,11 @@ const CATEGORY_EXCLUDED_ROLES: readonly configStore.ChannelRole[] = ['logs_garag
 /**
  * Nom de salon par défaut pour chaque rôle auto-créable via `/config category
  * set` — seuls les rôles présents ici sont candidats à la création (les rôles
- * de {@link CATEGORY_EXCLUDED_ROLES} en sont volontairement absents).
- *
- * Chacun est préfixé d'un emoji suivi du séparateur "・" (U+30FB, point médian
- * katakana) — convention déjà utilisée partout ailleurs sur le serveur type
- * (voir les autres salons existants), Discord accepte ce caractère tel quel
- * dans un nom de salon. Les salons de labo n'ont volontairement PAS d'emoji
- * statique ici : le leur (🟢/🔴) est déjà géré dynamiquement par
- * `alertes.setLaboStatut` selon la disponibilité, avec le même séparateur
- * "・" (voir `stripLaboPrefix`, qui sait aussi le retirer).
+ * de {@link CATEGORY_EXCLUDED_ROLES} en sont volontairement absents). Préfixe
+ * emoji+"・" (séparateur point médian katakana) pour un classement visuel
+ * cohérent dans la liste des salons Discord. Les salons de labo n'ont
+ * volontairement PAS d'emoji statique ici : le leur (🟢/🔴) est posé
+ * dynamiquement par `alertes.setLaboStatut`.
  */
 const CHANNEL_NAME_BY_ROLE: Partial<Record<configStore.ChannelRole, string>> = {
   documentation: '📚・documentation',
@@ -761,13 +760,57 @@ const CHANNEL_NAME_BY_ROLE: Partial<Record<configStore.ChannelRole, string>> = {
 };
 
 /**
- * Ordre d'affichage voulu pour les salons gérés par ce module, appliqué après
- * chaque création (`/config category set`, `syncLaboChannels`) via {@link
- * applyChannelOrder} — indépendamment de l'ordre ou du moment réel de
- * création (ex. un salon de labo créé bien plus tard par un changement de
- * tier doit quand même se retrouver à sa place, pas à la fin). Les rôles
- * absents d'ici (logs de coffre/garages, hors catégorie) ne sont jamais
- * réordonnés.
+ * URL du manuel complet, constante en dur — LA documentation de ce
+ * déploiement (pas une donnée qui varie par guilde, contrairement à
+ * `Guild.frontendUrl`), pointée par le bouton du salon `documentation`.
+ */
+const MANUEL_URL = 'https://claude.ai/code/artifact/775af8d1-811e-4de0-a32f-9cb16b5859e2';
+
+/**
+ * Poste (ou édite si déjà posté — même pattern que les autres panneaux
+ * permanents) le message d'accueil du salon `documentation` : résumé du bot
+ * + sommaire du manuel + bouton lien vers {@link MANUEL_URL}. Déclenchée
+ * depuis `/config channel set role:documentation`, `/config category set`
+ * (si le salon vient d'être créé) et `initGuild` (`index.ts`) au
+ * démarrage pour chaque guilde déjà connue.
+ */
+const DOCUMENTATION_TITLE = "📚 Bienvenue dans le dossier de l'organisation";
+
+export async function initDocumentationMessage(client: Client, guildId: string): Promise<void> {
+  const channelId = configStore.get(guildId).CHANNELS.documentation;
+  if (!channelId) return;
+  try {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isSendable()) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle(DOCUMENTATION_TITLE)
+      .setColor(0xcf9f2e)
+      .setDescription(
+        "Ce salon regroupe tout ce qu'il faut savoir sur le bot : comment déclarer une activité, vendre, " +
+        "gérer l'armurerie, poser une taxe, et comment un admin reconfigure tout ça depuis Discord.\n\n" +
+        '**Au programme du manuel complet :**\n' +
+        "🏴 Types d'organisation\n" + '📦 Stock général\n' + '🎮 Activités & quotas\n' +
+        '💉 Ventes de drogue\n' + '🔫 Armurerie\n' + '🛃 Taxes & rackets\n' +
+        '🚗 Garages & fourrière\n' + '🌿 Labos\n' + '🕵️ Administration',
+      )
+      .setFooter({ text: 'Mis à jour à chaque évolution du bot' })
+      .setTimestamp();
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setLabel('📖 Ouvrir le manuel complet').setStyle(ButtonStyle.Link).setURL(MANUEL_URL),
+    );
+
+    await upsertPanel(channel, guildId, 'documentation_message_id', DOCUMENTATION_TITLE, async () => ({ embeds: [embed], components: [row] }));
+  } catch (err) {
+    console.error(`[config] initDocumentationMessage(${guildId}):`, (err as Error).message);
+  }
+}
+
+/**
+ * Ordre de tri des salons auto-créés (rôles absents — logs de coffre,
+ * garages — jamais réordonnés). N'a de sens que RELATIVEMENT aux salons
+ * d'une même catégorie, pas besoin de filtrer par catégorie.
  */
 const CHANNEL_DISPLAY_ORDER: readonly configStore.ChannelRole[] = [
   'documentation',
@@ -778,19 +821,10 @@ const CHANNEL_DISPLAY_ORDER: readonly configStore.ChannelRole[] = [
   'historique_stock', 'log_ventes', 'logs_activites', 'admin',
 ];
 
-/**
- * Réordonne les salons déjà configurés selon {@link CHANNEL_DISPLAY_ORDER}.
- * Le champ `position` Discord n'a de sens que RELATIVEMENT aux salons d'une
- * même catégorie — nul besoin de filtrer par catégorie ici, chacun garde la
- * sienne, seul son rang parmi ses frères change. Best-effort : une erreur
- * (permission manquante) est loggée, jamais bloquante pour la commande
- * appelante.
- */
+/** Réordonne les salons déjà configurés d'une guilde selon {@link CHANNEL_DISPLAY_ORDER} — best-effort, jamais bloquant (permission "Gérer les salons" manquante possible). */
 export async function applyChannelOrder(guild: Guild, guildId: string): Promise<void> {
   const existing = configStore.get(guildId).CHANNELS;
-  const ordered = CHANNEL_DISPLAY_ORDER
-    .map(role => existing[role])
-    .filter((id): id is string => !!id);
+  const ordered = CHANNEL_DISPLAY_ORDER.map(role => existing[role]).filter((id): id is string => !!id);
   if (!ordered.length) return;
   try {
     await guild.channels.setPositions(ordered.map((channel, position) => ({ channel, position })));
@@ -799,17 +833,10 @@ export async function applyChannelOrder(guild: Guild, guildId: string): Promise<
   }
 }
 
-/**
- * Retrouve la catégorie Discord où créer un nouveau salon de labo, en
- * cherchant le parent d'un salon déjà connu — un autre salon de labo en
- * priorité (pour rester groupé avec les labos existants), sinon un panneau
- * de référence (quotas, stock général). `null` si aucun repère trouvé (ex.
- * `/config category set` jamais lancé) : le salon est alors créé hors
- * catégorie plutôt que d'échouer.
- */
+/** Cherche la catégorie d'un salon de labo/panneau déjà existant, pour y créer un nouveau salon de labo au même endroit — `null` si aucun repère (création hors catégorie plutôt que d'échouer). */
 async function resolveLaboCategoryId(interaction: ChatInputCommandInteraction, guildId: string): Promise<string | null> {
   const c = configStore.get(guildId).CHANNELS;
-  const reperes = [c.labo_heroine, c.labo_sporex, c.labo_mexicana, c.labo_cannabis, c.labo_cocaine, c.quotas, c.stock_general];
+  const reperes = [c.labo_heroine, c.labo_sporex, c.labo_mexicana, c.labo_cannabis, c.labo_cocaine, c.labo_salvia, c.labo_branche_cannabis, c.quotas, c.stock_general];
   for (const id of reperes) {
     if (!id) continue;
     const channel = await interaction.guild?.channels.fetch(id).catch(() => null);
@@ -819,14 +846,13 @@ async function resolveLaboCategoryId(interaction: ChatInputCommandInteraction, g
 }
 
 /**
- * Synchronise les salons de labo sur le tier fraîchement choisi (voir
- * `handleTypeGroupe`) : supprime les salons des labos qui n'existent plus
- * pour ce tier (voir `configStore.LABO_TIERS`), crée ceux qui manquent.
- * Un labo commun à deux tiers (ex. `labo_mexicana`, gang ET organisation)
- * garde son salon d'un tier à l'autre plutôt que d'être détruit puis
- * recréé — évite de perdre son historique pour rien lors d'un changement
- * gang ↔ organisation. Best-effort : une création/suppression en échec
- * (permission manquante...) est loggée, jamais bloquante pour la commande.
+ * Synchronise les salons de labo au changement de tier (`/config type-groupe
+ * set`) : supprime les salons des labos qui ne sont plus valides pour le
+ * nouveau tier, crée ceux des labos désormais valides mais sans salon. Un
+ * labo commun à deux tiers garde son salon (jamais détruit puis recréé).
+ * **Piège évité** : si la suppression Discord échoue, l'association en base
+ * n'est PAS retirée — sinon le salon existe toujours sur Discord mais le bot
+ * "l'oublie", et un futur retour à ce tier créerait un doublon.
  */
 async function syncLaboChannels(interaction: ChatInputCommandInteraction, guildId: string, tier: configStore.GroupTier): Promise<void> {
   if (!interaction.guild) return;
@@ -838,11 +864,6 @@ async function syncLaboChannels(interaction: ChatInputCommandInteraction, guildI
     try {
       const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
       if (channel) await channel.delete(`Changement de type d'organisation → ${tier}`);
-      // Uniquement si la suppression a réussi (ou si le salon n'existait déjà
-      // plus) : si `channel.delete()` échoue (permissions, API Discord), on
-      // garde l'association en base plutôt que d'"oublier" un salon qui
-      // existe toujours — sinon un futur retour à ce tier créerait un
-      // doublon au lieu de retrouver le salon existant.
       await configStore.mutate(guildId, () => db.removeChannelFromRole(guildId, labo, channelId));
     } catch (err) {
       console.error(`[config] type-groupe — suppression du salon ${labo} :`, (err as Error).message);
@@ -850,22 +871,23 @@ async function syncLaboChannels(interaction: ChatInputCommandInteraction, guildI
   }
 
   const manquants = allLabos.filter(labo => configStore.LABO_TIERS[labo].includes(tier) && !configStore.get(guildId).CHANNELS[labo]);
-  if (!manquants.length) return;
-
-  const categoryId = await resolveLaboCategoryId(interaction, guildId);
-  for (const labo of manquants) {
-    try {
-      const channel = await interaction.guild.channels.create({
-        name: CHANNEL_NAME_BY_ROLE[labo] ?? labo,
-        type: ChannelType.GuildText,
-        ...(categoryId ? { parent: categoryId } : {}),
-      });
-      await configStore.mutate(guildId, () => db.setChannelRole(guildId, labo, channel.id));
-      await alertes.setLaboStatut(interaction.client, guildId, labo, true);
-    } catch (err) {
-      console.error(`[config] type-groupe — création du salon ${labo} :`, (err as Error).message);
+  if (manquants.length) {
+    const categoryId = await resolveLaboCategoryId(interaction, guildId);
+    for (const labo of manquants) {
+      try {
+        const channel = await interaction.guild.channels.create({
+          name: CHANNEL_NAME_BY_ROLE[labo] ?? labo,
+          type: ChannelType.GuildText,
+          ...(categoryId ? { parent: categoryId } : {}),
+        });
+        await configStore.mutate(guildId, () => db.setChannelRole(guildId, labo, channel.id));
+        await alertes.setLaboStatut(interaction.client, guildId, labo, true);
+      } catch (err) {
+        console.error(`[config] type-groupe — création du salon ${labo} :`, (err as Error).message);
+      }
     }
   }
+
   await applyChannelOrder(interaction.guild, guildId);
 }
 
@@ -875,8 +897,11 @@ async function syncLaboChannels(interaction: ChatInputCommandInteraction, guildI
  * CHANNEL_NAME_BY_ROLE}/{@link CATEGORY_EXCLUDED_ROLES}), l'associe en base,
  * puis rafraîchit immédiatement les panneaux concernés — même rattrapage que
  * `/config channel set` (voir `handleChannel`), pour plusieurs salons d'un
- * coup. Un rôle déjà configuré n'est jamais recréé ni touché (ré-exécutable
- * sans risque de doublons).
+ * coup. Un rôle déjà configuré n'est jamais recréé, mais s'il est mal placé
+ * (pas dans cette catégorie), il est déplacé (`setParent`, jamais renommé ni
+ * recréé). Un salon de labo n'est proposé à la création que s'il est valide
+ * pour le tier courant (voir `LABO_TIERS`) — sinon tous les labos de tous les
+ * tiers se retrouveraient créés en permanence quel que soit le tier choisi.
  */
 async function handleCategory(interaction: ChatInputCommandInteraction, guildId: string, sub: string): Promise<void> {
   if (sub !== 'set') return;
@@ -891,17 +916,13 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
 
   const existing = configStore.get(guildId).CHANNELS;
   const tier = configStore.get(guildId).TYPE_GROUPE;
-  // Un rôle de labo (voir LABO_TIERS) n'est créé que s'il est valide pour le
-  // tier actuel — sinon tous les salons de labo, de tous les tiers, se
-  // retrouveraient créés en permanence quel que soit le type d'organisation
-  // choisi (voir aussi `syncLaboChannels`, qui gère la création/suppression à
-  // chaque changement de tier après ce premier passage).
+  const laboValidePourTier = (role: configStore.ChannelRole) => !configStore.LABO_TIERS[role] || configStore.LABO_TIERS[role].includes(tier);
   const toCreate = (Object.entries(CHANNEL_NAME_BY_ROLE) as Array<[configStore.ChannelRole, string]>)
-    .filter(([role]) => !CATEGORY_EXCLUDED_ROLES.includes(role) && !existing[role]
-      && (!(role in configStore.LABO_TIERS) || configStore.LABO_TIERS[role].includes(tier)));
+    .filter(([role]) => !CATEGORY_EXCLUDED_ROLES.includes(role) && !existing[role] && laboValidePourTier(role));
 
   const created: string[] = [];
   const failed: string[] = [];
+  const documentationJusteCreee = toCreate.some(([role]) => role === 'documentation');
 
   for (const [role, name] of toCreate) {
     try {
@@ -923,7 +944,7 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
     if (!existing.armurerie) await armurerie.updatePermanentMessage(interaction.client, guildId);
     if (!existing.quotas) await quotas.updatePermanentMessage(interaction.client, guildId);
     if (!existing.taxes) await taxes.initPermanentMessage(interaction.client, guildId);
-    if (!existing.documentation) await initDocumentationMessage(interaction.client, guildId);
+    if (documentationJusteCreee) await initDocumentationMessage(interaction.client, guildId);
     for (const [role] of toCreate) {
       if (role.startsWith('labo_')) await alertes.setLaboStatut(interaction.client, guildId, role, true);
     }
@@ -932,13 +953,6 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
   const alreadyConfigured = (Object.keys(CHANNEL_NAME_BY_ROLE) as configStore.ChannelRole[])
     .filter(role => !CATEGORY_EXCLUDED_ROLES.includes(role) && !!existing[role]);
 
-  // Range dans la catégorie les salons déjà configurés mais mal placés — ex.
-  // un salon de labo créé par `/config type-groupe set` avant qu'aucune
-  // catégorie n'existe encore (voir `syncLaboChannels`), qui resterait sinon
-  // hors catégorie même après un `/config category set` ultérieur. Ne
-  // recrée ni ne renomme rien, déplace seulement ; `lockPermissions: false`
-  // pour ne jamais changer qui peut voir un salon sensible (admin, taxes...)
-  // au passage.
   const moved: string[] = [];
   for (const role of alreadyConfigured) {
     const channelId = existing[role];
@@ -946,6 +960,9 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
     const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
     if (!channel || !('setParent' in channel) || channel.parentId === categorie.id) continue;
     try {
+      // `lockPermissions: false` : ne jamais changer qui peut voir le salon
+      // en le déplaçant — un salon sensible (admin, taxes...) garde ses
+      // permissions propres, pas celles héritées de la nouvelle catégorie.
       await channel.setParent(categorie.id, { lockPermissions: false });
       moved.push(`**${role}** → <#${channelId}>`);
     } catch (err) {
@@ -955,10 +972,12 @@ async function handleCategory(interaction: ChatInputCommandInteraction, guildId:
 
   await applyChannelOrder(interaction.guild, guildId);
 
+  const nonDeplaces = alreadyConfigured.filter(role => !moved.some(m => m.includes(`**${role}**`)));
   const lines = [
     created.length ? `✅ **${created.length} salon(s) créé(s)** dans <#${categorie.id}> :\n${created.join('\n')}` : null,
     moved.length ? `📁 **${moved.length} salon(s) déjà configuré(s) rangé(s)** dans <#${categorie.id}> :\n${moved.join('\n')}` : null,
     failed.length ? `⚠️ Échec pour : ${failed.join(', ')} (permission "Gérer les salons" manquante ?)` : null,
+    nonDeplaces.length ? `ℹ️ Déjà configurés et déjà bien rangés : ${nonDeplaces.join(', ')}` : null,
   ].filter((l): l is string => l !== null);
 
   await interaction.editReply({ content: lines.join('\n\n') || 'Rien à faire — tous les salons sont déjà configurés et bien rangés.' });
@@ -991,6 +1010,19 @@ async function handleSiteExterne(interaction: ChatInputCommandInteraction, guild
       await interaction.reply({ content: '❌ URL invalide — seuls les schémas http:// et https:// sont acceptés.', flags: MessageFlags.Ephemeral });
       return;
     }
+    // Le token (7 jours) est livré à cette page dans l'URL : en clair, un
+    // tiers sur le réseau pourrait injecter un script et le lire. `http://`
+    // n'est admis que pour un site de développement local.
+    const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+    if (parsed.protocol === 'http:' && !local) {
+      await interaction.reply({ content: '❌ URL refusée — https:// obligatoire (http:// seulement pour localhost en développement).', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // Le token est ajouté en `#token=...` : une URL qui a déjà un fragment donnerait `...#x#token=`.
+    if (parsed.hash) {
+      await interaction.reply({ content: "❌ URL refusée — elle ne doit pas contenir de `#` (le bot y ajoute lui-même le token).", flags: MessageFlags.Ephemeral });
+      return;
+    }
     const origin = parsed.origin;
     await guildRegistry.setGuildSite(guildId, url, origin);
     await interaction.reply({ content: `✅ Site externe autorisé : **${url}**\nOrigine CORS acceptée : \`${origin}\``, flags: MessageFlags.Ephemeral });
@@ -1013,7 +1045,7 @@ async function handleSiteExterne(interaction: ChatInputCommandInteraction, guild
   }
 }
 
-/** Autocomplete pour les options `nom`/`cle` des sous-commandes `remove`. */
+/** Autocomplete pour les options `nom`/`item` des sous-groupes qui en ont besoin. */
 export async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
   const group = interaction.options.getSubcommandGroup();
   const focused = interaction.options.getFocused(true);

@@ -38,12 +38,12 @@ import * as db from './db';
  * assignable à n'importe quel salon Discord via `/config channel set`).
  */
 export const CHANNEL_ROLES = [
-  'stock_general', 'logs_activites', 'alertes_braquages',
+  'documentation', 'stock_general', 'logs_activites', 'alertes_braquages',
   'alertes_actions', 'bilan', 'paie', 'armurerie', 'quotas', 'taxes',
   'alertes_taxes', 'historique_stock', 'ventes_drogue', 'log_ventes',
   'admin', 'logs_garages', 'labo_heroine', 'labo_sporex',
   'labo_mexicana', 'labo_cannabis', 'labo_cocaine', 'labo_salvia',
-  'labo_branche_cannabis', 'documentation',
+  'labo_branche_cannabis',
 ] as const;
 
 export type ChannelRole = (typeof CHANNEL_ROLES)[number];
@@ -61,7 +61,7 @@ export interface ActivityTypeConfig {
   displayOrder: number;
   /** Résolu dans `reload()` selon `TYPE_GROUPE` — voir {@link LABO_TIERS}. `true` pour toute activité non listée dans `LABO_TIERS` (jamais désactivée par le tier). */
   enabled: boolean;
-  /** Icône (optionnelle) affichée UNIQUEMENT dans l'embed « Gestion des Activités » (slots braquages, `buildMainEmbed` dans quotas.ts) — partout ailleurs (boutons, messages, alertes, API…) on affiche `label` seul, décision explicite de l'utilisateur. */
+  /** Icône d'affichage (optionnelle) — n'apparaît QUE dans les slots braquages de l'embed "Gestion des Activités" (`buildMainEmbed`, quotas.ts). Décision explicite de l'utilisateur : jamais ailleurs (boutons, titres de modal, messages, API…). */
   icon?: string;
 }
 
@@ -79,10 +79,10 @@ export const GROUP_TIERS: Array<{ key: GroupTier; label: string }> = [
 export const TYPE_GROUPE_SETTING_KEY = 'type_groupe';
 
 /**
- * Tier appliqué tant qu'aucun `/config type-groupe set` n'a jamais été fait.
- * Choisi égal aux anciennes valeurs codées en dur (Fleeca/Armurerie 6,
- * Bijouterie/Pinebank 1) pour qu'un déploiement existant qui ne configure pas
- * immédiatement son tier ne voie pas ses limites de braquage changer.
+ * Tier appliqué tant qu'aucun `/config type-groupe set` n'a jamais été fait :
+ * Petite Frappe (Fleeca/Armurerie 6, Bijouterie/Pinebank 1), pour qu'un
+ * serveur qui ne configure pas immédiatement son tier garde des limites de
+ * braquage raisonnables plutôt qu'aucune.
  */
 const DEFAULT_GROUP_TIER: GroupTier = 'petite_frappe';
 
@@ -139,9 +139,8 @@ export const BRAQUAGE_LIMITS_BY_TIER: Record<GroupTier, Record<string, number>> 
 
 /**
  * Labos accessibles par type d'organisation — une clé absente ici (aucun
- * tier ne la liste) est désactivée pour TOUS les tiers ; le tier
- * `independant` n'apparaît dans aucune liste, donc aucun labo n'y est
- * jamais disponible. Détermine `ActivityTypeConfig.enabled` dans `reload()`.
+ * tier ne la liste) est désactivée pour TOUS les tiers. Détermine
+ * `ActivityTypeConfig.enabled` dans `reload()`.
  */
 export const LABO_TIERS: Record<string, GroupTier[]> = {
   labo_heroine: ['petite_frappe'],
@@ -160,45 +159,50 @@ export interface ItemConfig {
   displayOrder: number;
   visibleStock: boolean;
   laboLie: string | null;
-  /** 'produit' ou 'materiau' — sens du lien `laboLie`, voir docstring du modèle `Item`. `null` si `laboLie` est `null`. */
-  laboLieRole: string | null;
+  /** 'produit'/'materiau'/`null` — voir docstring du modèle `Item`. */
+  laboLieRole: 'produit' | 'materiau' | null;
   /** Unités de base par unité de cet item (ex. 24 pour une boîte de munitions) — voir docstring du modèle `Item` et `armurerie.weightedStockSum`. */
   stockMultiplier: number;
 }
 
+/** Une tranche d'un barème de paie progressif — voir `BotConfig.VENTE_PALIERS` et `quotas.computeVentePay`. */
+export interface SalaryTierEntry {
+  /** Borne haute (unités) de cette tranche, incluse — `null` pour la tranche finale, sans limite. */
+  upTo: number | null;
+  /** $ par unité pour cette tranche précise. */
+  amount: number;
+}
+
 export interface BotConfig {
-  /** `logs_coffres`/`logs_coffres_admin` sont des listes (plusieurs salons possibles chacune, voir `/config channel add-log-coffre`/`add-log-coffre-admin`), mutuellement exclusives — un salon ne peut être que l'un ou l'autre, jamais les deux (voir la vérification dans `handleChannel`, `modules/config.ts`). Les deux sont surveillées de la même façon par `stocks.ts`, `logs_coffres_admin` obtenant en plus le badge 🛡️ dans `historique_stock` (voir `logStockToChannel`). */
+  /** `logs_coffres`/`logs_coffres_admin` sont des listes (plusieurs salons possibles chacune, voir `/config channel add-log-coffre`/`add-log-coffre-admin`) — les deux sont surveillées de la même façon par `stocks.ts`, `logs_coffres_admin` obtenant en plus le badge 🛡️ dans `historique_stock` (voir `logStockToChannel`). Un salon donné ne peut appartenir qu'à UNE SEULE des deux listes à la fois, jamais les deux (`handleChannel` dans `modules/config.ts` rejette l'ajout sinon). */
   CHANNELS: Record<ChannelRole, string | null> & { logs_coffres: string[]; logs_coffres_admin: string[] };
   ALLOWED_ITEMS: string[];
   ITEMS_BY_NAME: Record<string, ItemConfig>;
   STOCK_GROUPS: Record<string, string[]>;
   VENTE_ITEMS: string[];
-  /** Items dont le `laboLie` (rôle 'produit') est actif pour le tier courant — drogues en production interne, complément exact de VENTE_ITEMS pour ces items-là. */
+  /** Items dont le `laboLie` (rôle 'produit') est actif pour le tier courant — drogues en production interne, complément exact de VENTE_ITEMS pour ces items-là (voir `laboLie`/`laboLieRole` dans db.ts). */
   LABO_ITEMS: string[];
-  /** Items dont le `laboLie` (rôle 'materiau') est actif pour le tier courant — matières premières consommées par un labo actuellement accessible, jamais mélangées à LABO_ITEMS (ce sont les drogues produites, pas ce qu'elles consomment). */
+  /** Items dont le `laboLie` (rôle 'materiau') est actif pour le tier courant — matières premières consommées, n'affecte jamais VENTE_ITEMS/LABO_ITEMS. */
   MATERIAL_ITEMS: string[];
   ACTIVITY_TYPES: Record<string, ActivityTypeConfig>;
   QUOTA_TARGETS: Record<string, number>;
   ADMIN_ROLE_ID: string | null;
+  /** Rôle exigé pour utiliser l'API du site externe (voir `/config role set membre` et `permissions.hasApiAccess`). `null` = non configuré : seuls les admins passent. */
+  MEMBER_ROLE_ID: string | null;
+  /** Rôle donnant accès aux taxes du site externe (`/api/taxes`, `isTaxes` dans le token — voir `api/auth.requireTaxesAccess`), en plus des admins. */
   TAXES_ROLE_ID: string | null;
   /** $ par unité, par catégorie de quota — voir `/config salaire` et `computeSalaire` dans quotas.ts. Catégorie absente = aucune paie pour elle. */
   SALARY_RATES: Record<string, number>;
-  /** $ par unité, par item vendu — override de `SALARY_RATES['vente']` pour cet item précis (voir `/config salaire set item:` et `computeSalaire` dans quotas.ts). Item absent = taux général "vente" appliqué. */
+  /** $ par unité, par item vendu — remplace `SALARY_RATES.vente` pour cet item précis (voir `/config salaire ... item:`). Vide pour la grande majorité des guildes : ne JAMAIS relire `Transaction` en détail par item si cette map est vide (voir `quotas.getVenteByItemMap`). */
   ITEM_SALARY_RATES: Record<string, number>;
-  /** Barèmes de paie progressifs de la catégorie "vente" (`/config palier`) — `general` pour toutes les drogues, `byItem` pour une drogue précise. Chaque tableau est trié par `upTo` croissant, tranche finale (`upTo` null) en dernier. Priorité par item : palier item > taux item > palier général > taux général (voir `computeVentePay` dans quotas.ts). */
+  /** Paliers de paie progressifs pour la vente de drogue (voir `/config palier`, `quotas.computeVentePay`) — chaque tranche payée à son propre taux, sommées (barème, pas un seuil qui repaierait toute la quantité au dernier taux atteint). `general` prime sur `SALARY_RATES.vente` s'il est non vide ; une entrée de `byItem[nomItem]` prime sur `general` ET sur `ITEM_SALARY_RATES[nomItem]` pour cet item précis. Chaque tableau est trié par `upTo` croissant, la dernière tranche ayant `upTo: null` (sans limite) — vide si aucun palier configuré pour cette cible (repli sur le taux plat). */
   VENTE_PALIERS: { general: SalaryTierEntry[]; byItem: Record<string, SalaryTierEntry[]> };
-  /** Points par unité, par catégorie de quota — voir `/config classement` et `computeClassement` dans quotas.ts. Catégorie absente = aucun point pour elle. */
+  /** Points de classement (entiers), par catégorie de quota — voir `/config classement` et `computeClassement` dans quotas.ts. Totalement indépendant de SALARY_RATES : un item/activité peut avoir un taux de paie, des points, les deux, ou aucun. */
   CLASSEMENT_RATES: Record<string, number>;
-  /** Points par déclaration, par activité de la famille "actions" — override de `CLASSEMENT_RATES['actions']` pour cette activité précise (voir `/config classement set activite:`). Activité absente = nombre général "actions" appliqué. */
+  /** Points de classement par activité de la catégorie "actions" — remplace `CLASSEMENT_RATES.actions` pour cette activité précise (voir `/config classement ... activite:`). */
   ACTIVITY_CLASSEMENT_RATES: Record<string, number>;
   /** Tier courant — voir `/config type-groupe` et {@link DEFAULT_GROUP_TIER}. */
   TYPE_GROUPE: GroupTier;
-}
-
-/** Une tranche de barème de paie : payée `amount` $/unité entre la borne de la tranche précédente et `upTo` (null = sans limite). */
-export interface SalaryTierEntry {
-  upTo: number | null;
-  amount: number;
 }
 
 /** Un cache `BotConfig` par guilde — jamais de config globale unique (voir docstring de fichier). */
@@ -235,18 +239,17 @@ export async function reload(guildId: string): Promise<BotConfig> {
   const LABO_ITEMS: string[] = [];
   const MATERIAL_ITEMS: string[] = [];
   for (const it of items) {
-    ITEMS_BY_NAME[it.name] = it;
+    ITEMS_BY_NAME[it.name] = it as ItemConfig;
     ALLOWED_ITEMS.push(it.name);
     if (it.stockGroup) (STOCK_GROUPS[it.stockGroup] ??= []).push(it.name);
-    // Un item lié à un labo en tant que 'produit' (`laboLie`/`laboLieRole`)
-    // n'est vendable en PNJ que si CE tier ne peut pas produire cette drogue
-    // lui-même — voir LABO_TIERS. Un item sans lien reste vendable dès que
-    // `vente` est vrai, quel que soit le tier. `produitParLabo` et
-    // l'exclusion de VENTE_ITEMS sont l'exact complément l'un de l'autre :
-    // une drogue est soit vendable en PNJ, soit en production interne pour ce
-    // tier, jamais les deux à la fois. Un lien 'materiau' (matière première
-    // consommée par le labo, pas la drogue produite) n'a lui aucun effet sur
-    // vente_pnj — il alimente uniquement MATERIAL_ITEMS.
+    // Un item lié à un labo (`laboLie`) n'est vendable en PNJ que si CE tier
+    // ne peut pas produire cette drogue lui-même — voir LABO_TIERS. Un item
+    // sans lien reste vendable dès que `vente` est vrai, quel que soit le tier.
+    // `produitParLabo` et l'exclusion de VENTE_ITEMS sont l'exact complément
+    // l'un de l'autre pour un item de rôle 'produit' : une drogue est soit
+    // vendable en PNJ, soit en production interne pour ce tier, jamais les
+    // deux à la fois. Un item de rôle 'materiau' n'affecte jamais la vente
+    // PNJ (il sert juste à catégoriser l'affichage du stock).
     const laboActif = !!it.laboLie && (LABO_TIERS[it.laboLie]?.includes(TYPE_GROUPE) ?? false);
     const produitParLabo = laboActif && it.laboLieRole === 'produit';
     const materiauActif = laboActif && it.laboLieRole === 'materiau';
@@ -284,13 +287,15 @@ export async function reload(guildId: string): Promise<BotConfig> {
   const ITEM_SALARY_RATES: Record<string, number> = {};
   for (const row of await db.getAllItemSalaryRates(guildId)) ITEM_SALARY_RATES[row.item] = row.amount;
 
-  // getAllSalaryTiers trie déjà par borne croissante, tranche finale en dernier.
-  const VENTE_PALIERS: BotConfig['VENTE_PALIERS'] = { general: [], byItem: {} };
+  const VENTE_PALIERS: { general: SalaryTierEntry[]; byItem: Record<string, SalaryTierEntry[]> } = { general: [], byItem: {} };
   for (const row of await db.getAllSalaryTiers(guildId)) {
-    const entry = { upTo: row.upTo, amount: row.amount };
-    if (row.item == null) VENTE_PALIERS.general.push(entry);
+    const entry: SalaryTierEntry = { upTo: row.upTo, amount: row.amount };
+    if (row.item === null) VENTE_PALIERS.general.push(entry);
     else (VENTE_PALIERS.byItem[row.item] ??= []).push(entry);
   }
+  const byUpTo = (a: SalaryTierEntry, b: SalaryTierEntry) => (a.upTo ?? Infinity) - (b.upTo ?? Infinity);
+  VENTE_PALIERS.general.sort(byUpTo);
+  for (const item in VENTE_PALIERS.byItem) VENTE_PALIERS.byItem[item].sort(byUpTo);
 
   const CLASSEMENT_RATES: Record<string, number> = {};
   for (const row of await db.getAllClassementRates(guildId)) CLASSEMENT_RATES[row.quotaType] = row.amount;
@@ -312,6 +317,7 @@ export async function reload(guildId: string): Promise<BotConfig> {
     ACTIVITY_TYPES,
     QUOTA_TARGETS,
     ADMIN_ROLE_ID: rolesByTarget.admin ?? null,
+    MEMBER_ROLE_ID: rolesByTarget.membre ?? null,
     TAXES_ROLE_ID: rolesByTarget.taxes ?? null,
     SALARY_RATES,
     ITEM_SALARY_RATES,
@@ -347,9 +353,12 @@ export async function reloadAll(guildIds: string[]): Promise<void> {
  * répété à la main dans chaque handler de `/config`.
  */
 export async function mutate<T>(guildId: string, fn: () => Promise<T>): Promise<T> {
-  const result = await fn();
-  await reload(guildId);
-  return result;
+  try {
+    return await fn();
+  } finally {
+    // Même en cas d'échec : une écriture partielle doit être visible, pas masquée par un cache périmé.
+    await reload(guildId);
+  }
 }
 
 /**
@@ -364,7 +373,30 @@ export function get(guildId: string): BotConfig {
   return config;
 }
 
+/** Vrai si la config de cette guilde est chargée — un événement Discord peut arriver pour une guilde dont le `reload()` n'a pas encore eu lieu (démarrage, `guildCreate` en cours), où `get()` lèverait. */
+export function has(guildId: string): boolean {
+  return cache.has(guildId);
+}
+
 /** Retire une guilde du cache (voir `guildDelete` dans src/index.ts) — ses données restent en base, seul le cache en mémoire est vidé. */
 export function remove(guildId: string): void {
   cache.delete(guildId);
+}
+
+/**
+ * Salons `logs_coffres`/`logs_coffres_admin` surveillés — les deux listes sont
+ * traitées de façon identique ici, `logs_coffres_admin` obtenant en plus le
+ * badge 🛡️ (voir `stocks.logStockToChannel`). Un salon donné n'appartient normalement
+ * qu'à UNE SEULE des deux listes (voir `handleChannel` dans `modules/config.ts`,
+ * qui rejette l'ajout à l'un des deux rôles si déjà présent dans l'autre) —
+ * le `Set` ici est un filet de sécurité pur (ex. données historiques
+ * antérieures à cette règle), pas la garantie principale : sans lui, un salon
+ * cumulant les deux rôles serait traité deux fois par `catchUpMissedMessages`
+ * et `fullResync`, doublant ses mouvements de stock à chaque
+ * redémarrage/`/sync-stock` (`handleMessage`, un simple test d'appartenance,
+ * n'est lui pas affecté par un éventuel cumul).
+ */
+export function coffreChannelIds(guildId: string): string[] {
+  const c = get(guildId).CHANNELS;
+  return [...new Set([...c.logs_coffres, ...c.logs_coffres_admin])];
 }

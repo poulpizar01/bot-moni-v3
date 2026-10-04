@@ -30,10 +30,10 @@
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import type { Request, Response, NextFunction } from 'express';
-import type { Client } from 'discord.js';
-import * as configStore from '../config-store';
+import type { Client, GuildMember } from 'discord.js';
 import * as guildRegistry from '../guild-registry';
-import { isAdmin } from '../permissions';
+import * as configStore from '../config-store';
+import { isAdmin, hasApiAccess } from '../permissions';
 
 const API_JWT_SECRET = process.env.API_JWT_SECRET;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
@@ -42,6 +42,13 @@ const API_BASE_URL = process.env.API_BASE_URL;
 /** Durée de validité d'un token émis — l'utilisateur doit se reconnecter via Discord après ça (pas de refresh token : simplicité, API en lecture seule). */
 const API_TOKEN_TTL = '7d';
 
+/** Valeur de `.env.example`, refusée telle quelle par `assertAuthEnv`. */
+const JWT_SECRET_PLACEHOLDER = 'change_me_to_a_long_random_string';
+const JWT_SECRET_MIN_LENGTH = 32;
+
+/** Format d'un identifiant Discord (snowflake). */
+const SNOWFLAKE = /^\d{17,20}$/;
+
 /** Nom du cookie court-terme (anti-CSRF) posé par `/auth/login`, vérifié puis effacé par `/auth/callback`. */
 const STATE_COOKIE = 'oauth_state';
 
@@ -49,6 +56,7 @@ export interface ApiUser {
   id: string;
   username: string;
   isAdmin: boolean;
+  /** Rôle taxes (`/config role set taxes`) ou admin — lu par le site externe (famillemoni.com) et exigé par `/api/taxes`, voir `requireTaxesAccess`. */
   isTaxes: boolean;
   /** Guilde à laquelle ce token donne accès — chaque route API doit filtrer ses requêtes `db.*` par CETTE valeur, jamais une autre (voir src/api/routes/*.ts). */
   guildId: string;
@@ -80,6 +88,22 @@ export function assertAuthEnv(): void {
   if (missing.length) {
     throw new Error(`[api/auth] Variable(s) d'environnement manquante(s) : ${missing.join(', ')} (voir .env.example)`);
   }
+  // Toute l'isolation entre guildes repose sur ce secret : un secret devinable
+  // permet de forger un token avec l'ID Discord (public) d'un vrai admin et le
+  // guildId de n'importe quelle guilde, et requireAuth l'accepterait.
+  const secret = process.env.API_JWT_SECRET!;
+  if (secret === JWT_SECRET_PLACEHOLDER || secret.length < JWT_SECRET_MIN_LENGTH) {
+    throw new Error(
+      `[api/auth] API_JWT_SECRET trop faible (valeur d'exemple ou moins de ${JWT_SECRET_MIN_LENGTH} caractères). ` +
+      'En générer un avec : openssl rand -hex 32',
+    );
+  }
+  // En clair, le code OAuth et le cookie anti-CSRF (sans `secure`) circuleraient lisibles sur le réseau.
+  const base = new URL(process.env.API_BASE_URL!);
+  const local = base.hostname === 'localhost' || base.hostname === '127.0.0.1';
+  if (base.protocol !== 'https:' && !local) {
+    throw new Error('[api/auth] API_BASE_URL doit être en https:// (http:// seulement pour localhost en développement).');
+  }
 }
 
 /**
@@ -89,7 +113,8 @@ export function assertAuthEnv(): void {
  * dans `handleCallback`), puis redirige vers Discord.
  */
 export async function handleLogin(req: Request, res: Response): Promise<void> {
-  const guildId = req.query.guild as string | undefined;
+  // `?guild=a&guild=b` donne un tableau : traité comme absent plutôt que passé tel quel à la base (erreur 500)
+  const guildId = typeof req.query.guild === 'string' && SNOWFLAKE.test(req.query.guild) ? req.query.guild : undefined;
   if (!guildId) {
     res.status(400).send('Paramètre ?guild= manquant ou invalide — cette guilde n\'a jamais invité le bot.');
     return;
@@ -126,7 +151,8 @@ export async function handleLogin(req: Request, res: Response): Promise<void> {
  */
 export function handleCallback(client: Client): (req: Request, res: Response) => Promise<void> {
   return async (req, res) => {
-    const stateParam = req.query.state as string | undefined;
+    // Paramètre répété (`?state=a&state=b`) : un tableau, traité comme absent.
+    const stateParam = typeof req.query.state === 'string' ? req.query.state : undefined;
     const stateCookie = readCookie(req, STATE_COOKIE);
     res.clearCookie(STATE_COOKIE);
 
@@ -142,7 +168,7 @@ export function handleCallback(client: Client): (req: Request, res: Response) =>
       return;
     }
 
-    const authCode = req.query.code as string | undefined;
+    const authCode = typeof req.query.code === 'string' ? req.query.code : undefined;
     if (!authCode) {
       res.status(400).send('Code OAuth manquant.');
       return;
@@ -190,13 +216,17 @@ export function handleCallback(client: Client): (req: Request, res: Response) =>
         res.status(403).send('Tu n\'es pas membre du serveur Discord de cette organisation.');
         return;
       }
+      // Pas de token sans le rôle membre (quand il est configuré) : voir `permissions.hasApiAccess`.
+      if (!hasApiAccess(guildId, member)) {
+        res.status(403).send('Il te manque le rôle requis sur le serveur Discord de cette organisation pour accéder à ces données.');
+        return;
+      }
 
       const admin = isAdmin(guildId, member);
-      const taxesRoleId = configStore.get(guildId).TAXES_ROLE_ID;
-      const taxes = admin || (!!taxesRoleId && member.roles.cache.has(taxesRoleId));
+      const taxes = hasTaxesAccess(guildId, member, admin);
 
       const user: ApiUser = { id: me.id, username: me.username, isAdmin: admin, isTaxes: taxes, guildId };
-      const token = jwt.sign(user, API_JWT_SECRET!, { expiresIn: API_TOKEN_TTL });
+      const token = jwt.sign(user, API_JWT_SECRET!, { expiresIn: API_TOKEN_TTL, algorithm: 'HS256' });
 
       const frontendUrl = await guildRegistry.getGuildFrontendUrl(guildId);
       if (!frontendUrl) {
@@ -218,7 +248,7 @@ export function handleCallback(client: Client): (req: Request, res: Response) =>
  * `/config site-externe remove` ou un retrait du bot resterait valable
  * jusqu'à expiration (7 jours), à l'encontre du message affiché à l'admin.
  *
- * Les droits (`isAdmin`/`isTaxes`) et l'appartenance à la guilde sont
+ * Les droits (`isAdmin`/`isTaxes`), le rôle membre (`hasApiAccess`) et l'appartenance à la guilde sont
  * RE-RÉSOLUS À CHAQUE REQUÊTE depuis le client du bot (`guild.members`,
  * tenu à jour par l'intent `GuildMembers`) plutôt que lus tels quels dans le
  * token : sans ça, un membre dont on retire le rôle taxes/admin (ou qui est
@@ -239,7 +269,10 @@ export function requireAuth(client: Client): (req: Request, res: Response, next:
     }
     let claims: ApiUser;
     try {
-      claims = jwt.verify(token, API_JWT_SECRET!) as ApiUser;
+      // `algorithms` explicite : durcissement défensif contre une confusion
+      // d'algorithme (même si non exploitable ici, secret purement symétrique
+      // et jsonwebtoken v9 refuse déjà `alg: none` avec un secret fourni).
+      claims = jwt.verify(token, API_JWT_SECRET!, { algorithms: ['HS256'] }) as ApiUser;
     } catch {
       res.status(401).json({ error: 'Token invalide ou expiré — reconnecte-toi via /auth/login.' });
       return;
@@ -259,16 +292,26 @@ export function requireAuth(client: Client): (req: Request, res: Response, next:
       res.status(403).json({ error: "Tu n'es plus membre du serveur Discord de cette organisation." });
       return;
     }
+    // Rôle membre revérifié à chaque requête, comme le rôle admin : le retirer coupe l'accès aussitôt, sans attendre l'expiration du token.
+    if (!hasApiAccess(claims.guildId, member)) {
+      res.status(403).json({ error: 'Il te manque le rôle requis sur le serveur Discord de cette organisation.' });
+      return;
+    }
     const admin = isAdmin(claims.guildId, member);
-    const taxesRoleId = configStore.get(claims.guildId).TAXES_ROLE_ID;
-    const taxes = admin || (!!taxesRoleId && member.roles.cache.has(taxesRoleId));
+    const taxes = hasTaxesAccess(claims.guildId, member, admin);
 
     req.apiUser = { id: claims.id, username: member.user.username, isAdmin: admin, isTaxes: taxes, guildId: claims.guildId };
     next();
   };
 }
 
-/** Middleware à chaîner après `requireAuth` : exige en plus l'accès "taxes" (rôle `TAXES_ROLE_ID` ou admin — même règle que `isAdmin()` partout ailleurs dans le bot). */
+/** Rôle `TAXES_ROLE_ID` ou admin — même règle que `isAdmin()` partout ailleurs dans le bot. */
+function hasTaxesAccess(guildId: string, member: GuildMember, admin: boolean): boolean {
+  const taxesRoleId = configStore.get(guildId).TAXES_ROLE_ID;
+  return admin || (!!taxesRoleId && member.roles.cache.has(taxesRoleId));
+}
+
+/** Middleware à chaîner après `requireAuth` : exige en plus l'accès "taxes" (rôle `TAXES_ROLE_ID` ou admin). */
 export function requireTaxesAccess(req: Request, res: Response, next: NextFunction): void {
   if (!req.apiUser?.isTaxes) {
     res.status(403).json({ error: 'Accès réservé au rôle taxes (ou admin).' });

@@ -9,23 +9,21 @@
  * libellé affiché.
  *
  * Un message permanent dans le salon `armurerie` expose : Ajouter, Perdu,
- * Prêter, Rendu, Liste des Pertes, Détail par type, et — uniquement si le
- * tier courant fabrique un type de munition (voir
- * {@link getMunitionsFabricationType} : Petite Frappe → pistolet, Gang →
- * SMG, aucun pour Indépendant/Organisation) — deux déclarations indicatives :
- * Fabrication (plafond hebdomadaire fixe ci-dessous) et Vente (juste un
- * total suivi, sans plafond) — Historique.
- *
- * Le panneau PERMANENT n'affiche qu'un résumé (nombre d'armes par type) —
- * jamais le détail arme par arme, qui pourrait dépasser à lui seul la
- * limite Discord de 4096 caractères par description d'embed une fois assez
- * d'armes enregistrées (l'update échouerait alors en silence, panneau figé
- * sur l'ancienne liste). Le détail complet reste consultable via le bouton
- * Détail par type, en réponse éphémère (voir {@link buildArmesDetailEmbeds}).
+ * Prêter, Rendu, Liste des Pertes, Détail par type, et deux déclarations
+ * indicatives de munitions — Fabrication (plafond hebdomadaire fixe
+ * ci-dessous) et Vente (juste un total suivi, sans plafond) — Historique.
  *
  * Le stock réel de munitions affiché en tête de ce message vient de
  * `/config item add` comme n'importe quel item de coffre — voir
  * {@link MUNITIONS_STOCK_GROUP} pour l'associer au bon libellé de groupe.
+ *
+ * Le panneau permanent n'affiche que des COMPTES par type d'arme (voir
+ * `buildArmurierieEmbed`), pas le détail arme par arme — sorti dans une vue
+ * éphémère (bouton "🗂️ Détail par type", `buildArmesDetailEmbeds`) car une
+ * liste qui grossit sans borne (une arme = une ligne, jamais purgée) finit
+ * par dépasser le seuil de rendu d'un embed Discord — voir
+ * src/embed-chunks.ts pour le détail de cette limite (pas seulement les
+ * 4096 caractères documentés officiellement).
  */
 import {
   EmbedBuilder,
@@ -36,7 +34,6 @@ import {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
-  MessageFlags,
   type Client,
   type ButtonInteraction,
   type StringSelectMenuInteraction,
@@ -45,18 +42,29 @@ import {
 import * as db from '../db';
 import * as configStore from '../config-store';
 import { replyAutoDelete, updateAutoDelete } from '../interaction-helpers';
+import { buildChunkedEmbeds } from '../embed-chunks';
+import { upsertPanel } from '../permanent-message';
+import { parseEntier, parseMontant } from '../parse';
+
+/** Plafonds d'une saisie de munitions — au-delà, c'est une faute de frappe (les compteurs sont indicatifs, voir CLAUDE.md). */
+const MAX_MUNITIONS_SAISIE = 100_000;
+const MAX_PRIX_MUNITIONS = 100_000_000;
+
+const ARMURERIE_PANEL_TITLE = '🔫 Armurerie';
 
 /**
  * Types d'armes proposés à l'ajout — liste fixe (voir docstring de fichier).
  * Chaque modèle est son propre type (pas de regroupement par catégorie
  * d'arme) : c'est ce qui détermine le groupement par section dans l'embed
- * armurerie (voir `buildArmurierieEmbed`). Plus de 25 entrées → l'ajout d'une
- * arme passe par le pattern "modal de recherche avant select" (limite
- * Discord de 25 options par menu, voir `handleButton`/`handleModal`).
- * `category` est purement informatif (exposé par `GET /api/armurerie/types`)
- * — l'embed continue de grouper par `key`, jamais par catégorie.
+ * armurerie (voir `buildArmurierieEmbed`). `category` n'est qu'un libellé
+ * informatif (exposé via `/api/armurerie/types` pour le site externe) — le
+ * groupement affiché dans l'embed reste par `key`/`label` individuel, jamais
+ * recalculé depuis `category`. Plus de 25 entrées → l'ajout d'une arme passe
+ * par le pattern "modal de recherche avant select" (limite Discord de 25
+ * options par menu, voir `handleButton`/`handleModal`).
  */
 const ARME_TYPES: Array<{ key: string; label: string; category: string }> = [
+  // Armes de poing
   { key: 'pistolet_artisanal', label: 'Pistolet artisanal', category: 'Armes de poing' },
   { key: 'sns', label: 'SNS', category: 'Armes de poing' },
   { key: 'sns_pico', label: 'SNS PICO', category: 'Armes de poing' },
@@ -70,11 +78,13 @@ const ARME_TYPES: Array<{ key: string; label: string; category: string }> = [
   { key: 'berreta_mk2', label: 'Berreta (Pistolet MK2)', category: 'Armes de poing' },
   { key: 'pistolet_lourd', label: 'Pistolet Lourd', category: 'Armes de poing' },
   { key: 'revolver', label: 'Revolver', category: 'Armes de poing' },
+  // Fusils à pompe
   { key: 'fusil_a_canon_scie', label: 'Fusil à canon scié', category: 'Fusils à pompe' },
   { key: 'fusil_a_pompe', label: 'Fusil à pompe', category: 'Fusils à pompe' },
   { key: 'striker_12', label: 'Striker 12', category: 'Fusils à pompe' },
   { key: 'fusil_a_pompe_dassaut', label: "Fusil à pompe d'assaut", category: 'Fusils à pompe' },
   { key: 'fusil_a_double_canon', label: 'Fusil à double canon', category: 'Fusils à pompe' },
+  // Armes automatiques
   { key: 'mini_smg', label: 'Mini SMG', category: 'Armes automatiques' },
   { key: 'micro_smg', label: 'Micro SMG', category: 'Armes automatiques' },
   { key: 'tec9', label: 'TEC9', category: 'Armes automatiques' },
@@ -84,6 +94,7 @@ const ARME_TYPES: Array<{ key: string; label: string; category: string }> = [
   { key: 'mitraillette_tactique', label: 'Mitraillette Tactique', category: 'Armes automatiques' },
   { key: 'vesper_9', label: 'Vesper 9', category: 'Armes automatiques' },
   { key: 'vortex_smg', label: 'Vortex SMG', category: 'Armes automatiques' },
+  // Armes lourdes
   { key: 'fusil_compact', label: 'Fusil compact', category: 'Armes lourdes' },
   { key: 'ump_45', label: 'UMP 45', category: 'Armes lourdes' },
   { key: 'sg552', label: 'SG552', category: 'Armes lourdes' },
@@ -95,8 +106,8 @@ const ARME_TYPES: Array<{ key: string; label: string; category: string }> = [
   { key: 'ar_7', label: 'AR 7', category: 'Armes lourdes' },
 ];
 
-/** Référentiel des types d'armes pour l'API — évite à un client de recopier {@link ARME_TYPES} en dur. */
-export function getArmeTypes() {
+/** Types d'armes, dans l'ordre défini — voir `/api/armurerie/types`. */
+export function getArmeTypes(): ReadonlyArray<{ key: string; label: string; category: string }> {
   return ARME_TYPES;
 }
 
@@ -143,25 +154,26 @@ export function weightedStockSum(items: string[], stockByItem: Record<string, nu
 async function getMunitionsStock(guildId: string): Promise<number> {
   const c = configStore.get(guildId);
   const items = c.STOCK_GROUPS[MUNITIONS_STOCK_GROUP] ?? [];
-  const stockByItem = await db.getStocksByItems(guildId, items);
+  const stockByItem = await db.getStocksByItems(guildId, items, configStore.coffreChannelIds(guildId));
   return weightedStockSum(items, stockByItem, c.ITEMS_BY_NAME);
 }
 
-/** Nom exact de l'item de munitions SMG (voir piège n°1, docstring de `default-items.ts`) — contrairement à {@link MUNITIONS_STOCK_GROUP}, juste un stock affiché tel quel, sans regroupement pondéré (pas de "boîte" de SMG à ce jour). */
+/**
+ * Nom exact de l'item de munitions SMG (voir piège n°1, docstring de
+ * `default-items.ts`) — contrairement à {@link MUNITIONS_STOCK_GROUP}, juste
+ * un stock affiché tel quel dans l'armurerie, sans quota de fabrication ni
+ * compteur de vente hebdomadaire (pas demandé pour ce calibre).
+ */
 export const MUNITIONS_SMG_ITEM = 'Munition de SMG';
 
+/**
+ * Calibre que le tier courant peut FABRIQUER (déclaration indicative avec
+ * quota hebdomadaire) — `null` si aucun. Le stock des deux calibres reste
+ * toujours affiché (voir {@link MUNITIONS_STOCK_GROUP}/{@link MUNITIONS_SMG_ITEM}),
+ * seule la fabrication/vente est limitée à un type à la fois par tier.
+ */
 export type MunitionsFabricationType = 'pistolet' | 'smg';
 
-/**
- * Type de munition dont la fabrication/vente est suivie (boutons dédiés +
- * quota hebdomadaire), selon le tier — `null` si ce tier n'en fabrique
- * aucune (voir demande utilisateur du 15/09 : Petite Frappe fabrique du
- * pistolet, Gang du SMG, Indépendant/Organisation aucun des deux). Les
- * compteurs hebdomadaires (`fabrication_munitions`/ventes) restent un total
- * générique unique, réutilisé quel que soit le type actif : purement
- * indicatif, un changement de tier en cours de semaine peut mélanger du
- * pistolet et du SMG dans le même total, ce qui est acceptable ici.
- */
 const MUNITIONS_FABRICATION_TIER: Record<configStore.GroupTier, MunitionsFabricationType | null> = {
   independant: null,
   petite_frappe: 'pistolet',
@@ -169,12 +181,10 @@ const MUNITIONS_FABRICATION_TIER: Record<configStore.GroupTier, MunitionsFabrica
   organisation: null,
 };
 
-/** Type de munition fabricable pour le tier courant de cette guilde, ou `null` (voir {@link MUNITIONS_FABRICATION_TIER}). */
 export function getMunitionsFabricationType(guildId: string): MunitionsFabricationType | null {
   return MUNITIONS_FABRICATION_TIER[configStore.get(guildId).TYPE_GROUPE];
 }
 
-/** Libellé affiché pour un {@link MunitionsFabricationType} (titres de modal, confirmations). */
 function munitionsTypeLabel(type: MunitionsFabricationType): string {
   return type === 'pistolet' ? 'Pistolet' : 'SMG';
 }
@@ -183,10 +193,7 @@ function munitionsTypeLabel(type: MunitionsFabricationType): string {
  * Résumé munitions (stock réel + compteurs hebdomadaires indicatifs) —
  * données brutes, pas d'embed. Exportée pour être réutilisée par l'API en
  * lecture seule (voir src/api/routes/armurerie.ts) sans dupliquer cette
- * logique : source unique pour le panneau Discord ET l'API. `fabricationType`
- * indique à quel calibre `fabriqueesCetteSemaine`/`vendusCetteSemaine`/
- * `fabricationQuotaHebdo` s'appliquent actuellement (voir
- * {@link getMunitionsFabricationType}) — `null` si aucun pour ce tier.
+ * logique : source unique pour le panneau Discord ET l'API.
  */
 export async function getMunitionsSummary(guildId: string) {
   const sinceReset = Number((await db.getSetting(guildId, 'last_weekly_reset')) || 0);
@@ -194,10 +201,11 @@ export async function getMunitionsSummary(guildId: string) {
     getMunitionsStock(guildId),
     db.getMunitionsFabriqueesDepuis(guildId, sinceReset),
     db.getMunitionsVenduesDepuis(guildId, sinceReset),
-    db.getStock(guildId, MUNITIONS_SMG_ITEM),
+    db.getStock(guildId, MUNITIONS_SMG_ITEM, configStore.coffreChannelIds(guildId)),
   ]);
   return {
     stock,
+    // Calibre que les compteurs hebdomadaires concernent pour le tier courant — lu par le site externe de cette instance.
     fabricationType: getMunitionsFabricationType(guildId),
     fabriqueesCetteSemaine,
     fabricationQuotaHebdo: MUNITIONS_FABRICATION_QUOTA_HEBDO,
@@ -258,36 +266,44 @@ function comparerNomsNaturel(a: { nom: string }, b: { nom: string }): number {
 
 type Arme = Awaited<ReturnType<typeof db.getAllArmes>>[number];
 
-/** Regroupe les armes par type (voir ARME_TYPES), triées naturellement — logique partagée entre le résumé du panneau et le détail complet, pour ne jamais diverger. */
-function groupArmesByType(armes: Arme[]): { parType: Map<string, Arme[]>; sansType: Arme[] } {
-  const parType = new Map<string, Arme[]>();
-  for (const t of ARME_TYPES) parType.set(t.key, []);
+/** Groupe des armes par type (voir ARME_TYPES), triées naturellement au sein de chaque groupe — partagé par le résumé du panneau et le détail par type. */
+function groupArmesByType(armes: Arme[]): { groupes: Map<string, Arme[]>; sansType: Arme[] } {
+  const groupes = new Map<string, Arme[]>();
+  for (const t of ARME_TYPES) groupes.set(t.key, []);
   const sansType: Arme[] = [];
 
   for (const a of armes) {
-    if (a.type && parType.has(a.type)) {
-      parType.get(a.type)!.push(a);
+    if (a.type && groupes.has(a.type)) {
+      groupes.get(a.type)!.push(a);
     } else {
       sansType.push(a);
     }
   }
-  for (const liste of parType.values()) liste.sort(comparerNomsNaturel);
+  for (const liste of groupes.values()) liste.sort(comparerNomsNaturel);
   sansType.sort(comparerNomsNaturel);
 
-  return { parType, sansType };
+  return { groupes, sansType };
 }
 
 /**
- * Construit l'embed PERMANENT de l'armurerie : bloc munitions (stock +
- * quotas indicatifs), puis un résumé du nombre d'armes par type (voir
- * ARME_TYPES) — jamais le détail arme par arme (voir docstring de fichier).
- * Le résumé ne peut jamais déborder la limite Discord de 4096 caractères :
- * son nombre de lignes est borné par ARME_TYPES, une liste fixe.
+ * Construit l'embed du panneau permanent : bloc munitions (stock + quotas
+ * indicatifs), puis un COMPTE par type d'arme (pas le détail arme par arme —
+ * voir {@link buildArmesDetailEmbeds}, sorti du panneau via le bouton
+ * "🗂️ Détail par type"). Une description d'embed est plafonnée à 4096
+ * caractères ET, moins connu, à un nombre de lignes avant troncature
+ * silencieuse côté client (~80 lignes constatées empiriquement, aucun seuil
+ * documenté par Discord — voir src/embed-chunks.ts) : un panneau PERMANENT
+ * (édité en place, jamais reposté) ne peut pas se permettre de dépendre du
+ * nombre d'armes enregistrées, qui grossit sans borne avec le temps.
  */
 async function buildArmurierieEmbed(guildId: string, armes: Arme[]): Promise<EmbedBuilder> {
-  const embed = new EmbedBuilder().setTitle('🔫 Armurerie').setColor(0xFEE75C).setTimestamp().setFooter({ text: 'Mis à jour' });
+  const embed = new EmbedBuilder().setTitle(ARMURERIE_PANEL_TITLE).setColor(0xFEE75C).setTimestamp().setFooter({ text: 'Mis à jour' });
 
-  const { stock, fabricationType, fabriqueesCetteSemaine, vendusCetteSemaine, stockSmg } = await getMunitionsSummary(guildId);
+  const { stock, fabriqueesCetteSemaine, vendusCetteSemaine, stockSmg } = await getMunitionsSummary(guildId);
+  const fabricationType = getMunitionsFabricationType(guildId);
+  // Le calibre fabricable par le tier courant affiche stock + compteurs
+  // hebdomadaires ; l'autre reste visible mais avec juste le stock brut (pas
+  // de quota fabrication/vente pour un calibre que ce tier ne fabrique pas).
   const quotaLines = (type: MunitionsFabricationType) => fabricationType === type
     ? `\n🛠️ ${fabriqueesCetteSemaine} / ${MUNITIONS_FABRICATION_QUOTA_HEBDO} fabriquées cette semaine\n💰 ${vendusCetteSemaine} vendues cette semaine`
     : '';
@@ -301,122 +317,47 @@ async function buildArmurierieEmbed(guildId: string, armes: Arme[]): Promise<Emb
     return embed;
   }
 
-  const { parType, sansType } = groupArmesByType(armes);
-  const resume = ARME_TYPES
-    .filter(t => parType.get(t.key)!.length)
-    .map(t => `${t.label} : ${parType.get(t.key)!.length}`);
-  if (sansType.length) resume.push(`Sans type : ${sansType.length}`);
-  blocs.push(`__Armes enregistrées__ (voir 📋 Détail par type)\n${resume.join('\n')}`);
+  const { groupes, sansType } = groupArmesByType(armes);
+  const countLines: string[] = [];
+  for (const t of ARME_TYPES) {
+    const liste = groupes.get(t.key)!;
+    if (liste.length) countLines.push(`**${t.label}** : ${liste.length}`);
+  }
+  if (sansType.length) countLines.push(`**Sans type** : ${sansType.length}`);
+
+  blocs.push(`__Armes en stock (${armes.length}) — voir 🗂️ Détail par type__\n${countLines.join('\n')}`);
 
   embed.setDescription(blocs.join('\n\n'));
   return embed;
 }
 
 /**
- * Construit le détail arme par arme, groupé par type — même regroupement et
- * même présentation que l'ancien embed permanent (`__Type__` suivi de ses
- * armes triées), déporté ici derrière le bouton "Détail par type" pour ne
- * jamais dépasser la limite Discord de 4096 caractères par description.
- *
- * Deux budgets s'appliquent à chaque embed, PAS un seul : un budget de
- * caractères (~3900) ET un budget de lignes ({@link MAX_LIGNES_PAR_EMBED}).
- * Le budget de lignes n'est pas documenté par Discord — repéré en pratique
- * (bug remonté par l'utilisateur) : un embed de 2487 caractères/83 lignes
- * (bien sous les 4096 caractères officiels) se faisait tronquer à l'écran
- * après la ~81e ligne, identiquement sur desktop, web et mobile, alors que
- * `interaction.fetchReply()` confirmait que Discord avait bien stocké la
- * description complète — donc une limite de RENDU côté client, pas une
- * limite de longueur côté API. D'où une marge de sécurité (70) sous le point
- * de rupture observé (~81), plutôt que de coller au plus près d'un seuil
- * qu'on ne connaît que par un seul cas de figure.
- *
- * Un type est d'abord découpé en un ou plusieurs "blocs" tenant chacun dans
- * ces deux budgets, en réinsérant son en-tête `__Type__` à chaque coupure —
- * seul un type à lui seul assez gros pour déborder produit plusieurs blocs ;
- * dans l'immense majorité des cas (un type qui tient dans les deux budgets),
- * ça ne change rien de visible. Ces blocs sont ensuite empaquetés dans des
- * embeds (même pattern de découpe que /quotas, voir `handleListQuotaCommand`
- * dans quotas.ts), eux-mêmes plafonnés à 10 (limite Discord par message) —
- * au-delà, tronque et signale le nombre d'armes non affichées plutôt que de
- * laisser l'envoi planter.
+ * Détail complet des armes, groupées par type, en réponse au bouton
+ * "🗂️ Détail par type" — voir docstring de {@link buildArmurierieEmbed} pour
+ * pourquoi ce détail est sorti du panneau permanent plutôt que d'y grossir
+ * sans borne.
  */
 function buildArmesDetailEmbeds(armes: Arme[]): EmbedBuilder[] {
-  const TITRE = '🔫 Détail des armes par type';
-  if (!armes.length) {
-    return [new EmbedBuilder().setTitle(TITRE).setColor(0xFEE75C).setDescription('*Aucune arme enregistrée*')];
-  }
-
-  const { parType, sansType } = groupArmesByType(armes);
+  const { groupes, sansType } = groupArmesByType(armes);
   const ligneArme = (a: Arme) => `**${a.nom}** \`${a.reference}\` — ${statutLabel(a)}`;
-  const BUDGET = 3900;
-  const MAX_LIGNES_PAR_EMBED = 70;
 
-  const splitSection = (label: string, lignes: string[]): string[] => {
-    const header = `__${label}__`;
-    const pieces: string[] = [];
-    let piece = header;
-    let pieceLignes = 1;
-    for (const ligne of lignes) {
-      const candidate = `${piece}\n${ligne}`;
-      if (candidate.length > BUDGET || pieceLignes + 1 > MAX_LIGNES_PAR_EMBED) {
-        pieces.push(piece);
-        piece = `${header}\n${ligne}`;
-        pieceLignes = 2;
-      } else {
-        piece = candidate;
-        pieceLignes += 1;
-      }
-    }
-    pieces.push(piece);
-    return pieces;
-  };
-
-  const blocs: string[] = [];
+  const sections = [];
   for (const t of ARME_TYPES) {
-    const liste = parType.get(t.key)!;
-    if (liste.length) blocs.push(...splitSection(t.label, liste.map(ligneArme)));
+    const liste = groupes.get(t.key)!;
+    if (liste.length) sections.push({ header: `__${t.label}__`, lines: liste.map(ligneArme) });
   }
-  if (sansType.length) blocs.push(...splitSection('Sans type', sansType.map(ligneArme)));
+  if (sansType.length) sections.push({ header: '__Sans type__', lines: sansType.map(ligneArme) });
 
-  const chunks: string[][] = [];
-  let current: string[] = [];
-  let currentLignes = 0;
-  for (const bloc of blocs) {
-    const blocLignes = bloc.split('\n').length;
-    const candidateLen = current.length ? current.join('\n\n').length + 2 + bloc.length : bloc.length;
-    const candidateLignes = currentLignes + blocLignes;
-    if (current.length && (candidateLen > BUDGET || candidateLignes > MAX_LIGNES_PAR_EMBED)) {
-      chunks.push(current);
-      current = [bloc];
-      currentLignes = blocLignes;
-    } else {
-      current.push(bloc);
-      currentLignes = candidateLignes;
-    }
-  }
-  if (current.length) chunks.push(current);
-
-  const totalChunks = chunks.length;
-  const capped = chunks.slice(0, 10);
-  if (totalChunks > 10) {
-    const affichees = capped.reduce((n, c) => n + c.reduce((m, b) => m + b.split('\n').filter(l => l.startsWith('**')).length, 0), 0);
-    capped[capped.length - 1].push(`*+${armes.length - affichees} armes non affichées — affine ta recherche*`);
-  }
-
-  return capped.map((chunk, i) => new EmbedBuilder()
-    .setTitle(i === 0 ? TITRE : null)
-    .setColor(0xFEE75C)
-    .setDescription(chunk.join('\n\n')));
+  return buildChunkedEmbeds(sections, {
+    title: '🗂️ Détail des armes par type',
+    color: 0xFEE75C,
+    emptyDescription: '*Aucune arme enregistrée*',
+  });
 }
 
 // ─── BOUTONS PRINCIPAUX ───────────────────────────────────────────────────────
 
-/**
- * Construit les rangées de boutons du message permanent (actions armes, puis
- * munitions) — la rangée munitions (Fabrication/Vente/Historique) n'est
- * ajoutée que si le tier courant fabrique un type de munition (voir
- * {@link getMunitionsFabricationType}) : absente pour Indépendant/Organisation.
- */
+/** Construit les rangées de boutons du message permanent (actions armes, puis munitions — cette dernière absente si le tier courant n'a aucun calibre fabricable, voir {@link getMunitionsFabricationType}). */
 function buildArmurierieButtons(guildId: string): ActionRowBuilder<ButtonBuilder>[] {
   const rows = [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -426,9 +367,8 @@ function buildArmurierieButtons(guildId: string): ActionRowBuilder<ButtonBuilder
       new ButtonBuilder().setCustomId('arm_rendu').setLabel('Rendu').setStyle(ButtonStyle.Success).setEmoji('✅'),
       new ButtonBuilder().setCustomId('arm_pertes').setLabel('Liste des Pertes').setStyle(ButtonStyle.Secondary).setEmoji('📋'),
     ),
-    // Rangée à part : la première est déjà à son maximum de 5 boutons Discord.
     new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId('arm_detail').setLabel('Détail par type').setStyle(ButtonStyle.Secondary).setEmoji('📋'),
+      new ButtonBuilder().setCustomId('arm_detail').setLabel('Détail par type').setStyle(ButtonStyle.Secondary).setEmoji('🗂️'),
     ),
   ];
   if (getMunitionsFabricationType(guildId)) {
@@ -451,18 +391,10 @@ export async function updatePermanentMessage(client: Client, guildId: string): P
     const channel = await client.channels.fetch(channelId).catch(() => null);
     if (!channel?.isSendable()) return;
 
-    const armes = (await db.getAllArmes(guildId)).filter(a => a.statut !== 'perdue');
-    const embed = await buildArmurierieEmbed(guildId, armes);
-    const rows = buildArmurierieButtons(guildId);
-
-    const storedId = await db.getSetting(guildId, 'armurerie_message_id');
-    if (storedId) {
-      const msg = await channel.messages.fetch(storedId).catch(() => null);
-      if (msg) { await msg.edit({ embeds: [embed], components: rows }); return; }
-    }
-
-    const newMsg = await channel.send({ embeds: [embed], components: rows });
-    await db.setSetting(guildId, 'armurerie_message_id', newMsg.id);
+    await upsertPanel(channel, guildId, 'armurerie_message_id', ARMURERIE_PANEL_TITLE, async () => {
+      const armes = (await db.getAllArmes(guildId)).filter(a => a.statut !== 'perdue');
+      return { embeds: [await buildArmurierieEmbed(guildId, armes)], components: buildArmurierieButtons(guildId) };
+    });
   } catch (err) {
     console.error(`[armurerie] updatePermanentMessage(${guildId}):`, (err as Error).message);
   }
@@ -514,9 +446,6 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
 
   if (id === 'arm_fabrication') {
     const type = getMunitionsFabricationType(guildId);
-    // Garde-fou : bouton normalement absent pour ce tier (voir
-    // buildArmurierieButtons), au cas où un message pas encore rafraîchi
-    // depuis un changement de tier serait encore cliqué.
     if (!type) return replyAutoDelete(interaction, "❌ Aucune fabrication de munitions pour ce type d'organisation.");
     const modal = new ModalBuilder()
       .setCustomId('modal_arm_fabrication')
@@ -532,7 +461,7 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
 
   if (id === 'arm_vente_munitions') {
     const type = getMunitionsFabricationType(guildId);
-    if (!type) return replyAutoDelete(interaction, "❌ Aucune fabrication de munitions pour ce type d'organisation.");
+    if (!type) return replyAutoDelete(interaction, "❌ Aucune vente de munitions pour ce type d'organisation.");
     const modal = new ModalBuilder()
       .setCustomId('modal_arm_vente_munitions')
       .setTitle(`Vente de munitions (${munitionsTypeLabel(type)})`)
@@ -553,20 +482,21 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
     return interaction.showModal(modal);
   }
 
-  if (id === 'arm_detail') {
-    const armes = (await db.getAllArmes(guildId)).filter(a => a.statut !== 'perdue');
-    const embeds = buildArmesDetailEmbeds(armes);
-    await interaction.reply({ embeds, flags: MessageFlags.Ephemeral });
-    return;
+  if (id === 'arm_pertes') {
+    // Jamais purgée : sur un serveur actif de longue date, la liste des
+    // pertes peut dépasser le seuil de rendu Discord (voir buildArmurierieEmbed).
+    const pertes = await db.getArmesPerdue(guildId);
+    const embeds = buildChunkedEmbeds([{ lines: pertes.map(a => `**${a.nom}** \`${a.reference}\``) }], {
+      title: '📋 Armes perdues',
+      color: 0xED4245,
+      emptyDescription: '*Aucune arme perdue*',
+    });
+    return replyAutoDelete(interaction, { embeds });
   }
 
-  if (id === 'arm_pertes') {
-    const pertes = await db.getArmesPerdue(guildId);
-    const embed = new EmbedBuilder()
-      .setTitle('📋 Armes perdues')
-      .setColor(0xED4245)
-      .setDescription(pertes.length ? pertes.map(a => `**${a.nom}** \`${a.reference}\``).join('\n') : '*Aucune arme perdue*');
-    return replyAutoDelete(interaction, { embeds: [embed] });
+  if (id === 'arm_detail') {
+    const armes = (await db.getAllArmes(guildId)).filter(a => a.statut !== 'perdue');
+    return replyAutoDelete(interaction, { embeds: buildArmesDetailEmbeds(armes) });
   }
 
   if (id === 'arm_historique_munitions') {
@@ -671,7 +601,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     const query = interaction.fields.getTextInputValue('recherche').trim().toLowerCase();
     const filtered = query ? ARME_TYPES.filter(t => t.label.toLowerCase().includes(query)) : ARME_TYPES;
 
-    if (!filtered.length) return replyAutoDelete(interaction, `❌ Aucun type d'arme ne correspond à « ${query} ».`);
+    if (!filtered.length) return replyAutoDelete(interaction, { content: `❌ Aucun type d'arme ne correspond à « ${query} ».`, allowedMentions: { parse: [] } });
 
     const select = new StringSelectMenuBuilder()
       .setCustomId('arm_select_ajouter_type')
@@ -728,7 +658,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
       ? cfg.armes.filter(a => a.nom.toLowerCase().includes(query) || a.reference.toLowerCase().includes(query))
       : cfg.armes;
 
-    if (!filtered.length) return replyAutoDelete(interaction, `❌ Aucune arme ne correspond à « ${query} ».`);
+    if (!filtered.length) return replyAutoDelete(interaction, { content: `❌ Aucune arme ne correspond à « ${query} ».`, allowedMentions: { parse: [] } });
 
     const options = filtered.slice(0, 25).map(a => ({
       label: `${a.nom} (${a.reference})`,
@@ -762,7 +692,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
       return replyAutoDelete(interaction, '❌ Cette référence existe déjà.');
     }
 
-    await replyAutoDelete(interaction, `✅ **${nom}** (\`${reference}\`) — ${type.label} — ajoutée à l'armurerie.`);
+    await replyAutoDelete(interaction, { content: `✅ **${nom}** (\`${reference}\`) — ${type.label} — ajoutée à l'armurerie.`, allowedMentions: { parse: [] } });
     await updatePermanentMessage(interaction.client, guildId);
     return;
   }
@@ -775,14 +705,19 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     if (!arme) return replyAutoDelete(interaction, '❌ Arme introuvable.');
 
     await db.updateArmeStatut(guildId, armeId, 'pretee', preteaA);
-    await replyAutoDelete(interaction, `✅ **${arme.nom}** marquée comme prêtée à **${preteaA}**.`);
+    await replyAutoDelete(interaction, { content: `✅ **${arme.nom}** marquée comme prêtée à **${preteaA}**.`, allowedMentions: { parse: [] } });
     await updatePermanentMessage(interaction.client, guildId);
     return;
   }
 
+  // Le tier a pu changer pendant que le modal était ouvert (voir MUNITIONS_FABRICATION_TIER).
+  if ((id === 'modal_arm_fabrication' || id === 'modal_arm_vente_munitions') && !getMunitionsFabricationType(guildId)) {
+    return replyAutoDelete(interaction, "❌ Aucune fabrication ni vente de munitions pour ce type d'organisation.");
+  }
+
   if (id === 'modal_arm_fabrication') {
-    const quantite = parseInt(interaction.fields.getTextInputValue('quantite').trim(), 10);
-    if (!Number.isInteger(quantite) || quantite <= 0) return replyAutoDelete(interaction, '❌ Quantité invalide.');
+    const quantite = parseEntier(interaction.fields.getTextInputValue('quantite'), MAX_MUNITIONS_SAISIE);
+    if (!quantite) return replyAutoDelete(interaction, `❌ Quantité invalide (nombre entier entre 1 et ${MAX_MUNITIONS_SAISIE.toLocaleString('fr-FR')}).`);
 
     await db.addTransaction(guildId, {
       user_id: interaction.user.id,
@@ -791,20 +726,19 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
       quantite,
     });
 
-    const fabType = getMunitionsFabricationType(guildId);
-    await replyAutoDelete(interaction, `🛠️ **${quantite}** munitions${fabType ? ` (${munitionsTypeLabel(fabType)})` : ''} déclarées fabriquées.`);
+    await replyAutoDelete(interaction, `🛠️ **${quantite}** munitions déclarées fabriquées.`);
     await updatePermanentMessage(interaction.client, guildId);
     return;
   }
 
   if (id === 'modal_arm_vente_munitions') {
-    const quantite = parseInt(interaction.fields.getTextInputValue('quantite').trim(), 10);
+    const quantite = parseEntier(interaction.fields.getTextInputValue('quantite'), MAX_MUNITIONS_SAISIE);
     const acheteurId = interaction.fields.getTextInputValue('acheteur_id').trim();
-    const prix = parseFloat(interaction.fields.getTextInputValue('prix').trim().replace(',', '.'));
+    const prix = parseMontant(interaction.fields.getTextInputValue('prix'), MAX_PRIX_MUNITIONS);
 
-    if (!Number.isInteger(quantite) || quantite <= 0) return replyAutoDelete(interaction, '❌ Quantité invalide.');
+    if (!quantite) return replyAutoDelete(interaction, `❌ Quantité invalide (nombre entier entre 1 et ${MAX_MUNITIONS_SAISIE.toLocaleString('fr-FR')}).`);
     if (!acheteurId) return replyAutoDelete(interaction, '❌ ID acheteur manquant.');
-    if (!Number.isFinite(prix) || prix < 0) return replyAutoDelete(interaction, '❌ Prix invalide.');
+    if (prix == null) return replyAutoDelete(interaction, '❌ Prix invalide (montant positif attendu).');
 
     await db.addMunitionVente(guildId, {
       vendeur_id: interaction.user.id,
@@ -814,8 +748,7 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
       prix,
     });
 
-    const venteType = getMunitionsFabricationType(guildId);
-    await replyAutoDelete(interaction, `💰 **${quantite}** munitions${venteType ? ` (${munitionsTypeLabel(venteType)})` : ''} vendues à \`${acheteurId}\` pour **${prix}$**.`);
+    await replyAutoDelete(interaction, { content: `💰 **${quantite}** munitions vendues à \`${acheteurId}\` pour **${prix}$**.`, allowedMentions: { parse: [] } });
     await updatePermanentMessage(interaction.client, guildId);
   }
 }

@@ -35,8 +35,10 @@
  */
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import type { Client } from 'discord.js';
 import { assertAuthEnv, handleLogin, handleCallback, requireAuth, requireTaxesAccess } from './auth';
+import { prisma } from '../db';
 import * as guildRegistry from '../guild-registry';
 import stocksRouter from './routes/stocks';
 import quotasRouter from './routes/quotas';
@@ -46,6 +48,7 @@ import ventesRouter from './routes/ventes';
 import usersRouter from './routes/users';
 import { braquagesRouter, cooldownsRouter } from './routes/activites';
 import garagesRouter from './routes/garages';
+import rolesRouter from './routes/roles';
 
 /** Démarre l'API REST. N'a d'effet que si `API_PORT` est défini dans `.env` — absent = API désactivée, déploiement existant inchangé. */
 export function startApiServer(client: Client): void {
@@ -57,6 +60,18 @@ export function startApiServer(client: Client): void {
   const API_PORT = Number(process.env.API_PORT) || 3001;
 
   const app = express();
+  // Ne pas annoncer la pile technique dans chaque réponse.
+  app.disable('x-powered-by');
+  // `1` = un seul saut de confiance (le reverse proxy HTTPS en frontal sur la
+  // même machine, voir README section API REST) : Express lit `req.ip` depuis
+  // `X-Forwarded-For` posé par CE proxy plutôt que l'adresse de connexion TCP
+  // brute (celle du proxy pour TOUTES les requêtes). Sans ça, express-rate-limit
+  // (voir plus bas) bucket sur une seule IP partagée par tous les visiteurs —
+  // dégradation silencieuse, pas d'erreur. `1`, pas `true` : `true` ferait
+  // confiance à un `X-Forwarded-For` fourni par n'importe quel client direct
+  // si jamais `<API_PORT>` était accidentellement exposé malgré la consigne
+  // pare-feu du README.
+  app.set('trust proxy', 1);
   // Origine acceptée si elle correspond au site d'au moins une guilde active
   // connue (voir docstring de fichier) — pas de credentials (le JWT voyage en
   // en-tête Authorization, jamais en cookie cross-site).
@@ -68,13 +83,55 @@ export function startApiServer(client: Client): void {
     credentials: false,
   }));
 
-  app.get('/health', (_req, res) => res.json({ ok: true }));
+  // Ping DB léger en plus de la vivacité du process — un supervisor externe
+  // (uptime monitor) doit voir un `/health` en échec si Postgres est
+  // injoignable, pas un `{ok:true}` qui ne reflète que "Express répond".
+  // Public (un moniteur externe n'a pas de token) mais limité : chaque appel
+  // interroge la base, partagée avec le bot.
+  const healthLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+  app.get('/health', healthLimiter, async (_req, res) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      res.json({ ok: true });
+    } catch {
+      res.status(503).json({ ok: false });
+    }
+  });
 
-  app.get('/auth/login', handleLogin);
-  app.get('/auth/callback', handleCallback(client));
+  // Par IP, pas par guilde (le JWT n'existe pas encore à ce stade). Une
+  // limite dédiée et plus stricte sur /auth/login, séparée de l'API : pas de
+  // brute-force utile ici (même message d'erreur guilde inconnue/inactive),
+  // mais évite un DoS applicatif par répétition de requêtes.
+  const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+  // Deux paliers. `apiLimiter`, par IP et avant requireAuth (le JWT n'existe
+  // pas encore), ne sert qu'à freiner un abus non authentifié : il est large,
+  // parce que les sites de plusieurs guildes peuvent appeler l'API depuis la
+  // même IP sortante (même serveur, même proxy) et le partageraient. Le vrai
+  // quota est `guildLimiter`, par guilde, après requireAuth : un tenant très
+  // actif n'épuise jamais celui d'un autre.
+  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 3_000, standardHeaders: true, legacyHeaders: false });
+  const guildLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => req.apiUser!.guildId,
+  });
+
+  app.get('/auth/login', authLimiter, handleLogin);
+  app.get('/auth/callback', authLimiter, handleCallback(client));
 
   const api = express.Router();
+  // Réponses propres à un membre (paie, taxes avec mot de passe…) : jamais
+  // gardées par un cache intermédiaire ou le navigateur.
+  api.use((_req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    res.set('X-Content-Type-Options', 'nosniff');
+    next();
+  });
+  api.use(apiLimiter);
   api.use(requireAuth(client));
+  api.use(guildLimiter);
   api.get('/me', (req, res) => res.json(req.apiUser));
   api.use('/users', usersRouter);
   api.use('/stocks', stocksRouter);
@@ -85,6 +142,7 @@ export function startApiServer(client: Client): void {
   api.use('/braquages', braquagesRouter);
   api.use('/cooldowns', cooldownsRouter);
   api.use('/garages', garagesRouter);
+  api.use('/roles', rolesRouter(client));
   app.use('/api', api);
 
   // Signature à 4 paramètres obligatoire : Express reconnaît un middleware
@@ -94,7 +152,20 @@ export function startApiServer(client: Client): void {
     res.status(500).json({ error: 'Erreur interne.' });
   });
 
-  app.listen(API_PORT, () => {
-    console.log(`✅ API REST en écoute sur le port ${API_PORT}`);
+  // Loopback par défaut : le reverse proxy HTTPS tourne sur la même machine
+  // (Caddy pour cette instance, voir /etc/caddy/Caddyfile). En Docker, l'interface
+  // du conteneur n'est pas le loopback de l'hôte : docker-compose.yml passe
+  // `API_HOST=0.0.0.0` et restreint lui-même la publication du port à
+  // 127.0.0.1 côté hôte.
+  const API_HOST = process.env.API_HOST || '127.0.0.1';
+
+  // Express 5 transmet l'erreur d'écoute (port déjà pris…) à ce callback —
+  // seule l'API est alors indisponible, le bot Discord continue.
+  app.listen(API_PORT, API_HOST, (err?: Error) => {
+    if (err) {
+      console.error(`❌ API REST indisponible (${API_HOST}:${API_PORT}) :`, err.message);
+      return;
+    }
+    console.log(`✅ API REST en écoute sur ${API_HOST}:${API_PORT}`);
   });
 }

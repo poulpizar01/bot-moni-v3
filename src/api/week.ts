@@ -7,13 +7,21 @@
  */
 import type { Request, Response } from 'express';
 import * as db from '../db';
+import { parisWallToUtc } from '../paris-time';
 
 export interface WeekRange {
   since: number;
   until: number;
 }
 
-/** Parse `2026-W37` (lundi 00:00 UTC → lundi suivant) en `{ since, until }` ms epoch — `null` si mal formé ou hors plage (semaine 1-53). */
+/**
+ * Parse `2026-W37` en période de paie `{ since, until }` ms epoch — `null` si
+ * mal formé ou hors plage (semaine 1-53). La période est celle du reset
+ * hebdomadaire (dimanche 19h, heure de Paris, voir `quotas.checkWeeklyReset`)
+ * qui clôt cette semaine ISO : du dimanche 19h précédent au dimanche 19h de
+ * la semaine demandée. Des bornes lundi-lundi ne recouperaient jamais
+ * exactement la paie publiée le dimanche soir.
+ */
 export function parseIsoWeek(weekStr: string): WeekRange | null {
   const m = /^(\d{4})-W(\d{2})$/.exec(weekStr);
   if (!m) return null;
@@ -28,11 +36,14 @@ export function parseIsoWeek(weekStr: string): WeekRange | null {
   const week1Monday = new Date(jan4);
   week1Monday.setUTCDate(jan4.getUTCDate() - (jan4Day - 1));
 
-  const since = new Date(week1Monday);
-  since.setUTCDate(week1Monday.getUTCDate() + (week - 1) * 7);
-  const until = new Date(since);
-  until.setUTCDate(since.getUTCDate() + 7);
-  return { since: since.getTime(), until: until.getTime() };
+  const sunday = new Date(week1Monday);
+  sunday.setUTCDate(week1Monday.getUTCDate() + (week - 1) * 7 + 6);
+  const previousSunday = new Date(sunday);
+  previousSunday.setUTCDate(sunday.getUTCDate() - 7);
+  return {
+    since: parisWallToUtc(previousSunday.getUTCFullYear(), previousSunday.getUTCMonth(), previousSunday.getUTCDate(), 19),
+    until: parisWallToUtc(sunday.getUTCFullYear(), sunday.getUTCMonth(), sunday.getUTCDate(), 19),
+  };
 }
 
 /**

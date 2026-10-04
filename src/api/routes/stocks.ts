@@ -19,6 +19,13 @@
  *
  * Chaque route filtre par `req.apiUser.guildId` (posé par `requireAuth`,
  * voir src/api/auth.ts) — jamais les données d'une autre guilde.
+ *
+ * Un coffre `logs_coffres_admin` n'est visible (dans `/channels`) ou
+ * interrogeable en détail (`/:channelId`) que par un admin, et `/history`
+ * exclut leurs mouvements — mais `/` (le total global) reste le même pour
+ * tout le monde : il somme tous les coffres suivis, admin compris (en
+ * exclure ferait mentir le stock affiché), voir `db.getAllStocks`. Un salon
+ * retiré de la config (`/config channel remove-log-coffre`) n'y compte plus.
  */
 import { Router } from 'express';
 import * as db from '../../db';
@@ -55,7 +62,7 @@ function avecConfigItem<T extends { item: string }>(guildId: string, rows: T[]) 
 /** GET /api/stocks — quantité actuelle de chaque item suivi, tous coffres confondus (inclut la contribution des coffres admin pour tout le monde — c'est le total réel, jamais amputé), avec la configuration de chaque item (voir `avecConfigItem`). */
 router.get('/', async (req, res) => {
   const guildId = req.apiUser!.guildId;
-  res.json(avecConfigItem(guildId, await db.getAllStocks(guildId)));
+  res.json(avecConfigItem(guildId, await db.getAllStocks(guildId, configStore.coffreChannelIds(guildId))));
 });
 
 /**
@@ -79,7 +86,12 @@ router.get('/history', async (req, res) => {
   res.json(await db.getRecentStockHistory(apiUser.guildId, item, limit, channelId, excludeChannelIds));
 });
 
-/** GET /api/stocks/channels — liste des salons de logs de coffre suivis (avec leur `label`). `logs_coffres_admin` n'est inclus que pour un admin. */
+/**
+ * GET /api/stocks/channels — liste des coffres surveillés (`logs_coffres` +
+ * `logs_coffres_admin`, avec leur `label` éventuel) pour peupler un
+ * sélecteur côté site externe. Les coffres admin ne sont renvoyés qu'aux
+ * requêtes admin.
+ */
 router.get('/channels', async (req, res) => {
   const apiUser = req.apiUser!;
   const normaux = (await db.getChannelsWithLabel(apiUser.guildId, 'logs_coffres')).map(c => ({ ...c, role: 'logs_coffres' as const }));
@@ -89,7 +101,12 @@ router.get('/channels', async (req, res) => {
   res.json([...normaux, ...admin]);
 });
 
-/** GET /api/stocks/items — configuration brute de tous les items suivis (`/config item`), dans l'ordre d'affichage — y compris ceux qui n'ont encore aucun stock. */
+/**
+ * GET /api/stocks/items — catalogue des objets suivis (`db.getAllItems`),
+ * dans l'ordre du Stock Général (`displayOrder`) — pour que le site externe
+ * groupe/ordonne comme le panneau Discord au lieu de dupliquer la liste en
+ * dur. Déclarée avant `/:channelId`.
+ */
 router.get('/items', async (req, res) => {
   res.json(await db.getAllItems(req.apiUser!.guildId));
 });
@@ -98,13 +115,13 @@ router.get('/items', async (req, res) => {
  * GET /api/stocks/:channelId — quantité actuelle de chaque item pour UN
  * coffre précis (un salon `logs_coffres` ou `logs_coffres_admin` — voir
  * `/config channel list` côté Discord pour les identifiants). Liste vide
- * (pas d'erreur) si ce salon n'a encore aucun mouvement enregistré. Réservé
- * aux admins si ce salon précis est un coffre admin. Toujours en dernier :
- * route la plus générique du groupe.
+ * (pas d'erreur) si ce salon n'a encore aucun mouvement enregistré. Rejette
+ * un coffre admin pour un non-admin (même règle que `/channels`). Toujours
+ * en dernier : route la plus générique du groupe.
  */
 router.get('/:channelId', async (req, res) => {
   const apiUser = req.apiUser!;
-  const channelId = req.params.channelId;
+  const channelId = String(req.params.channelId);
   if (!apiUser.isAdmin && configStore.get(apiUser.guildId).CHANNELS.logs_coffres_admin.includes(channelId)) {
     res.status(403).json({ error: 'Accès réservé aux administrateurs pour ce coffre.' });
     return;

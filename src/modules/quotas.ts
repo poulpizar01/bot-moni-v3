@@ -41,6 +41,8 @@ import {
   StringSelectMenuBuilder,
   SlashCommandBuilder,
   MessageFlags,
+  DiscordAPIError,
+  RESTJSONErrorCodes,
   type Client,
   type Message,
   type GuildMember,
@@ -52,11 +54,16 @@ import {
 } from 'discord.js';
 import * as db from '../db';
 import * as configStore from '../config-store';
-import { type ActivityTypeConfig, type SalaryTierEntry } from '../config-store';
+import type { ActivityTypeConfig, SalaryTierEntry } from '../config-store';
 import * as alertes from './alertes';
 import * as garages from './garages';
 import { isAdmin } from '../permissions';
 import { replyAutoDelete, updateAutoDelete } from '../interaction-helpers';
+import { buildChunkedEmbeds } from '../embed-chunks';
+import { upsertPanel, fetchMessageOrNull, sendOnce } from '../permanent-message';
+import { parseEntier } from '../parse';
+import { SerialRunner } from '../serial';
+import { parisWallClock, weeklyBoundariesBetween } from '../paris-time';
 
 /**
  * Un labo passe par un select de participants PUIS un modal (temps restant) —
@@ -64,17 +71,25 @@ import { replyAutoDelete, updateAutoDelete } from '../interaction-helpers';
  * caractères, trop court pour y encoder jusqu'à 25 IDs Discord (18 chiffres
  * chacun) : on ne transmet donc au modal qu'un token de quelques caractères
  * référençant la liste réelle ici, en mémoire (expire après 5 min si le modal
- * n'est jamais soumis).
+ * n'est jamais soumis). La carte est commune à toutes les guildes : chaque
+ * entrée porte la guilde et le membre pour qui elle a été émise, vérifiés à
+ * la soumission — un token n'est pas une preuve à lui seul.
  */
-const pendingLaboParticipants = new Map<string, string[]>();
+const pendingLaboParticipants = new Map<string, { guildId: string; userId: string; partnerIds: string[] }>();
 
 /** Enregistre une liste de participants labo sous un token éphémère (voir docstring de `pendingLaboParticipants`) et retourne ce token. */
-function createLaboParticipantToken(partnerIds: string[]): string {
+function createLaboParticipantToken(guildId: string, userId: string, partnerIds: string[]): string {
   const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  pendingLaboParticipants.set(token, partnerIds);
+  pendingLaboParticipants.set(token, { guildId, userId, partnerIds });
   setTimeout(() => pendingLaboParticipants.delete(token), 5 * 60 * 1000);
   return token;
 }
+
+/** Plafond d'une quantité déclarée à la main (récolte, vente saisie) : rien d'autre ne borne cette saisie, qui alimente directement le quota et la paie. */
+const MAX_QUANTITE_DECLARATION = 100_000;
+
+/** Au-delà, `setTimeout` déborde (2^31 ms ≈ 24,8 jours) et se déclencherait immédiatement : le labo repasserait au vert aussitôt. */
+const MAX_TEMPS_LABO_MINUTES = 35_000;
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -87,16 +102,17 @@ function formatTime(ms: number): string {
   return [d && `${d}j`, h && `${h}h`, m && `${m}m`, s && `${s}s`].filter(Boolean).join(' ') || '0s';
 }
 
-/** Formate un timestamp (ms) en date courte française (JJ/MM/AAAA). */
+/** Formate un timestamp (ms) en date courte française (JJ/MM/AAAA), en heure de Paris (voir `taxes.formatDate` pour le risque de décalage sur un VPS en UTC). */
 function formatDate(ts: number): string {
-  return new Date(ts).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  return new Date(ts).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Europe/Paris' });
 }
 
-/** Formate un timestamp (ms) en date + heure françaises complètes. */
+/** Formate un timestamp (ms) en date + heure françaises complètes, en heure de Paris. */
 function formatDateTime(ts: number): string {
   return new Date(ts).toLocaleString('fr-FR', {
     day: '2-digit', month: '2-digit', year: 'numeric',
     hour: '2-digit', minute: '2-digit', second: '2-digit',
+    timeZone: 'Europe/Paris',
   });
 }
 
@@ -105,13 +121,13 @@ function capitalize(s: string): string {
   return s.length ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
-export type QuotaSummary = { byQuotaType: Record<string, number>; map: Record<string, { count: number; points: number }> };
+export type QuotaSummary = { byQuotaType: Record<string, number>; map: Record<string, { count: number }> };
 
 /** Plage [since, until) en ms epoch — voir les fonctions `*ForRange` ci-dessous, utilisées par l'API (src/api/routes/quotas.ts) pour interroger une semaine passée. */
 export type QuotaRange = { since: number; until: number };
 
 /** Dérive la somme par catégorie de quota (`ACTIVITY_TYPES[*].quotaType`) à partir d'une carte de stats déjà chargée. */
-function summarizeByQuotaType(guildId: string, map: Record<string, { count: number; points: number }>): Record<string, number> {
+function summarizeByQuotaType(guildId: string, map: Record<string, { count: number }>): Record<string, number> {
   const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
   const byQuotaType: Record<string, number> = {};
   for (const [key, cfg] of Object.entries(activityTypes)) {
@@ -140,10 +156,10 @@ async function getUserQuotaSummary(guildId: string, userId: string): Promise<Quo
  */
 async function getAllUserQuotaSummaries(guildId: string): Promise<Map<string, QuotaSummary>> {
   const rows = await db.getAllStats(guildId);
-  const statMaps = new Map<string, Record<string, { count: number; points: number }>>();
+  const statMaps = new Map<string, Record<string, { count: number }>>();
   for (const r of rows) {
     const m = statMaps.get(r.userId) ?? {};
-    m[r.action] = { count: r.count, points: r.points };
+    m[r.action] = { count: r.count };
     statMaps.set(r.userId, m);
   }
   const result = new Map<string, QuotaSummary>();
@@ -167,15 +183,15 @@ async function buildMainEmbed(guildId: string): Promise<EmbedBuilder> {
     .filter(([, cfg]) => cfg.enabled && cfg.braquageWeeklyLimit != null)
     .sort((a, b) => a[1].displayOrder - b[1].displayOrder);
 
-  const slotLines = await Promise.all(braquageEntries.map(async ([key, cfg]) => {
-    const used = await db.getBraquageCount(guildId, key);
-    const dispo = Math.max(0, cfg.braquageWeeklyLimit! - used);
+  const braquageCounts = await db.getBraquageCounts(guildId, braquageEntries.map(([key]) => key));
+  const slotLines = braquageEntries.map(([key, cfg]) => {
+    const dispo = Math.max(0, cfg.braquageWeeklyLimit! - (braquageCounts[key] ?? 0));
     const icon = dispo > 0 ? '🟢' : '🔴';
     return `${icon} ${cfg.icon ? `${cfg.icon} ` : ''}${cfg.label} : **${dispo}/${cfg.braquageWeeklyLimit}**`;
-  }));
+  });
 
   const embed = new EmbedBuilder()
-    .setTitle('🎮 Gestion des Activités')
+    .setTitle(MAIN_PANEL_TITLE)
     .setColor(0x5865F2)
     .setDescription(
       'Enregistre tes activités de la semaine en cliquant sur les boutons ci-dessous.\n' +
@@ -224,139 +240,130 @@ async function buildQuotaEmbed(guildId: string, userId: string, member: GuildMem
 }
 
 /**
- * Paie progressive d'une quantité sur UN barème trié (voir `SalaryTier` dans
- * schema.prisma) : chaque tranche [borne précédente, upTo] est payée à SON
- * taux et les montants s'additionnent, comme un barème d'impôt — 250 unités
- * avec 0-100→10$, 100-300→15$ rapportent 100×10 + 150×15, jamais 250×15.
+ * Paie d'une quantité selon un barème progressif (paliers, voir `/config
+ * palier`) : chaque tranche `[borne précédente, upTo]` est payée à son
+ * propre taux, sommées comme un barème d'impôt — PAS un seuil qui repaierait
+ * toute la quantité au taux de la dernière tranche atteinte. `tiers` doit
+ * être trié par `upTo` croissant — voir `configStore.reload()`, qui garantit
+ * ce tri. Sans tranche finale sans limite (`upTo: null`), les unités
+ * au-delà de la dernière borne sont payées au taux de la dernière tranche,
+ * jamais 0 $ : un barème incomplet ne doit pas faire disparaître de la paie.
  */
 function computeTierPay(quantite: number, tiers: SalaryTierEntry[]): number {
   let prevBound = 0;
   let total = 0;
   for (const tier of tiers) {
     const upper = tier.upTo ?? Infinity;
-    total += Math.max(0, Math.min(quantite, upper) - prevBound) * tier.amount;
-    if (quantite <= upper) break;
+    const dansCetteTranche = Math.max(0, Math.min(quantite, upper) - prevBound);
+    total += dansCetteTranche * tier.amount;
+    if (quantite <= upper) return total;
     prevBound = upper;
   }
-  return total;
-}
-
-/** Une ligne de paie "vente" : une drogue ayant son propre palier/taux, ou (`item` null) la quantité mise en commun au barème/taux général. `rate` null = payée au palier. */
-interface VentePayPart {
-  item: string | null;
-  qty: number;
-  rate: number | null;
-  pay: number;
-}
-
-/** Vrai si la paie "vente" doit être détaillée par drogue (taux ou palier propre à un item) — seul cas où les appelants relisent `Transaction` via `getVenteByItemMap`. */
-function hasVenteItemOverrides(c: configStore.BotConfig): boolean {
-  return Object.keys(c.ITEM_SALARY_RATES).length > 0 || Object.keys(c.VENTE_PALIERS.byItem).length > 0;
+  const last = tiers[tiers.length - 1];
+  return last ? total + (quantite - prevBound) * last.amount : total;
 }
 
 /**
- * Paie "vente" découpée en lignes, par priorité : palier de l'item > taux de
- * l'item > palier général > taux général. `venteByItem` null = aucun
- * override par item, calcul direct sur le total. Les drogues sans override
- * sont MISES EN COMMUN avant d'appliquer le barème général : 30 + 80 unités
- * de deux drogues différentes cumulent 110 unités dans le même barème, elles
- * ne repartent pas chacune de la première tranche.
+ * Paie de la catégorie "vente" : priorité au barème/taux propre à un item
+ * (`itemTiers`/`itemRates`, voir `/config palier`/`/config salaire ...
+ * item:`) sur son unique quantité, le RESTE (quantité mise en commun,
+ * `pooled`) étant payé au barème/taux général. `venteByItem` est `null`
+ * quand aucun override par item n'existe (ni palier ni taux) — dans ce cas
+ * tout `totalVente` passe directement par le barème/taux général, sans avoir
+ * besoin du détail par item (voir chaque appelant, qui évite ainsi une
+ * lecture `Transaction` inutile).
  */
-function computeVentePayParts(totalVente: number, venteByItem: Record<string, number> | null, c: configStore.BotConfig): VentePayPart[] {
-  const generalTiers = c.VENTE_PALIERS.general;
-  const generalRate = c.SALARY_RATES.vente ?? 0;
-  const parts: VentePayPart[] = [];
+function computeVentePay(
+  totalVente: number,
+  venteByItem: Record<string, number> | null,
+  generalRate: number,
+  generalTiers: SalaryTierEntry[],
+  itemRates: Record<string, number>,
+  itemTiers: Record<string, SalaryTierEntry[]>,
+): number {
+  const { lignes, pooled } = repartirVente(totalVente, venteByItem, itemRates, itemTiers);
+  const general = generalTiers.length ? computeTierPay(pooled, generalTiers) : pooled * generalRate;
+  return lignes.reduce((sum, ligne) => sum + ligne.pay, general);
+}
+
+/**
+ * Répartition de la vente entre les items ayant leur propre palier ou taux
+ * (une ligne chacun, payée sur SA quantité) et le reste mis en commun
+ * (`pooled`), payé au barème/taux général — base unique de
+ * `computeVentePay` et de `buildVenteDetailLines`. Un taux/palier par item
+ * est enregistré sous le nom configuré ("Cannabis") alors qu'une vente porte
+ * le nom tel que lu dans les logs de coffre, en minuscules ("cannabis") : la
+ * comparaison se fait en minuscules, comme partout ailleurs pour un item.
+ */
+function repartirVente(
+  totalVente: number,
+  venteByItem: Record<string, number> | null,
+  itemRates: Record<string, number>,
+  itemTiers: Record<string, SalaryTierEntry[]>,
+): { lignes: Array<{ label: string; qty: number; tiers?: SalaryTierEntry[]; rate?: number; pay: number }>; pooled: number } {
+  if (!venteByItem) return { lignes: [], pooled: totalVente };
+  const parItem = new Map<string, { label: string; tiers?: SalaryTierEntry[]; rate?: number }>();
+  for (const [name, rate] of Object.entries(itemRates)) parItem.set(name.toLowerCase(), { label: name, rate });
+  for (const [name, tiers] of Object.entries(itemTiers)) {
+    if (tiers.length) parItem.set(name.toLowerCase(), { label: name, tiers });
+  }
+
+  const lignes: Array<{ label: string; qty: number; tiers?: SalaryTierEntry[]; rate?: number; pay: number }> = [];
   let pooled = totalVente;
-  for (const [item, qty] of Object.entries(venteByItem ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
-    const tiers = c.VENTE_PALIERS.byItem[item];
-    if (tiers?.length) parts.push({ item, qty, rate: null, pay: computeTierPay(qty, tiers) });
-    else if (c.ITEM_SALARY_RATES[item] != null) parts.push({ item, qty, rate: c.ITEM_SALARY_RATES[item], pay: qty * c.ITEM_SALARY_RATES[item] });
-    else continue;
+  for (const item of Object.keys(venteByItem).sort()) {
+    const override = parItem.get(item);
+    if (!override) continue;
+    const qty = venteByItem[item];
+    const pay = override.tiers ? computeTierPay(qty, override.tiers) : qty * override.rate!;
+    lignes.push({ ...override, qty, pay });
     pooled -= qty;
   }
-  // `totalVente` vient de Stat (semaine en cours) et `venteByItem` de
-  // Transaction : un léger décalage ne doit jamais produire une quantité négative.
-  pooled = Math.max(0, pooled);
-  parts.push(generalTiers.length
-    ? { item: null, qty: pooled, rate: null, pay: computeTierPay(pooled, generalTiers) }
-    : { item: null, qty: pooled, rate: generalRate, pay: pooled * generalRate });
-  return parts;
+  return { lignes, pooled: Math.max(0, pooled) };
 }
 
 /**
- * Salaire total à partir des taux configurés (`/config salaire`) : somme,
- * pour chaque catégorie ayant un taux, de `compte de cette catégorie × taux`
- * — sauf "vente", déléguée à {@link computeVentePayParts} (paliers
- * `/config palier` et taux par drogue). Une catégorie sans taux ne
- * contribue rien — voir docstring de fichier.
+ * Salaire total à partir des taux/paliers configurés (`/config
+ * salaire`/`/config palier`) : somme, pour chaque catégorie ayant un taux,
+ * de `compte de cette catégorie × taux` — sauf "vente", déléguée à
+ * `computeVentePay` (seule catégorie qui peut avoir un barème progressif ou
+ * un taux/barème par item). Une catégorie sans taux ni barème ne contribue
+ * rien.
  */
-function computeSalaire(byQuotaType: Record<string, number>, c: configStore.BotConfig, venteByItem: Record<string, number> | null): number {
+function computeSalaireTotal(
+  byQuotaType: Record<string, number>,
+  rates: Record<string, number>,
+  venteByItem: Record<string, number> | null,
+  itemRates: Record<string, number>,
+  venteTiers: { general: SalaryTierEntry[]; byItem: Record<string, SalaryTierEntry[]> },
+): number {
   let sum = 0;
-  for (const [qt, rate] of Object.entries(c.SALARY_RATES)) {
+  for (const [qt, rate] of Object.entries(rates)) {
     if (qt === 'vente') continue;
     sum += (byQuotaType[qt] ?? 0) * rate;
   }
-  for (const part of computeVentePayParts(byQuotaType.vente ?? 0, venteByItem, c)) sum += part.pay;
+  sum += computeVentePay(byQuotaType.vente ?? 0, venteByItem, rates.vente ?? 0, venteTiers.general, itemRates, venteTiers.byItem);
   return sum;
 }
 
 /**
- * Points de classement à partir des taux configurés (`/config classement`) :
- * comme `computeSalaire`, mais la catégorie "actions" se calcule par
- * activité — chaque activité de cette famille (atm, cambu, superette, go
- * fast, les 4 braquages, human labs) utilise son propre nombre de points si
- * configuré (`/config classement set quota_type:actions activite:`), sinon
- * le nombre général de la catégorie "actions". Contrairement à "vente" côté
- * salaire, aucune requête supplémentaire n'est nécessaire ici : le cache
- * `Stat`/`map` est déjà détaillé par activité (une ligne par clé
- * `ACTIVITY_TYPES`), la famille "actions" n'est qu'un regroupement de
- * plusieurs clés déjà disponibles individuellement.
+ * Répartition des ventes par item, pour tous les joueurs, sur une plage —
+ * relit `Transaction` (voir `db.getVenteDetailAllUsers`), une requête que le
+ * panneau Discord live n'a normalement jamais besoin de faire. **N'appeler
+ * que si `ITEM_SALARY_RATES` ou `VENTE_PALIERS.byItem` est non vide** — un
+ * override par item quelconque (taux plat OU palier) impose de connaître la
+ * quantité vendue PAR item, pas seulement le total agrégé. Voir chaque
+ * appelant (`getSalaryRanking`, `getUserPayForRange`, `getAllUserPayForRange`,
+ * `buildPayEmbed`), qui garde cette vérification localement plutôt qu'un seul
+ * point central, pour qu'aucun chemin ne l'oublie.
  */
-function computeClassement(guildId: string, map: Record<string, { count: number; points: number }>, rates: Record<string, number>, activityRates: Record<string, number>): number {
-  const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
-  let sum = 0;
-  const otherTotals: Record<string, number> = {};
-  for (const [key, cfg] of Object.entries(activityTypes)) {
-    if (!cfg.quotaType) continue;
-    const count = map[key]?.count || 0;
-    if (cfg.quotaType === 'actions') {
-      sum += count * (activityRates[key] ?? rates.actions ?? 0);
-    } else {
-      otherTotals[cfg.quotaType] = (otherTotals[cfg.quotaType] ?? 0) + count;
-    }
-  }
-  for (const [qt, rate] of Object.entries(rates)) {
-    if (qt === 'actions') continue;
-    sum += (otherTotals[qt] ?? 0) * rate;
-  }
-  return sum;
-}
-
-/**
- * Classement de tous les membres suivis par points décroissants (voir
- * {@link computeClassement}) — période en cours uniquement (cache `Stat`),
- * même principe que `getSalaryRanking` mais pour `/config classement` plutôt
- * que `/config salaire`. Uniquement ceux dont les points sont > 0.
- */
-async function getClassementRanking(guildId: string): Promise<Array<{ userId: string; points: number }>> {
-  const c = configStore.get(guildId);
-  const summaries = await getAllUserQuotaSummaries(guildId);
-  const results: Array<{ userId: string; points: number }> = [];
-  for (const [userId, { map }] of summaries) {
-    const points = computeClassement(guildId, map, c.CLASSEMENT_RATES, c.ACTIVITY_CLASSEMENT_RATES);
-    if (points > 0) results.push({ userId, points });
-  }
-  return results.sort((a, b) => b.points - a.points);
-}
-
-/** Quantités vendues par item sur [sinceTs, untilTs), groupées par joueur (voir `db.getVenteTotalsByItem`) — un seul appel pour tous les joueurs suivis, réutilisé par `getSalaryRanking`/`getAllUserPayForRange`. */
-async function getVenteByItemMap(guildId: string, sinceTs: number, untilTs: number, userId?: string): Promise<Map<string, Record<string, number>>> {
-  const rows = await db.getVenteTotalsByItem(guildId, sinceTs, untilTs, userId);
+async function getVenteByItemMap(guildId: string, sinceTs: number, untilTs: number): Promise<Map<string, Record<string, number>>> {
+  const rows = await db.getVenteDetailAllUsers(guildId, sinceTs, untilTs);
   const map = new Map<string, Record<string, number>>();
   for (const r of rows) {
-    const m = map.get(r.userId) ?? {};
-    m[r.item] = (m[r.item] ?? 0) + r.total;
-    map.set(r.userId, m);
+    const userMap = map.get(r.userId) ?? {};
+    const item = r.item.toLowerCase();
+    userMap[item] = (userMap[item] ?? 0) + r.quantite;
+    map.set(r.userId, userMap);
   }
   return map;
 }
@@ -367,34 +374,58 @@ async function getVenteByItemMap(guildId: string, sinceTs: number, untilTs: numb
  * activité payante déclarée → absent du classement, pas juste à 0$).
  */
 async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }>> {
-  const c = configStore.get(guildId);
-  // Requête Transaction supplémentaire seulement si la guilde utilise un taux
-  // ou un palier par drogue — sinon le total "vente" agrégé de Stat suffit.
-  const hasItemOverrides = hasVenteItemOverrides(c);
-  const since = hasItemOverrides ? Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0) : 0;
-  const [summaries, venteByItemMap] = await Promise.all([
-    getAllUserQuotaSummaries(guildId),
-    hasItemOverrides ? getVenteByItemMap(guildId, since, Date.now()) : Promise.resolve(new Map<string, Record<string, number>>()),
-  ]);
+  const rates = configStore.get(guildId).SALARY_RATES;
+  const itemRates = configStore.get(guildId).ITEM_SALARY_RATES;
+  const venteTiers = configStore.get(guildId).VENTE_PALIERS;
+  const needsItemBreakdown = Object.keys(itemRates).length > 0 || Object.keys(venteTiers.byItem).length > 0;
+  const summaries = await getAllUserQuotaSummaries(guildId);
+  const venteByItemMap = needsItemBreakdown
+    ? await getVenteByItemMap(guildId, Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0), Date.now())
+    : null;
   const results: Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }> = [];
   for (const [userId, { byQuotaType }] of summaries) {
-    const salaire = computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null);
+    const venteByItem = venteByItemMap ? (venteByItemMap.get(userId) ?? {}) : null;
+    const salaire = computeSalaireTotal(byQuotaType, rates, venteByItem, itemRates, venteTiers);
     if (salaire > 0) results.push({ userId, salaire, byQuotaType });
   }
   return results.sort((a, b) => b.salaire - a.salaire);
+}
+
+/**
+ * Slots de braquage restants par activité, à l'échelle du GROUPE (limite
+ * hebdomadaire glissante sur 7 jours, partagée par tous les membres — voir
+ * `BRAQUAGE_LIMITS_BY_TIER`/`ActivityTypeConfig.braquageWeeklyLimit`), pour
+ * `/api/quotas/braquages`. Mêmes fonctions `db` que le panneau Discord
+ * (`buildMainEmbed`/`buildMinuterieEmbed`) mais un calcul dédié qui retourne
+ * une structure exploitable plutôt que des lignes de texte formatées — même
+ * logique de séparation que les fonctions `*ForRange` ci-dessous (un chemin
+ * de calcul propre à l'API, pas fusionné au panneau live).
+ */
+export async function getBraquageSummary(guildId: string): Promise<Array<{ action: string; label: string; limit: number; used: number; nextSlotAt: number | null }>> {
+  const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
+  const entries = Object.entries(activityTypes)
+    .filter(([, cfg]) => cfg.enabled && cfg.braquageWeeklyLimit != null)
+    .sort((a, b) => a[1].displayOrder - b[1].displayOrder);
+  const counts = await db.getBraquageCounts(guildId, entries.map(([key]) => key));
+
+  return Promise.all(entries.map(async ([key, cfg]) => {
+    const limit = cfg.braquageWeeklyLimit!;
+    const used = counts[key] ?? 0;
+    let nextSlotAt: number | null = null;
+    if (used >= limit) {
+      const oldest = await db.getOldestBraquage(guildId, key);
+      if (oldest) nextSlotAt = oldest + 7 * 24 * 60 * 60 * 1000;
+    }
+    return { action: key, label: cfg.label, limit, used, nextSlotAt };
+  }));
 }
 
 // ─── RECONSTRUCTION SUR UNE PLAGE (API — semaines passées) ────────────────────
 //
 // Les fonctions au-dessus (getUserQuotaSummary, getAllUserQuotaSummaries,
 // getSalaryRanking) lisent le cache `Stat`, qui ne connaît QUE la période en
-// cours (vidé entièrement à chaque reset hebdo, voir weeklyReset) — SAUF
-// exception étroite et volontaire : dès qu'un taux ou palier par item existe
-// (`hasVenteItemOverrides`), `getSalaryRanking` lit aussi `Transaction`
-// via `getVenteByItemMap`, `Stat` ne gardant qu'un total "vente" agrégé sans
-// détail par drogue (voir `computeVentePayParts`). Sans taux/palier par
-// item configuré (cas par défaut), aucune lecture supplémentaire n'a lieu.
-// Les fonctions ci-dessous reconstruisent le même calcul depuis `Transaction`
+// cours (vidé entièrement à chaque reset hebdo, voir checkWeeklyReset). Les
+// fonctions ci-dessous reconstruisent le même calcul depuis `Transaction`
 // (jamais purgée, juste soft-delete) sur une plage [since, until) arbitraire
 // — utilisées par l'API pour interroger une semaine passée (voir
 // src/api/routes/quotas.ts). Volontairement un chemin de calcul séparé,
@@ -403,8 +434,8 @@ async function getSalaryRanking(guildId: string): Promise<Array<{ userId: string
 // cours" (Stat) et "semaine passée" (Transaction) en deux logiques à
 // maintenir en parallèle.
 //
-// ATTENTION : les objectifs (`/config quota`), taux de paie (`/config
-// salaire`) et paliers (`/config palier`) ne sont PAS historisés — seule la valeur actuelle existe. Ces
+// ATTENTION : les objectifs (`/config quota`) et taux de paie (`/config
+// salaire`) ne sont PAS historisés — seule la valeur actuelle existe. Ces
 // fonctions appliquent donc les taux/objectifs ACTUELS à l'activité d'une
 // semaine passée, pas ceux réellement en vigueur à l'époque si l'admin les a
 // changés depuis.
@@ -413,9 +444,13 @@ function quantityActionKeys(guildId: string): string[] {
   return Object.entries(configStore.get(guildId).ACTIVITY_TYPES).filter(([, c]) => c.quantity).map(([k]) => k);
 }
 
+/** `Transaction` contient aussi des actions hors registre (ex. `fabrication_munitions`, compteur de l'armurerie) : seules celles d'`ACTIVITY_TYPES` sont des activités, comme dans `Stat`. */
 function summaryFromActionTotals(guildId: string, rows: Array<{ action: string; total: number }>): QuotaSummary {
-  const map: Record<string, { count: number; points: number }> = {};
-  for (const r of rows) map[r.action] = { count: r.total, points: 0 };
+  const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
+  const map: Record<string, { count: number }> = {};
+  for (const r of rows) {
+    if (activityTypes[r.action]) map[r.action] = { count: r.total };
+  }
   return { byQuotaType: summarizeByQuotaType(guildId, map), map };
 }
 
@@ -437,29 +472,32 @@ export async function getAllUserQuotaSummariesForRange(guildId: string, range: Q
   return [...byUser.entries()].map(([userId, actionRows]) => ({ userId, ...summaryFromActionTotals(guildId, actionRows) }));
 }
 
-/** Paie d'un joueur (taux actuels appliqués à l'activité de la plage) — voir note ci-dessus sur les taux non historisés. */
+/** Paie d'un joueur (taux/paliers actuels appliqués à l'activité de la plage) — voir note ci-dessus sur les taux non historisés (les paliers non plus). */
 export async function getUserPayForRange(guildId: string, userId: string, range: QuotaRange): Promise<{ salaire: number; byQuotaType: Record<string, number> }> {
-  const c = configStore.get(guildId);
-  const hasItemOverrides = hasVenteItemOverrides(c);
-  const [{ byQuotaType }, venteByItemMap] = await Promise.all([
-    getUserQuotaSummaryForRange(guildId, userId, range),
-    hasItemOverrides ? getVenteByItemMap(guildId, range.since, range.until, userId) : Promise.resolve(new Map<string, Record<string, number>>()),
-  ]);
-  return { salaire: computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null), byQuotaType };
+  const { byQuotaType } = await getUserQuotaSummaryForRange(guildId, userId, range);
+  const rates = configStore.get(guildId).SALARY_RATES;
+  const itemRates = configStore.get(guildId).ITEM_SALARY_RATES;
+  const venteTiers = configStore.get(guildId).VENTE_PALIERS;
+  const needsItemBreakdown = Object.keys(itemRates).length > 0 || Object.keys(venteTiers.byItem).length > 0;
+  const venteByItem = needsItemBreakdown ? ((await getVenteByItemMap(guildId, range.since, range.until)).get(userId) ?? {}) : null;
+  return { salaire: computeSalaireTotal(byQuotaType, rates, venteByItem, itemRates, venteTiers), byQuotaType };
 }
 
-/** Paie de tous les joueurs suivis sur la plage, y compris à 0$ (contrairement à `getSalaryRanking`) — pas triée. */
+/** Paie de tous les joueurs suivis sur la plage, y compris à 0$ — pas triée. */
 export async function getAllUserPayForRange(guildId: string, range: QuotaRange): Promise<Array<{ userId: string; salaire: number; byQuotaType: Record<string, number> }>> {
-  const c = configStore.get(guildId);
-  const hasItemOverrides = hasVenteItemOverrides(c);
-  const [summaries, venteByItemMap] = await Promise.all([
-    getAllUserQuotaSummariesForRange(guildId, range),
-    hasItemOverrides ? getVenteByItemMap(guildId, range.since, range.until) : Promise.resolve(new Map<string, Record<string, number>>()),
-  ]);
-  return summaries.map(({ userId, byQuotaType }) => ({ userId, salaire: computeSalaire(byQuotaType, c, hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null), byQuotaType }));
+  const rates = configStore.get(guildId).SALARY_RATES;
+  const itemRates = configStore.get(guildId).ITEM_SALARY_RATES;
+  const venteTiers = configStore.get(guildId).VENTE_PALIERS;
+  const needsItemBreakdown = Object.keys(itemRates).length > 0 || Object.keys(venteTiers.byItem).length > 0;
+  const summaries = await getAllUserQuotaSummariesForRange(guildId, range);
+  const venteByItemMap = needsItemBreakdown ? await getVenteByItemMap(guildId, range.since, range.until) : null;
+  return summaries.map(({ userId, byQuotaType }) => {
+    const venteByItem = venteByItemMap ? (venteByItemMap.get(userId) ?? {}) : null;
+    return { userId, salaire: computeSalaireTotal(byQuotaType, rates, venteByItem, itemRates, venteTiers), byQuotaType };
+  });
 }
 
-/** Comme `getClassementRanking`, mais sur une plage arbitraire — mêmes règles (triée décroissant, uniquement points > 0), reconstruite depuis `Transaction` comme les autres `*ForRange` (voir note en tête de section). */
+/** Comme `getClassementRanking`, mais sur une plage arbitraire — mêmes règles (triée décroissant, uniquement points > 0). */
 export async function getClassementRankingForRange(guildId: string, range: QuotaRange): Promise<Array<{ userId: string; points: number }>> {
   const classementRates = configStore.get(guildId).CLASSEMENT_RATES;
   const activityClassementRates = configStore.get(guildId).ACTIVITY_CLASSEMENT_RATES;
@@ -476,54 +514,66 @@ export async function getClassementRankingForRange(guildId: string, range: Quota
 export async function getGroupSummaryForRange(guildId: string, range: QuotaRange): Promise<Array<{ action: string; label: string; total: number }>> {
   const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
   const totals = await db.getGroupActionTotals(guildId, range.since, quantityActionKeys(guildId), range.until);
-  return totals.map(({ action, total }) => ({
-    action,
-    label: activityTypes[action] ? activityTypes[action].label : action,
-    total,
-  }));
+  return totals
+    .filter(({ action }) => activityTypes[action])
+    .map(({ action, total }) => ({ action, label: activityTypes[action].label, total }));
 }
 
-/** Embed de paie personnelle : détail par catégorie payante (vente détaillée par drogue si un taux/palier par item existe) + salaire total + classement. */
-async function buildPayEmbed(guildId: string, userId: string, member: GuildMember | null): Promise<EmbedBuilder> {
-  const c = configStore.get(guildId);
-  const rates = c.SALARY_RATES;
-  const hasItemOverrides = hasVenteItemOverrides(c);
+/**
+ * Lignes de détail de la catégorie "vente" pour `buildPayEmbed` : un item
+ * avec son propre palier/taux (voir `/config palier`/`/config salaire ...
+ * item:`) reçoit sa propre ligne sur SA quantité ; le reste (`pooled`, mis en
+ * commun) est affiché sur une dernière ligne "(reste)" au palier/taux
+ * général — sauf si AUCUN item n'a d'override, où une seule ligne "Vente"
+ * suffit (pas de "reste" trompeur quand il n'y a rien à en distinguer).
+ */
+function buildVenteDetailLines(
+  venteByItem: Record<string, number> | null,
+  totalVente: number,
+  generalRate: number,
+  generalTiers: SalaryTierEntry[],
+  itemRates: Record<string, number>,
+  itemTiers: Record<string, SalaryTierEntry[]>,
+): string[] {
+  const fmt = (n: number) => Math.round(n).toLocaleString('fr-FR');
+  const { lignes, pooled } = repartirVente(totalVente, venteByItem, itemRates, itemTiers);
+  const lines = lignes.map(l => (l.tiers
+    ? `• Vente ${l.label} : ${l.qty} unités (palier) = **${fmt(l.pay)}$**`
+    : `• Vente ${l.label} : ${l.qty} × ${l.rate}$ = **${fmt(l.pay)}$**`));
+  if (pooled > 0 || !lines.length) {
+    const label = lines.length ? 'Vente (reste)' : 'Vente';
+    lines.push(generalTiers.length
+      ? `• ${label} : ${pooled} unités (palier) = **${fmt(computeTierPay(pooled, generalTiers))}$**`
+      : `• ${label} : ${pooled} × ${generalRate}$ = **${fmt(pooled * generalRate)}$**`);
+  }
+  return lines;
+}
 
-  const since = Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
-  const [{ byQuotaType }, venteByItemMap] = await Promise.all([
-    getUserQuotaSummary(guildId, userId),
-    hasItemOverrides ? getVenteByItemMap(guildId, since, Date.now(), userId) : Promise.resolve(new Map<string, Record<string, number>>()),
-  ]);
-  const venteByItem = hasItemOverrides ? venteByItemMap.get(userId) ?? {} : null;
-  const salaire = computeSalaire(byQuotaType, c, venteByItem);
+/** Embed de paie personnelle : détail par catégorie payante (par item pour "vente" si au moins un taux ou un palier par item est configuré) + salaire total + classement (paie). */
+async function buildPayEmbed(guildId: string, userId: string, member: GuildMember | null): Promise<EmbedBuilder> {
+  const rates = configStore.get(guildId).SALARY_RATES;
+  const itemRates = configStore.get(guildId).ITEM_SALARY_RATES;
+  const venteTiers = configStore.get(guildId).VENTE_PALIERS;
+  const needsItemBreakdown = Object.keys(itemRates).length > 0 || Object.keys(venteTiers.byItem).length > 0;
+  const { byQuotaType } = await getUserQuotaSummary(guildId, userId);
+  const venteByItem = needsItemBreakdown
+    ? (await getVenteByItemMap(guildId, Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0), Date.now())).get(userId) ?? {}
+    : null;
+  const salaire = computeSalaireTotal(byQuotaType, rates, venteByItem, itemRates, venteTiers);
 
   const embed = new EmbedBuilder().setTitle(`💰 Ma Paie — ${member?.displayName || userId}`).setColor(0xFEE75C);
 
-  const categories = new Set(Object.keys(rates));
-  if (hasItemOverrides || c.VENTE_PALIERS.general.length) categories.add('vente');
-  const sortedCategories = [...categories].sort();
-  if (!sortedCategories.length) {
-    embed.setDescription("*Aucun taux de paie configuré (voir `/config salaire set`).*");
+  const hasVentePay = rates.vente != null || venteTiers.general.length > 0 || needsItemBreakdown;
+  const categories = Object.keys(rates).filter(qt => qt !== 'vente').sort();
+  if (!categories.length && !hasVentePay) {
+    embed.setDescription("*Aucun taux de paie configuré (voir `/config salaire set`/`/config palier`).*");
     return embed;
   }
 
-  const fmt = (n: number) => Math.round(n).toLocaleString('fr-FR');
-  const detail = sortedCategories.map(qt => {
-    if (qt === 'vente') {
-      const parts = computeVentePayParts(byQuotaType.vente ?? 0, venteByItem, c);
-      // Une ligne "(reste)" seulement si au moins une drogue a été isolée —
-      // sinon elle porterait tout le total sous un libellé trompeur.
-      const isolated = parts.length > 1;
-      return parts
-        .filter(p => p.item != null || !isolated || p.qty > 0)
-        .map(p => {
-          const label = p.item ?? (isolated ? '(reste)' : '');
-          const calc = p.rate == null ? `${p.qty} (palier)` : `${p.qty} × ${p.rate}$`;
-          return `• Vente${label ? ` ${label}` : ''} : ${calc} = **${fmt(p.pay)}$**`;
-        }).join('\n');
-    }
-    return `• ${capitalize(qt)} : ${byQuotaType[qt] ?? 0} × ${rates[qt]}$ = **${fmt((byQuotaType[qt] ?? 0) * rates[qt])}$**`;
-  }).join('\n');
+  const detail = [
+    ...(hasVentePay ? buildVenteDetailLines(venteByItem, byQuotaType.vente ?? 0, rates.vente ?? 0, venteTiers.general, itemRates, venteTiers.byItem) : []),
+    ...categories.map(qt => `• ${capitalize(qt)} : ${byQuotaType[qt] ?? 0} × ${rates[qt]}$ = **${Math.round((byQuotaType[qt] ?? 0) * rates[qt]).toLocaleString('fr-FR')}$**`),
+  ].join('\n');
 
   const ranking = await getSalaryRanking(guildId);
   const rank = ranking.findIndex(r => r.userId === userId) + 1;
@@ -531,12 +581,55 @@ async function buildPayEmbed(guildId: string, userId: string, member: GuildMembe
   embed.addFields(
     { name: '📋 Détail', value: detail },
     { name: '💵 Salaire total', value: `${Math.round(salaire).toLocaleString('fr-FR')} $`, inline: true },
+    // "(paie)" pour lever l'ambiguïté avec le classement de groupe, basé sur
+    // les points et totalement distinct (voir buildClassementEmbed/getClassementRanking).
     { name: '🏆 Classement (paie)', value: rank ? `#${rank}` : 'N/A', inline: true },
   );
   return embed;
 }
 
-/** Embed du classement de groupe trié par salaire total décroissant. */
+/**
+ * Points de classement d'un joueur à partir de sa carte de stats déjà
+ * chargée (`map`, voir `QuotaSummary`) — contrairement à la paie par item
+ * (voir `computeSalaireAvecItems`/`getVenteByItemMap`), AUCUNE requête
+ * supplémentaire n'est nécessaire ici : le cache `Stat` est déjà détaillé
+ * par activité individuelle (une entrée par clé `ACTIVITY_TYPES`), la
+ * catégorie "actions" n'étant qu'un regroupement de clés déjà disponibles.
+ */
+function computeClassement(guildId: string, map: Record<string, { count: number }>, classementRates: Record<string, number>, activityClassementRates: Record<string, number>): number {
+  const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
+  let sum = 0;
+  for (const [key, cfg] of Object.entries(activityTypes)) {
+    if (!cfg.quotaType) continue;
+    const count = map[key]?.count || 0;
+    if (!count) continue;
+    const rate = cfg.quotaType === 'actions' && activityClassementRates[key] != null
+      ? activityClassementRates[key]
+      : classementRates[cfg.quotaType] ?? 0;
+    sum += count * rate;
+  }
+  return sum;
+}
+
+/**
+ * Classement de tous les membres suivis par points de classement
+ * décroissants (voir `/config classement`) — totalement indépendant du
+ * salaire (`getSalaryRanking`), un joueur peut être premier ici et absent du
+ * classement de paie, ou inversement.
+ */
+async function getClassementRanking(guildId: string): Promise<Array<{ userId: string; points: number }>> {
+  const classementRates = configStore.get(guildId).CLASSEMENT_RATES;
+  const activityClassementRates = configStore.get(guildId).ACTIVITY_CLASSEMENT_RATES;
+  const summaries = await getAllUserQuotaSummaries(guildId);
+  const results: Array<{ userId: string; points: number }> = [];
+  for (const [userId, { map }] of summaries) {
+    const points = computeClassement(guildId, map, classementRates, activityClassementRates);
+    if (points > 0) results.push({ userId, points });
+  }
+  return results.sort((a, b) => b.points - a.points);
+}
+
+/** Embed du classement de groupe, trié par points décroissants (voir `/config classement` — indépendant de la paie, voir `buildPayEmbed`). */
 async function buildClassementEmbed(client: Client, guildId: string): Promise<EmbedBuilder> {
   const ranking = await getClassementRanking(guildId);
   const lines: string[] = [];
@@ -547,7 +640,7 @@ async function buildClassementEmbed(client: Client, guildId: string): Promise<Em
     const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
     const member = await guild?.members.fetch(r.userId).catch(() => null);
     const name = member?.displayName || `<@${r.userId}>`;
-    lines.push(`${medal} ${name} — **${Math.round(r.points).toLocaleString('fr-FR')}** pt${r.points >= 2 ? 's' : ''}`);
+    lines.push(`${medal} ${name} — **${r.points.toLocaleString('fr-FR')}** pt`);
   }
 
   return new EmbedBuilder()
@@ -564,11 +657,11 @@ async function buildClassementEmbed(client: Client, guildId: string): Promise<Em
  * même si elle a un total historique (elle a pu être active plus tôt dans la
  * semaine, avant un changement de tier).
  */
-async function buildBilanEmbed(guildId: string, sinceTs?: number): Promise<EmbedBuilder> {
+async function buildBilanEmbed(guildId: string, sinceTs?: number, untilTs: number = Date.now()): Promise<EmbedBuilder> {
   const since = sinceTs ?? Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
   const activityTypes = configStore.get(guildId).ACTIVITY_TYPES;
   const quantityKeys = Object.entries(activityTypes).filter(([, c]) => c.quantity).map(([k]) => k);
-  const totals = await db.getGroupActionTotals(guildId, since, quantityKeys);
+  const totals = await db.getGroupActionTotals(guildId, since, quantityKeys, untilTs);
   const map: Record<string, number> = {};
   for (const row of totals) map[row.action] = row.total;
 
@@ -677,6 +770,9 @@ function buildButtonRows(guildId: string) {
   for (const rowEntries of direct) {
     const row = new ActionRowBuilder<ButtonBuilder>();
     for (const [key, cfg] of rowEntries) {
+      // Pas d'emoji sur le bouton (cfg.label brut) : l'icône ne s'affiche que dans les
+      // slots braquages de l'embed "Gestion des Activités" (décision explicite de
+      // l'utilisateur) — nulle part ailleurs, y compris ici.
       row.addComponents(new ButtonBuilder().setCustomId(`act_${key}`).setLabel(cfg.label.slice(0, 80)).setStyle(styleFor(cfg)));
     }
     rows.push(row as ActionRowBuilder<ButtonBuilder | UserSelectMenuBuilder>);
@@ -705,6 +801,8 @@ function buildButtonRows(guildId: string) {
 
 // ─── MESSAGE PERMANENT ────────────────────────────────────────────────────────
 
+const MAIN_PANEL_TITLE = '🎮 Gestion des Activités';
+
 /** Édite le panneau d'activités permanent (ou le crée s'il n'existe pas encore/plus). */
 export async function initPermanentMessage(client: Client, guildId: string): Promise<void> {
   const c = configStore.get(guildId);
@@ -713,20 +811,10 @@ export async function initPermanentMessage(client: Client, guildId: string): Pro
     const channel = await client.channels.fetch(c.CHANNELS.quotas).catch(() => null);
     if (!channel || !channel.isSendable()) return;
 
-    const embed = await buildMainEmbed(guildId);
-    const rows = buildButtonRows(guildId);
-
-    const storedId = await db.getSetting(guildId, 'quota_message_id');
-    if (storedId) {
-      const msg = await channel.messages.fetch(storedId).catch(() => null);
-      if (msg) {
-        await msg.edit({ embeds: [embed], components: rows });
-        return;
-      }
-    }
-
-    const newMsg = await channel.send({ embeds: [embed], components: rows });
-    await db.setSetting(guildId, 'quota_message_id', newMsg.id);
+    await upsertPanel(channel, guildId, 'quota_message_id', MAIN_PANEL_TITLE, async () => ({
+      embeds: [await buildMainEmbed(guildId)],
+      components: buildButtonRows(guildId),
+    }));
   } catch (err) {
     console.error(`[quotas] initPermanentMessage(${guildId}):`, (err as Error).message);
   }
@@ -789,6 +877,12 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
   if (!cfg.enabled) {
     return replyAutoDelete(interaction, `❌ **${cfg.label}** n'est pas disponible pour le type d'organisation actuel.`);
   }
+  // Une activité sans bouton (ex. la vente, créditée par le circuit retrait →
+  // dépôt d'argent) ne se déclare jamais depuis le panneau : un `customId`
+  // forgé ne doit pas ouvrir un raccourci.
+  if (!cfg.panelButton) {
+    return replyAutoDelete(interaction, `❌ **${cfg.label}** ne se déclare pas depuis le panneau.`);
+  }
 
   if (cfg.labo) {
     const select = new UserSelectMenuBuilder()
@@ -801,7 +895,7 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
     }, { deleteAfterMs: 60_000 });
   }
 
-  if (cfg.braquageWeeklyLimit) {
+  if (cfg.braquageWeeklyLimit != null) {
     if (!(await checkBraquageLimit(guildId, key))) {
       const used = await db.getBraquageCount(guildId, key);
       return replyAutoDelete(interaction, `🚫 La limite hebdomadaire de **${cfg.label}** est atteinte (${used}/${cfg.braquageWeeklyLimit} sur 7 jours).`);
@@ -830,7 +924,8 @@ async function triggerActivity(interaction: ButtonInteraction | StringSelectMenu
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId('quantite').setLabel('Quantité')
-            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10),
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)
+            .setPlaceholder(`Nombre entier, ${MAX_QUANTITE_DECLARATION.toLocaleString('fr-FR')} au plus`),
         ),
       );
     if (interaction.isButton() || interaction.isStringSelectMenu()) return interaction.showModal(modal);
@@ -893,17 +988,19 @@ async function handleMinuterie(interaction: ButtonInteraction, guildId: string):
   const entries = Object.entries(activityTypes).sort((a, b) => a[1].displayOrder - b[1].displayOrder);
 
   const cooldownLines = await Promise.all(
-    entries.filter(([, cfg]) => cfg.cooldownMs && !cfg.labo && !cfg.braquageWeeklyLimit).map(async ([key, cfg]) => {
+    entries.filter(([, cfg]) => cfg.cooldownMs && !cfg.labo && cfg.braquageWeeklyLimit == null).map(async ([key, cfg]) => {
       const remaining = await checkCooldown(guildId, userId, key);
       const status = remaining ? `⏳ ${formatTime(remaining)}` : '✅ Dispo';
       return `**${cfg.label}** : ${status}`;
     }),
   );
 
+  const braquageEntries = entries.filter(([, cfg]) => cfg.enabled && cfg.braquageWeeklyLimit != null);
+  const braquageCounts = await db.getBraquageCounts(guildId, braquageEntries.map(([key]) => key));
   const braquageLines = await Promise.all(
-    entries.filter(([, cfg]) => cfg.enabled && cfg.braquageWeeklyLimit != null).map(async ([key, cfg]) => {
+    braquageEntries.map(async ([key, cfg]) => {
       const limit = cfg.braquageWeeklyLimit!;
-      const dispo = Math.max(0, limit - (await db.getBraquageCount(guildId, key)));
+      const dispo = Math.max(0, limit - (braquageCounts[key] ?? 0));
       let line = `${dispo > 0 ? '🟢' : '🔴'} **${cfg.label}** : ${dispo}/${limit}`;
       if (dispo === 0) {
         const oldest = await db.getOldestBraquage(guildId, key);
@@ -950,42 +1047,100 @@ export async function handleStringSelect(interaction: StringSelectMenuInteractio
 
 // ─── HANDLER MODALS ───────────────────────────────────────────────────────────
 
-/** Route les soumissions de modal (`modal_act_*`, `modal_actlabo_*`) : enregistre la transaction et met à jour stats/cooldown/panneau. */
+/** Flux de déclaration d'une activité — chacun n'est valable que pour un type d'activité (voir {@link fluxAutorise}). */
+type FluxDeclaration = 'simple' | 'quantite' | 'labo' | 'braquage';
+
+/**
+ * Vrai si ce flux correspond bien à cette activité. Un modal ou un menu se
+ * soumet avec un `customId` que le serveur ne doit pas croire sur parole :
+ * soumettre `modal_act_<braquage>` contournerait la limite hebdomadaire,
+ * `act_select_<activité à cooldown>` le cooldown, `modal_act_vente` le
+ * circuit retrait → dépôt d'argent.
+ */
+function fluxAutorise(cfg: ActivityTypeConfig, flux: FluxDeclaration): boolean {
+  if (!cfg.panelButton) return false;
+  const braquage = cfg.braquageWeeklyLimit != null;
+  if (flux === 'labo') return cfg.labo;
+  if (flux === 'braquage') return !cfg.labo && braquage;
+  if (cfg.labo || braquage) return false;
+  return flux === 'quantite' ? cfg.quantity : !cfg.quantity;
+}
+
+/** Message de refus d'une déclaration rejetée par `db.recordActivity` (limite ou cooldown atteint entre l'ouverture et la soumission). */
+function refusDeclaration(cfg: ActivityTypeConfig, result: Exclude<db.ActivityResult, { ok: true }>): string {
+  return result.reason === 'limite'
+    ? `🚫 La limite hebdomadaire de **${cfg.label}** est atteinte (${result.used}/${cfg.braquageWeeklyLimit} sur 7 jours).`
+    : `⏳ Tu es en cooldown pour **${cfg.label}** encore **${formatTime(result.remainingMs)}**.`;
+}
+
+/**
+ * Confirme au membre une déclaration déjà enregistrée, puis publie ses suites
+ * (log dans `logs_activites`, panneau, `extra`). La réponse passe d'abord —
+ * Discord n'attend que 3 secondes, et un membre qui voit un échec alors que
+ * tout est enregistré déclare une seconde fois — mais les suites sont
+ * publiées même si la réponse échoue : l'activité est enregistrée quoi qu'il arrive.
+ */
+async function confirmDeclaration(
+  reply: () => Promise<void>, client: Client, guildId: string, embed: EmbedBuilder, extra?: () => Promise<void>,
+): Promise<void> {
+  await reply().catch(err => console.error(`[quotas] réponse à une déclaration enregistrée (${guildId}) :`, (err as Error).message));
+  try {
+    if (extra) await extra();
+    await logActivite(client, guildId, embed);
+    await updatePermanentMessage(client, guildId);
+  } catch (err) {
+    console.error(`[quotas] suites d'une déclaration (${guildId}) :`, (err as Error).message);
+  }
+}
+
+const REFUS_FLUX = "❌ Cette activité ne se déclare pas de cette façon.";
+
+/**
+ * Route les soumissions de modal (`modal_act_*`, `modal_actlabo_*`). Tout ce
+ * qui a été vérifié à l'ouverture (activité disponible pour le tier,
+ * cooldown) est revérifié ici : un modal peut rester ouvert longtemps, ou
+ * être ouvert sur deux appareils.
+ */
 export async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
   const id = interaction.customId;
   const guildId = interaction.guildId!;
+  const user = interaction.user;
 
   if (id.startsWith('modal_act_') && !id.startsWith('modal_actlabo_')) {
     const key = id.slice('modal_act_'.length);
     const cfg = configStore.get(guildId).ACTIVITY_TYPES[key];
     if (!cfg) return;
+    if (!cfg.enabled) return replyAutoDelete(interaction, `❌ **${cfg.label}** n'est pas disponible pour le type d'organisation actuel.`);
+    if (!fluxAutorise(cfg, cfg.quantity ? 'quantite' : 'simple')) return replyAutoDelete(interaction, REFUS_FLUX);
 
     if (cfg.quantity) {
       const type = interaction.fields.getTextInputValue('type').trim();
-      const rawQty = interaction.fields.getTextInputValue('quantite').trim();
-      const quantite = parseInt(rawQty, 10);
-      if (isNaN(quantite) || quantite <= 0) return replyAutoDelete(interaction, '❌ Quantité invalide.');
+      const quantite = parseEntier(interaction.fields.getTextInputValue('quantite'));
+      if (!quantite) return replyAutoDelete(interaction, '❌ Quantité invalide (nombre entier attendu).');
+      if (quantite > MAX_QUANTITE_DECLARATION) {
+        return replyAutoDelete(interaction, `❌ Quantité trop élevée : **${MAX_QUANTITE_DECLARATION.toLocaleString('fr-FR')}** au plus par déclaration.`);
+      }
 
-      const txId = await db.addTransaction(guildId, { user_id: interaction.user.id, username: interaction.user.tag, action: key, quantite, type, timestamp: Date.now() });
-      await db.incrementStat(guildId, interaction.user.id, key, quantite, 0);
+      const result = await db.recordActivity(guildId, { userId: user.id, username: user.tag, action: key, quantite, type, statDelta: quantite });
+      if (!result.ok) return replyAutoDelete(interaction, refusDeclaration(cfg, result));
 
-      const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, { Type: type, Quantité: quantite.toLocaleString('fr-FR') });
-      await logActivite(interaction.client, guildId, embed);
-      await updatePermanentMessage(interaction.client, guildId);
-      return replyAutoDelete(interaction, `✅ **${cfg.label}** — ${quantite.toLocaleString('fr-FR')} × ${type} enregistrés (ID #${txId}).`);
+      const embed = buildTransactionEmbed(guildId, result.txId, user.id, user.tag, key, { Type: type, Quantité: quantite.toLocaleString('fr-FR') });
+      return confirmDeclaration(
+        () => replyAutoDelete(interaction, { content: `✅ **${cfg.label}** — ${quantite.toLocaleString('fr-FR')} × ${type} enregistrés (ID #${result.txId}).`, allowedMentions: { parse: [] } }),
+        interaction.client, guildId, embed,
+      );
     }
 
     const confirm = interaction.fields.getTextInputValue('confirm').trim().toLowerCase();
     if (confirm !== 'oui') return replyAutoDelete(interaction, '❌ Action annulée.');
 
-    const txId = await db.addTransaction(guildId, { user_id: interaction.user.id, username: interaction.user.tag, action: key, timestamp: Date.now() });
-    await db.incrementStat(guildId, interaction.user.id, key, 1, 0);
-    if (cfg.cooldownMs) await db.setCooldown(guildId, interaction.user.id, key, Date.now() + cfg.cooldownMs);
+    const result = await db.recordActivity(guildId, { userId: user.id, username: user.tag, action: key, statDelta: 1, cooldownMs: cfg.cooldownMs });
+    if (!result.ok) return replyAutoDelete(interaction, refusDeclaration(cfg, result));
 
-    const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, {});
-    await logActivite(interaction.client, guildId, embed);
-    await updatePermanentMessage(interaction.client, guildId);
-    return replyAutoDelete(interaction, `✅ **${cfg.label}** enregistré (ID #${txId}).`);
+    return confirmDeclaration(
+      () => replyAutoDelete(interaction, `✅ **${cfg.label}** enregistré (ID #${result.txId}).`),
+      interaction.client, guildId, buildTransactionEmbed(guildId, result.txId, user.id, user.tag, key, {}),
+    );
   }
 
   if (id.startsWith('modal_actlabo_')) {
@@ -993,43 +1148,39 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
     const [key, token = ''] = withoutPrefix.split('|');
     const cfg = configStore.get(guildId).ACTIVITY_TYPES[key];
     if (!cfg) return;
+    if (!cfg.enabled) return replyAutoDelete(interaction, `❌ **${cfg.label}** n'est pas disponible pour le type d'organisation actuel.`);
+    if (!fluxAutorise(cfg, 'labo')) return replyAutoDelete(interaction, REFUS_FLUX);
 
-    const tempsRaw = interaction.fields.getTextInputValue('temps_restant').trim();
-    const tempsMinutes = parseInt(tempsRaw, 10);
-    // 0 accepté : certains labos (Salvia, Branche De Cannabis) n'ont pas de
-    // délai de production — le salon reste disponible (voir setLaboStatut).
-    if (isNaN(tempsMinutes) || tempsMinutes < 0) return replyAutoDelete(interaction, '❌ Temps restant invalide.');
+    // 0 accepté : certains labos n'ont pas de délai de production réel — le
+    // salon reste disponible (voir setLaboStatut, alertes.ts).
+    const tempsMinutes = parseEntier(interaction.fields.getTextInputValue('temps_restant'));
+    if (tempsMinutes == null) return replyAutoDelete(interaction, '❌ Temps restant invalide (nombre entier de minutes attendu).');
+    if (tempsMinutes > MAX_TEMPS_LABO_MINUTES) {
+      return replyAutoDelete(interaction, `❌ Temps restant trop long : **${MAX_TEMPS_LABO_MINUTES.toLocaleString('fr-FR')}** minutes au plus.`);
+    }
 
-    const partnerIds = token ? (pendingLaboParticipants.get(token) || []) : [];
-    if (token && !partnerIds.length) {
+    const pending = token ? pendingLaboParticipants.get(token) : undefined;
+    if (token && (!pending || pending.guildId !== guildId || pending.userId !== user.id)) {
       return replyAutoDelete(interaction, '❌ La sélection de participants a expiré. Recommence.');
     }
     if (token) pendingLaboParticipants.delete(token);
+    const partnerIds = (pending?.partnerIds ?? []).filter(pid => pid !== user.id);
 
-    const filteredPartnerIds = partnerIds.filter(pid => pid !== interaction.user.id);
-    const allIds = [interaction.user.id, ...filteredPartnerIds];
+    const result = await db.recordActivity(guildId, {
+      userId: user.id, username: user.tag, action: key,
+      partenaires: partnerIds, tempsRestant: String(tempsMinutes), statDelta: 1,
+    });
+    if (!result.ok) return replyAutoDelete(interaction, refusDeclaration(cfg, result));
 
-    await replyAutoDelete(interaction, `✅ **${cfg.label}** validé. Enregistrement en cours...`);
-
-    void (async () => {
-      try {
-        const txId = await db.addTransaction(guildId, {
-          user_id: interaction.user.id, username: interaction.user.tag, action: key,
-          partenaires: partnerIds, temps_restant: String(tempsMinutes), timestamp: Date.now(),
-        });
-        for (const uid of allIds) await db.incrementStat(guildId, uid, key, 1, 0);
-        await alertes.setLaboStatut(interaction.client, guildId, key, false, tempsMinutes);
-
-        const partnerMentions = partnerIds.length ? partnerIds.map(pid => `<@${pid}>`).join(', ') : '*Aucun*';
-        const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, {
-          'Temps restant': `${tempsMinutes} min`, Participants: `${allIds.length}`, Partenaires: partnerMentions,
-        });
-        await logActivite(interaction.client, guildId, embed);
-        await updatePermanentMessage(interaction.client, guildId);
-      } catch (err) {
-        console.error('[quotas] erreur traitement labo:', (err as Error).message);
-      }
-    })();
+    const embed = buildTransactionEmbed(guildId, result.txId, user.id, user.tag, key, {
+      'Temps restant': `${tempsMinutes} min`,
+      Participants: `${partnerIds.length + 1}`,
+      Partenaires: partnerIds.length ? partnerIds.map(pid => `<@${pid}>`).join(', ') : '*Aucun*',
+    });
+    return confirmDeclaration(
+      () => replyAutoDelete(interaction, `✅ **${cfg.label}** enregistré (ID #${result.txId}).`),
+      interaction.client, guildId, embed, () => alertes.setLaboStatut(interaction.client, guildId, key, false, tempsMinutes),
+    );
   }
 }
 
@@ -1043,42 +1194,51 @@ export async function handleSelect(interaction: UserSelectMenuInteraction): Prom
   const key = id.slice('act_select_'.length);
   const cfg = configStore.get(guildId).ACTIVITY_TYPES[key];
   if (!cfg) return;
+  // Le menu reste utilisable 60 s : le tier a pu changer entre-temps.
+  if (!cfg.enabled) {
+    return updateAutoDelete(interaction, { content: `❌ **${cfg.label}** n'est pas disponible pour le type d'organisation actuel.`, components: [] });
+  }
+  if (!fluxAutorise(cfg, cfg.labo ? 'labo' : 'braquage')) return updateAutoDelete(interaction, { content: REFUS_FLUX, components: [] });
 
   if (cfg.labo) {
     const selectedIds = interaction.values.filter(uid => uid !== interaction.user.id);
-    const token = selectedIds.length ? createLaboParticipantToken(selectedIds) : '';
+    const token = selectedIds.length ? createLaboParticipantToken(guildId, interaction.user.id, selectedIds) : '';
     const modal = new ModalBuilder()
       .setCustomId(`modal_actlabo_${key}${token ? `|${token}` : ''}`)
       .setTitle(`${cfg.label} — Temps restant`.slice(0, 45))
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId('temps_restant').setLabel('Temps restant (en minutes)')
-            .setPlaceholder('0 si ce labo n\'a pas de délai de production')
-            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(5),
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(5)
+            .setPlaceholder("0 si ce labo n'a pas de délai de production"),
         ),
       );
     return interaction.showModal(modal);
   }
 
-  // Braquage : partenaires sélectionnés → enregistrement direct
+  // Braquage : partenaires sélectionnés → enregistrement direct. La limite
+  // hebdomadaire, vérifiée au clic sur le bouton, est revérifiée dans la
+  // transaction d'écriture : plusieurs menus peuvent être ouverts en même
+  // temps pour un seul slot restant.
   const selectedIds = interaction.values.filter(uid => uid !== interaction.user.id);
   const allIds = [interaction.user.id, ...selectedIds];
 
-  await db.addBraquage(guildId, interaction.user.id, key);
-  const txId = await db.addTransaction(guildId, { user_id: interaction.user.id, username: interaction.user.tag, action: key, partenaires: selectedIds, timestamp: Date.now() });
-  for (const uid of allIds) await db.incrementStat(guildId, uid, key, 1, 0);
+  const result = await db.recordActivity(guildId, {
+    userId: interaction.user.id, username: interaction.user.tag, action: key,
+    partenaires: selectedIds, statDelta: 1, braquageLimit: cfg.braquageWeeklyLimit,
+  });
+  if (!result.ok) return updateAutoDelete(interaction, { content: refusDeclaration(cfg, result), components: [] });
 
-  const embed = buildTransactionEmbed(guildId, txId, interaction.user.id, interaction.user.tag, key, {
+  const embed = buildTransactionEmbed(guildId, result.txId, interaction.user.id, interaction.user.tag, key, {
     Partenaires: selectedIds.length ? selectedIds.map(p => `<@${p}>`).join(', ') : '*Aucun*',
   });
-  await logActivite(interaction.client, guildId, embed);
-  await alertes.postBraquageAlert(interaction.client, guildId, key);
-  await updatePermanentMessage(interaction.client, guildId);
-
-  return updateAutoDelete(interaction, {
-    content: `✅ **${cfg.label}** enregistré (ID #${txId}). Participants : ${allIds.map(p => `<@${p}>`).join(', ')}.`,
-    components: [],
-  });
+  return confirmDeclaration(
+    () => updateAutoDelete(interaction, {
+      content: `✅ **${cfg.label}** enregistré (ID #${result.txId}). Participants : ${allIds.map(p => `<@${p}>`).join(', ')}.`,
+      components: [],
+    }),
+    interaction.client, guildId, embed, () => alertes.postBraquageAlert(interaction.client, guildId, key),
+  );
 }
 
 // ─── COMMANDE /supp ───────────────────────────────────────────────────────────
@@ -1099,23 +1259,24 @@ export async function handleSuppCommand(interaction: ChatInputCommandInteraction
   }
 
   const cfg = configStore.get(guildId).ACTIVITY_TYPES[tx.action];
-  const allIds = [tx.userId, ...tx.partenaires];
+  // `!= null` et pas un test de véracité : une limite à 0 (activité fermée au
+  // tier courant) reste un braquage, dont les partenaires ont été crédités.
+  const estBraquage = cfg?.braquageWeeklyLimit != null;
+  const collectif = !!cfg && !cfg.quantity && (cfg.labo || estBraquage);
 
-  if (cfg) {
-    if (cfg.quantity) {
-      await db.decrementStat(guildId, tx.userId, tx.action, tx.quantite, 0);
-    } else if (cfg.labo || cfg.braquageWeeklyLimit) {
-      for (const uid of allIds) await db.decrementStat(guildId, uid, tx.action, 1, 0);
-      // Le braquage consommait un slot hebdomadaire partagé : le libérer aussi,
-      // sinon le groupe reste bloqué à un slot de moins jusqu'à ce que l'entrée
-      // sorte de la fenêtre glissante de 7 jours (voir db.removeMostRecentBraquage).
-      if (cfg.braquageWeeklyLimit) await db.removeMostRecentBraquage(guildId, tx.userId, tx.action);
-    } else {
-      await db.decrementStat(guildId, tx.userId, tx.action, 1, 0);
-    }
+  // Le braquage consommait un slot hebdomadaire partagé : `suppTransaction`
+  // le libère aussi, sinon le groupe reste à un slot de moins jusqu'à ce que
+  // l'entrée sorte de la fenêtre glissante de 7 jours.
+  const supprimee = await db.suppTransaction(guildId, txId, interaction.user.tag, {
+    statUserIds: !cfg ? [] : collectif ? [tx.userId, ...tx.partenaires] : [tx.userId],
+    statDelta: cfg?.quantity ? tx.quantite : 1,
+    sinceTs: Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0),
+    freeBraquage: estBraquage,
+  });
+  if (!supprimee) {
+    await interaction.reply({ content: `❌ Transaction #${txId} introuvable ou déjà supprimée.`, flags: MessageFlags.Ephemeral });
+    return;
   }
-
-  await db.deleteTransaction(guildId, txId, interaction.user.tag);
 
   const embed = new EmbedBuilder()
     .setTitle(`🗑️ Transaction #${txId} supprimée`)
@@ -1137,45 +1298,127 @@ export async function handleSuppCommand(interaction: ChatInputCommandInteraction
 
 const LAST_RESET_KEY = 'last_weekly_reset';
 
+/** Semaines closes restant à publier (voir `db.performWeeklyReset`). */
+const PUBLICATION_KEY = 'weekly_publication';
+
+const weeklyResetRunning = new Set<string>();
+
 /**
- * Reformate `date` en heure de Paris puis reparse la chaîne obtenue comme si
- * elle était locale au serveur : le `Date` renvoyé a donc des champs
- * (`getHours`/`getDay`/`setHours`/`setDate`...) qui reflètent l'heure de Paris,
- * quel que soit le fuseau du serveur qui exécute le process — indispensable
- * pour comparer/calculer une échéance "dimanche 19h Europe/Paris" sans
- * dépendre du fuseau système. Le format `en-US` produit une chaîne
- * (`MM/DD/YYYY, HH:mm:ss`) que `new Date(...)` sait reparser de façon fiable.
+ * Cron (toutes les 15 min, et au démarrage) : reset hebdomadaire s'il est dû,
+ * puis publication des semaines closes.
+ *
+ * Les deux sont découplés. Le reset est une seule transaction DB (stats
+ * reconstruites, date avancée, semaines notées à publier), qui clôt chaque
+ * semaine pile au dimanche 19h — les mêmes bornes que `?week=` côté API,
+ * quelle que soit l'heure réelle du passage, et une période par dimanche
+ * manqué. La publication (bilan, paie, fourrières) est calculée depuis
+ * `Transaction` sur la période close, jamais depuis `Stat`. Chaque étape est
+ * indépendante des autres et cochée une fois postée : une erreur Discord ou
+ * un arrêt du process la fait reprendre au passage suivant sans rien
+ * reposter (voir `permanent-message.sendOnce`), et une semaine pas encore
+ * publiée n'est jamais écrasée par la suivante.
  */
-function parisWallClock(date: Date): Date {
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Europe/Paris',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    hourCycle: 'h23',
-  });
-  return new Date(fmt.format(date));
-}
-
-/** Vrai si le dernier reset hebdomadaire enregistré est antérieur au dimanche 19h Europe/Paris le plus récent. */
-async function isWeeklyResetDue(guildId: string): Promise<boolean> {
-  const wallNow = parisWallClock(new Date());
-  const boundary = new Date(wallNow);
-  boundary.setHours(19, 0, 0, 0);
-  boundary.setDate(boundary.getDate() - boundary.getDay());
-  if (boundary.getTime() > wallNow.getTime()) boundary.setDate(boundary.getDate() - 7);
-
-  const lastMs = Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
-  const wallLast = parisWallClock(new Date(lastMs));
-  return wallLast.getTime() < boundary.getTime();
-}
-
-/** Cron (toutes les 15 min) : déclenche le reset hebdomadaire s'il est en retard (voir `isWeeklyResetDue`) — auto-réparant si le bot était down au moment prévu. */
 export async function checkWeeklyReset(client: Client, guildId: string): Promise<void> {
-  if (!(await isWeeklyResetDue(guildId))) return;
-  const previousReset = Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
-  await db.setSetting(guildId, LAST_RESET_KEY, Date.now());
-  console.log(`[quotas] Reset hebdomadaire en retard détecté (${guildId}) — déclenchement automatique.`);
-  await weeklyReset(client, guildId, previousReset);
+  if (weeklyResetRunning.has(guildId)) return;
+  weeklyResetRunning.add(guildId);
+  try {
+    const stored = await db.getSetting(guildId, LAST_RESET_KEY);
+    if (stored == null) {
+      // Guilde jamais remise à zéro : aucune semaine à clôturer, la première part de maintenant.
+      await db.setSetting(guildId, LAST_RESET_KEY, Date.now());
+      return;
+    }
+    let since = Number(stored) || 0;
+    const boundaries = weeklyBoundariesBetween(since, Date.now());
+    if (boundaries.length) {
+      const periods = boundaries.map(until => { const period = { since, until }; since = until; return period; });
+      await db.performWeeklyReset(guildId, LAST_RESET_KEY, PUBLICATION_KEY, periods, quantityActionKeys(guildId));
+      console.log(`[quotas] Reset hebdomadaire effectué (${guildId}) — ${periods.length} semaine(s) close(s).`);
+      await deleteQuotaReminder(client, guildId);
+    }
+    await publishPendingWeeks(client, guildId);
+  } catch (err) {
+    console.error(`[quotas] checkWeeklyReset(${guildId}) — nouvelle tentative au prochain passage :`, (err as Error).message);
+  } finally {
+    weeklyResetRunning.delete(guildId);
+  }
+}
+
+/**
+ * Salon de publication : `null` s'il n'est pas configuré, n'existe plus ou
+ * n'accepte pas de message — l'étape est alors faite, rien à retenter. Toute
+ * autre erreur de lecture remonte : l'étape reste à faire.
+ */
+async function publicationChannel(client: Client, channelId: string | null | undefined) {
+  if (!channelId) return null;
+  try {
+    const channel = await client.channels.fetch(channelId);
+    return channel?.isSendable() ? channel : null;
+  } catch (err) {
+    if (err instanceof DiscordAPIError && err.code === RESTJSONErrorCodes.UnknownChannel) return null;
+    throw err;
+  }
+}
+
+/** Publie ce qui reste à publier des semaines closes, de la plus ancienne à la plus récente. */
+async function publishPendingWeeks(client: Client, guildId: string): Promise<void> {
+  const pending = await db.getPendingPublications(guildId, PUBLICATION_KEY);
+  if (!pending.length) return;
+  for (const week of pending) await publishWeek(client, guildId, week, () => db.setPendingPublications(guildId, PUBLICATION_KEY, pending));
+  await db.setPendingPublications(guildId, PUBLICATION_KEY, pending.filter(week => !(week.bilan && week.paie && week.fourrieres)));
+}
+
+/** Les trois étapes de publication d'une semaine close, chacune indépendante : une étape en échec n'empêche pas les autres et sera retentée. */
+async function publishWeek(client: Client, guildId: string, week: db.PendingPublication, save: () => Promise<void>): Promise<void> {
+  const c = configStore.get(guildId);
+  const range: QuotaRange = { since: week.since, until: week.until };
+  const debut = week.since > 0 ? week.since : week.until - 7 * 24 * 60 * 60 * 1000;
+  const entete = `${formatDate(debut)} — ${formatDate(week.until)}`;
+  const etape = async (nom: 'bilan' | 'paie' | 'fourrieres', fn: () => Promise<void>) => {
+    if (week[nom]) return;
+    try {
+      await fn();
+      week[nom] = true;
+      await save();
+    } catch (err) {
+      console.error(`[quotas] publication ${nom} (${guildId}, ${entete}) — nouvelle tentative au prochain passage :`, (err as Error).message);
+    }
+  };
+
+  await etape('bilan', async () => {
+    const channel = await publicationChannel(client, c.CHANNELS.bilan);
+    if (!channel) return;
+    const title = `📊 Bilan hebdomadaire — ${entete}`;
+    const bilanEmbed = (await buildBilanEmbed(guildId, range.since, range.until)).setTitle(title);
+    await sendOnce(channel, [{ embeds: [bilanEmbed] }], title);
+  });
+
+  await etape('paie', async () => {
+    const channel = await publicationChannel(client, c.CHANNELS.paie);
+    if (!channel) return;
+    const ranking = (await getAllUserPayForRange(guildId, range)).filter(r => r.salaire > 0).sort((a, b) => b.salaire - a.salaire);
+    if (!ranking.length) return;
+
+    const guild = client.guilds.cache.get(guildId);
+    const targets = c.QUOTA_TARGETS;
+    const lines: string[] = [];
+    for (let i = 0; i < ranking.length; i++) {
+      const r = ranking[i];
+      const member = guild ? await guild.members.fetch(r.userId).catch(() => null) : null;
+      const name = member?.displayName || `<@${r.userId}>`;
+      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+      const quotaLine = Object.keys(targets).sort()
+        .map(qt => `${capitalize(qt)} ${r.byQuotaType[qt] ?? 0}/${targets[qt]}`)
+        .join(' | ');
+      lines.push(`${medal} **${name}** — 💵 ${Math.round(r.salaire).toLocaleString('fr-FR')} ${quotaLine ? `\n    ${quotaLine}` : ''}\n`);
+    }
+    // Un message par embed : Discord plafonne aussi le total des embeds d'un même message.
+    const title = `💰 Paie hebdomadaire — ${entete}`;
+    const embeds = buildChunkedEmbeds([{ lines }], { title, color: 0xFEE75C });
+    await sendOnce(channel, embeds.map(embed => ({ embeds: [embed] })), title);
+  });
+
+  await etape('fourrieres', () => garages.resetFourrieresHebdo(client, guildId, entete, week.until));
 }
 
 // ─── RAPPEL DE QUOTA DU DIMANCHE (00h → 19h) — spécifique à la catégorie "vente" ──
@@ -1242,7 +1485,7 @@ async function ensureQuotaReminderMessage(client: Client, guildId: string): Prom
 
   const messageId = await db.getSetting(guildId, QUOTA_REMINDER_KEY);
   if (messageId) {
-    const existing = await channel.messages.fetch(messageId).catch(() => null);
+    const existing = await fetchMessageOrNull(channel, messageId);
     if (existing) return existing;
     console.log(`[quotas] Rappel de quota introuvable (${guildId}, supprimé manuellement) — recréation.`);
   }
@@ -1256,24 +1499,45 @@ async function ensureQuotaReminderMessage(client: Client, guildId: string): Prom
 /** Cron (toutes les 15 min) : s'assure que le rappel de quota du dimanche existe pendant sa fenêtre d'affichage. */
 export async function checkQuotaReminder(client: Client, guildId: string): Promise<void> {
   if (!isDansFenetreRappelQuota()) return;
-  try { await ensureQuotaReminderMessage(client, guildId); } catch (err) { console.error(`[quotas] checkQuotaReminder(${guildId}):`, (err as Error).message); }
+  try { await reminders.run(guildId, () => ensureQuotaReminderMessage(client, guildId)); } catch (err) { console.error(`[quotas] checkQuotaReminder(${guildId}):`, (err as Error).message); }
 }
 
-/** Rafraîchit immédiatement le rappel de quota (appelé après confirmation d'une vente, plutôt que d'attendre le prochain cron). */
+/**
+ * Le cron (`checkQuotaReminder`) et une vente confirmée (`syncQuotaReminder`)
+ * peuvent tous deux créer le rappel : exécutés en série par guilde, jamais
+ * deux rappels postés en même temps.
+ */
+const reminders = new SerialRunner();
+
+/**
+ * Rafraîchit immédiatement le rappel de quota — après confirmation d'une
+ * vente ou un changement d'objectif (`/config quota`), plutôt que d'attendre
+ * le prochain cron. Objectif vente retiré : le rappel est supprimé.
+ */
 export async function syncQuotaReminder(client: Client, guildId: string): Promise<void> {
   if (!isDansFenetreRappelQuota()) return;
   try {
-    const quota = configStore.get(guildId).QUOTA_TARGETS['vente'];
-    if (quota == null) return;
-    const msg = await ensureQuotaReminderMessage(client, guildId);
-    if (msg) await msg.edit(buildQuotaReminderPayload(await getMembresSousQuotaVente(guildId), quota));
+    await reminders.run(guildId, async () => {
+      const quota = configStore.get(guildId).QUOTA_TARGETS['vente'];
+      if (quota == null) {
+        await deleteQuotaReminderMessage(client, guildId);
+        return;
+      }
+      const msg = await ensureQuotaReminderMessage(client, guildId);
+      if (msg) await msg.edit(buildQuotaReminderPayload(await getMembresSousQuotaVente(guildId), quota));
+    });
   } catch (err) {
     console.error(`[quotas] syncQuotaReminder(${guildId}):`, (err as Error).message);
   }
 }
 
 /** Supprime le message de rappel de quota (appelé au reset hebdomadaire, les compteurs repartant à zéro). */
-async function deleteQuotaReminder(client: Client, guildId: string): Promise<void> {
+function deleteQuotaReminder(client: Client, guildId: string): Promise<void> {
+  return reminders.run(guildId, () => deleteQuotaReminderMessage(client, guildId));
+}
+
+/** Corps de `deleteQuotaReminder`, à n'appeler que depuis la file `reminders`. */
+async function deleteQuotaReminderMessage(client: Client, guildId: string): Promise<void> {
   const messageId = await db.getSetting(guildId, QUOTA_REMINDER_KEY);
   if (!messageId) return;
   await db.setSetting(guildId, QUOTA_REMINDER_KEY, '');
@@ -1288,66 +1552,7 @@ async function deleteQuotaReminder(client: Client, guildId: string): Promise<voi
   }
 }
 
-/** Reset hebdomadaire : publie bilan + paie, remet les stats à zéro. */
-export async function weeklyReset(client: Client, guildId: string, sinceTs?: number): Promise<void> {
-  try {
-    const c = configStore.get(guildId);
-    const since = sinceTs ?? Number((await db.getSetting(guildId, LAST_RESET_KEY)) || 0);
-    const now = new Date();
-    const endDate = formatDate(now.getTime());
-    const startTs = now.getTime() - 7 * 24 * 60 * 60 * 1000;
-    const startDate = formatDate(startTs);
-    const entete = `${startDate} — ${endDate}`;
-
-    if (c.CHANNELS.bilan) {
-      const bilanEmbed = await buildBilanEmbed(guildId, since);
-      bilanEmbed.setTitle(`📊 Bilan hebdomadaire — ${entete}`);
-      const bilanChannel = await client.channels.fetch(c.CHANNELS.bilan).catch(() => null);
-      if (bilanChannel?.isSendable()) await bilanChannel.send({ embeds: [bilanEmbed] }).catch(() => null);
-    }
-
-    if (c.CHANNELS.paie) {
-      const ranking = await getSalaryRanking(guildId);
-      const paieChannel = await client.channels.fetch(c.CHANNELS.paie).catch(() => null);
-      const guild = client.guilds.cache.get(guildId);
-
-      if (paieChannel?.isSendable() && ranking.length) {
-        const targets = c.QUOTA_TARGETS;
-        const lines: string[] = [];
-        for (let i = 0; i < ranking.length; i++) {
-          const r = ranking[i];
-          const member = guild ? await guild.members.fetch(r.userId).catch(() => null) : null;
-          const name = member?.displayName || `<@${r.userId}>`;
-          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-          const quotaLine = Object.keys(targets).sort()
-            .map(qt => `${capitalize(qt)} ${r.byQuotaType[qt] ?? 0}/${targets[qt]}`)
-            .join(' | ');
-
-          lines.push(
-            `${medal} **${name}** — 💵 ${Math.round(r.salaire).toLocaleString('fr-FR')} $\n` +
-            (quotaLine ? `    ${quotaLine}` : ''),
-          );
-        }
-
-        const paieEmbed = new EmbedBuilder()
-          .setTitle(`💰 Paie hebdomadaire — ${entete}`)
-          .setColor(0xFEE75C)
-          .setDescription(lines.join('\n\n'))
-          .setTimestamp();
-        await paieChannel.send({ embeds: [paieEmbed] }).catch(() => null);
-      }
-    }
-
-    await db.resetAllStats(guildId);
-    await deleteQuotaReminder(client, guildId);
-    await garages.resetFourrieresHebdo(client, guildId, entete);
-    console.log(`[quotas] Reset hebdomadaire effectué (${guildId}) — ${entete}`);
-  } catch (err) {
-    console.error(`[quotas] weeklyReset(${guildId}):`, (err as Error).message);
-  }
-}
-
-// ─── COMMANDE /quotas ──────────────────────────────────────────────────────
+// ─── COMMANDE /quotas ─────────────────────────────────────────────────────────
 
 /** `/quotas` (admin) : liste tous les membres suivis avec leur progression par catégorie de quota, complets en premier. */
 export async function handleListQuotaCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1382,29 +1587,10 @@ export async function handleListQuotaCommand(interaction: ChatInputCommandIntera
     return `${r.complete ? '✅' : '❌'} **${r.name}** — ${detail}`;
   });
 
-  const chunks: string[][] = [];
-  let current: string[] = [];
-  let length = 0;
-  for (const line of lines) {
-    if (length + line.length + 1 > 3900) { chunks.push(current); current = []; length = 0; }
-    current.push(line);
-    length += line.length + 1;
-  }
-  if (current.length) chunks.push(current);
-
-  // Discord plafonne un message à 10 embeds — au-delà (des centaines de
-  // membres suivis), tronquer plutôt que laisser l'envoi planter en silence.
-  const totalChunks = chunks.length;
-  const capped = chunks.slice(0, 10);
-  if (totalChunks > 10) {
-    const affiches = capped.reduce((n, c) => n + c.length, 0);
-    capped[capped.length - 1].push(`*+${lines.length - affiches} membres non affichés — affine ta recherche*`);
-  }
-
-  const embeds = capped.map((chunk, i) => new EmbedBuilder()
-    .setTitle(i === 0 ? '📋 Suivi des quotas — tous les membres' : null)
-    .setColor(0x5865F2)
-    .setDescription(chunk.join('\n')));
+  const embeds = buildChunkedEmbeds([{ lines }], {
+    title: '📋 Suivi des quotas — tous les membres',
+    color: 0x5865F2,
+  });
 
   await interaction.reply({ embeds, flags: MessageFlags.Ephemeral });
 }

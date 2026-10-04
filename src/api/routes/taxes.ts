@@ -1,10 +1,8 @@
 /**
  * @file src/api/routes/taxes.ts
- * @description Lecture seule des taxes — le "back-office web" pour lequel
- * `TAXES_ROLE_ID` (voir `/config role`) a toujours existé sans jamais avoir
- * de consommateur réel jusqu'ici. Monté derrière `requireTaxesAccess` dans
- * server.ts (rôle taxes ou admin), en plus de `requireAuth` (membre du
- * serveur) appliqué à toute l'API.
+ * @description Lecture seule des taxes — même accès que le reste de l'API :
+ * `requireAuth` (membre du serveur, porteur du rôle membre ou
+ * admin), pas de rôle dédié aux taxes.
  *
  * `?type=` accepte, au choix : un type fixe (`sporex`, `heroine`, `vente`,
  * `fertilisant`, `cannabis`, `mexicana`, `cocaine`, `salvia`), le type fictif `zone`
@@ -13,11 +11,14 @@
  * `/config channel list` côté Discord, ou `/api/taxes?type=zone` pour lister
  * les zones existantes, n'a pas besoin d'être connue à l'avance).
  *
- * Ordre des routes : `/` puis `/search`/`/types`, `/:id` toujours en dernier (même
- * convention que les autres groupes de l'API). `/` et `/search` renvoient
- * les infos générales d'une taxe (vue "liste") — `telephone`/`mot_de_passe`
- * sont réservés au détail d'UNE taxe précise (`/:id`, voir `db.getTaxe` vs
- * `db.findTaxes`), pas affichés dans une liste.
+ * `/` et `/search` ne renvoient que les infos générales d'une taxe
+ * (`db.findTaxes`/`mapTaxeSummary` dans db.ts, sans `telephone`/
+ * `motDePasse`) — seul `/:id` (détail d'UNE taxe précise, `db.getTaxe`)
+ * renvoie tout. `/types` (référentiel, voir plus bas) est une route statique
+ * de plus. Route dynamique `/:id` déclarée en DERNIER, après `/search` et
+ * `/types` — même principe que `/api/quotas`/`/api/ventes` (`:userId`
+ * toujours en dernier), sinon Express l'interpréterait comme un paramètre
+ * plutôt qu'une route statique.
  */
 import { Router } from 'express';
 import * as db from '../../db';
@@ -88,20 +89,22 @@ router.get('/search', async (req, res) => {
 });
 
 /**
- * GET /api/taxes/types — référentiel des types fixes et zones (tous tiers,
- * avec `available` pour le tier courant), voir `getTaxesReferentiel` — évite
- * à un client de recopier ces listes en dur.
+ * GET /api/taxes/types — référentiel (tier courant, types fixes et zones
+ * connus avec leur libellé, `available` pour le tier ACTUEL) — évite au site
+ * externe de dupliquer en dur `FIXED_TYPE_META`/`ZONES_BY_TIER`. Voir
+ * `taxes.getTaxesReferentiel`. Déclaré avant `/:id`, sinon Express
+ * l'interpréterait comme une recherche du type "types".
  */
-router.get('/types', (req, res) => {
+router.get('/types', async (req, res) => {
   res.json(getTaxesReferentiel(req.apiUser!.guildId));
 });
 
 /**
- * GET /api/taxes/:id — détail complet d'une taxe précise, y compris
- * téléphone/mot de passe (absents de `/` et `/search`, voir docstring de
- * fichier). 404 si absente (une taxe expirée mais pas encore
- * supprimée/renouvelée reste consultable ici, contrairement au filtre par
- * défaut de `/`). Toujours en dernier : paramètre dynamique du groupe.
+ * GET /api/taxes/:id — détail complet d'UNE taxe précise (téléphone/mot de
+ * passe inclus, contrairement à `/` et `/search` — voir `db.getTaxe` vs
+ * `db.findTaxes`/`mapTaxeSummary`). Toujours en dernier : route dynamique du
+ * groupe, sinon Express l'interpréterait comme une recherche du type
+ * "search".
  */
 router.get('/:id', async (req, res) => {
   const id = Number(req.params.id);

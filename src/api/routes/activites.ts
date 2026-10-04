@@ -56,7 +56,7 @@ async function cooldownsDe(guildId: string, userId: string) {
   const types = configStore.get(guildId).ACTIVITY_TYPES;
   return (await db.getActiveCooldowns(guildId))
     .filter(c => c.userId === userId)
-    .map(c => ({ action: c.action, label: types[c.action] ? types[c.action].label : c.action, expiresAt: c.expires_at }))
+    .map(c => ({ action: c.action, label: types[c.action] ? types[c.action].label : c.action, expiresAt: c.expiresAt }))
     .sort((a, b) => a.expiresAt - b.expiresAt);
 }
 

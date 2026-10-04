@@ -14,6 +14,10 @@
  *
  * Chaque route filtre par `req.apiUser.guildId` (posé par `requireAuth`,
  * voir src/api/auth.ts) — jamais les données d'une autre guilde.
+ *
+ * `/:userId` exige en plus `requireSelfOrAdmin` : un membre normal ne peut
+ * consulter que SES PROPRES ventes, jamais celles d'un autre (voir
+ * `../auth.ts`). `/` (total du groupe) reste ouvert à tout membre.
  */
 import { Router } from 'express';
 import * as db from '../../db';
@@ -37,7 +41,7 @@ router.get('/', async (req, res) => {
   res.json({ players, groupTotal });
 });
 
-/** GET /api/ventes/:userId?week= — ventes d'un joueur précis : total + détail par drogue vendue. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). */
+/** GET /api/ventes/:userId?week= — ventes d'un joueur précis : total + détail par drogue vendue. Réservé à ce joueur lui-même (ou un admin). */
 router.get('/:userId', requireSelfOrAdmin, async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);

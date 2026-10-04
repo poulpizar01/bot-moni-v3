@@ -31,6 +31,8 @@ import {
 import * as db from '../db';
 import * as configStore from '../config-store';
 import { isAdmin } from '../permissions';
+import { buildChunkedEmbeds } from '../embed-chunks';
+import { parseEntier } from '../parse';
 import * as quotas from './quotas';
 import type { StockEntry } from './stocks';
 
@@ -53,11 +55,24 @@ type PendingSale = Awaited<ReturnType<typeof db.getPendingSale>>;
 
 // ─── POINT D'ENTRÉE DEPUIS STOCKS ────────────────────────────────────────────
 
-/** Point d'entrée appelé par `stocks.handleMessage` pour chaque mouvement détecté : route vers création de vente en attente ou tentative de confirmation selon l'item et le sens du mouvement. */
-export async function onStockEntry(client: Client, guildId: string, entry: StockEntry): Promise<void> {
+/**
+ * Point d'entrée appelé par `stocks` pour chaque mouvement de coffre appliqué :
+ * route vers création de vente en attente ou tentative de confirmation selon
+ * l'item et le sens du mouvement. `replay` : mouvement plus ancien que le
+ * démarrage du bot, rattrapé après coup — seul un dépôt d'argent est alors
+ * traité (il confirme une vente déjà déclarée dans sa fenêtre) ; un retrait
+ * ou un redépôt passé ne crée ni ne modifie aucune vente, faute de savoir à
+ * quelle alerte il se rapportait.
+ */
+export async function onStockEntry(client: Client, guildId: string, entry: StockEntry, opts: { replay?: boolean } = {}): Promise<void> {
   const c = configStore.get(guildId);
   const itemLower = entry.item.toLowerCase();
   const venteItems = c.VENTE_ITEMS.map(i => i.toLowerCase());
+
+  if (opts.replay) {
+    if (entry.action === 'depose' && itemLower === CONFIRME_VENTE_ITEM.toLowerCase()) await tryConfirmMoneyDeposit(client, guildId, entry);
+    return;
+  }
 
   if (entry.action === 'retire' && venteItems.includes(itemLower)) {
     await createPendingSale(client, guildId, entry);
@@ -100,10 +115,11 @@ async function createPendingSale(client: Client, guildId: string, entry: StockEn
 
   const existing = await db.getPendingSaleForAccumulation(guildId, entry.joueur, entry.item, Date.now() - ACCUMULATION_WINDOW_MS);
   if (existing) {
-    const newQuantite = existing.quantite + entry.quantite;
-    await db.accumulatePendingSale(guildId, existing.id, newQuantite, Date.now());
-    await editAccumulatedAlert(client, existing, newQuantite);
-    return;
+    const newQuantite = await db.accumulatePendingSale(guildId, existing.id, entry.quantite, Date.now());
+    if (newQuantite != null) {
+      await editAccumulatedAlert(client, existing, newQuantite);
+      return;
+    }
   }
 
   const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -121,8 +137,25 @@ async function createPendingSale(client: Client, guildId: string, entry: StockEn
   const row = buildAlertButtons(saleId);
   const ping = discordIds.length > 0 ? discordIds.map(id => `<@${id}>`).join(' ') : `**${entry.joueur}**`;
 
-  const sentMsg = await channel.send({ content: ping, embeds: [embed], components: [row] });
+  // Sans son message, la vente n'aurait aucun bouton pour être déclarée et
+  // absorberait en silence les retraits suivants : elle est écartée, et les
+  // admins prévenus pour la suivre à la main.
+  const sentMsg = await channel.send({ content: ping, embeds: [embed], components: [row] }).catch(() => null);
+  if (!sentMsg) {
+    await db.transitionPendingSale(guildId, saleId, ['en_attente'], 'ignore');
+    await alertAdmin(client, guildId, '⚠️ Alerte de vente non postée', `Impossible de poster l'alerte de vente de **${entry.joueur}** (${entry.quantite.toLocaleString('fr-FR')} × ${entry.item}) dans <#${channelId}> — vérifier les permissions du bot. Vente à suivre manuellement.`);
+    return;
+  }
   await db.updatePendingSaleMessage(guildId, saleId, sentMsg.id, sentMsg.channelId);
+}
+
+/** Alerte libre dans le salon `admin`, s'il est configuré. */
+async function alertAdmin(client: Client, guildId: string, title: string, description: string): Promise<void> {
+  const channelId = configStore.get(guildId).CHANNELS.admin;
+  if (!channelId) return;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isSendable()) return;
+  await channel.send({ embeds: [new EmbedBuilder().setTitle(title).setColor(0xED4245).setDescription(description).setTimestamp()] }).catch(() => null);
 }
 
 /** Embed d'alerte de vente : joueur, item, quantité — le footer `Vente #<id>` identifie la vente (voir `handleTrashReaction`). */
@@ -162,12 +195,7 @@ async function editAccumulatedAlert(client: Client, sale: NonNullable<PendingSal
   } catch { /* silence */ }
 }
 
-/**
- * Édite l'embed d'une vente déjà 'declare' après réduction partielle de sa
- * quantité (redépôt partiel post-déclaration). Contrairement à
- * `editAccumulatedAlert`, le titre reste celui d'une vente déclarée — pas de
- * bouton à restaurer, une vente 'declare' n'en a plus (voir `handleButton`).
- */
+/** Met à jour l'embed d'une vente déclarée (statut `declare`) après une réduction de quantité par redépôt partiel — sans les boutons d'action, une vente déjà déclarée n'en a plus. */
 async function editDeclaredAlertQuantite(client: Client, sale: NonNullable<PendingSale>, newQuantite: number): Promise<void> {
   if (!sale.channelId || !sale.messageId) return;
   try {
@@ -187,53 +215,71 @@ async function editDeclaredAlertQuantite(client: Client, sale: NonNullable<Pendi
 
 // ─── CONFIRMATION PAR DÉPÔT D'ARGENT ─────────────────────────────────────────
 
-/** Un dépôt d'un item de paiement confirme toutes les ventes déclarées en attente d'un joueur dans la fenêtre {@link WINDOW_MS}. */
+/**
+ * Un dépôt d'un item de paiement confirme toutes les ventes déclarées d'un
+ * joueur dans les {@link WINDOW_MS} qui précèdent CE dépôt — mesurées à
+ * l'heure du message de log, pas du traitement : un dépôt fait pendant un
+ * arrêt du bot confirme bien la vente déclarée avant, et un vieux dépôt
+ * rattrapé ne confirme jamais une vente d'aujourd'hui. Seules les ventes
+ * réellement confirmées par CE dépôt (voir `db.confirmDeclaredSale`) sont
+ * journalisées : une vente confirmée entre-temps par un autre dépôt n'est ni
+ * recréditée ni reloguée.
+ */
 async function tryConfirmMoneyDeposit(client: Client, guildId: string, entry: StockEntry): Promise<void> {
-  const sales = await db.getPendingSalesForConfirmation(guildId, entry.joueur, Date.now() - WINDOW_MS);
+  const sales = await db.getPendingSalesForConfirmation(guildId, entry.joueur, entry.timestamp - WINDOW_MS, entry.timestamp);
   if (!sales.length) return;
 
+  const confirmed: Array<NonNullable<PendingSale>> = [];
   for (const sale of sales) {
-    await db.confirmPendingSale(guildId, sale.id);
+    const quantite = await db.confirmDeclaredSale(guildId, sale.id, entry.timestamp);
+    if (quantite == null) continue;
+    confirmed.push({ ...sale, quantite });
     await editAlertMessage(client, sale, '✅ Vente confirmée — argent déposé', 0x57F287);
   }
-  await sendLogVente(client, guildId, sales, entry.quantite);
+  if (confirmed.length) await sendLogVente(client, guildId, confirmed, entry.quantite);
 }
 
 // ─── CONFIRMATION PAR RETOUR DE DROGUE ───────────────────────────────────────
 
 /**
  * Un dépôt de l'item de vente lui-même confirme un reposage déclaré, ou
- * décrémente/annule une vente encore active — 'en_attente' OU 'declare'
- * (redépôt partiel ou total, y compris après un clic "Déclarer" par erreur ;
- * voir `db.getPendingSaleForReduction`).
+ * décrémente/annule une vente active (`en_attente` OU déjà `declare` — un
+ * joueur peut reposer après avoir cliqué "Déclarer" au lieu de payer, ça ne
+ * doit pas laisser la vente bloquée "en attente" pour toujours).
+ *
+ * **Limite connue** : cible la vente la PLUS RÉCENTE pour ce joueur/item —
+ * si un joueur a deux ventes actives du même item en même temps (rare :
+ * retrait, déclaration, puis un second retrait avant confirmation), un
+ * redépôt peut cibler la mauvaise des deux. Pas corrigé ici (demanderait un
+ * ordre de tri différent, ex. prioriser `declare` sur `en_attente`) — à
+ * valider avec l'utilisateur avant de complexifier.
  */
 async function tryConfirmRedeposit(client: Client, guildId: string, entry: StockEntry): Promise<void> {
   const saleRepose = await db.getPendingSaleRepose(guildId, entry.joueur, entry.item, Date.now() - WINDOW_MS);
-  if (saleRepose) {
-    await db.confirmPendingSale(guildId, saleRepose.id);
-    await editAlertMessage(client, saleRepose, '✅ Drogue reposée et vérifiée', 0x57F287);
+  const repose = saleRepose ? await db.applyReposeRedeposit(guildId, saleRepose.id, entry.quantite) : null;
+  if (saleRepose && repose) {
+    if (repose.reste === 0) await editAlertMessage(client, saleRepose, '✅ Drogue reposée et vérifiée', 0x57F287);
+    else await editAlertMessage(client, saleRepose, `📦 Drogue reposée en partie — encore ${repose.reste.toLocaleString('fr-FR')} à redéposer`, 0x5865F2);
     return;
   }
 
   const saleActive = await db.getPendingSaleForReduction(guildId, entry.joueur, entry.item, Date.now() - WINDOW_MS);
   if (!saleActive) return;
 
-  const nouvelleQuantite = saleActive.quantite - entry.quantite;
-  if (nouvelleQuantite <= 0) {
-    await db.updatePendingSaleStatut(guildId, saleActive.id, 'ignore');
+  const result = await db.applyRedeposit(guildId, saleActive.id, entry.quantite);
+  if (!result) return;
+  if (result.annulee) {
     await editAlertMessage(client, saleActive, '📦 Drogue intégralement reposée — vente annulée', 0x95A5A6);
-  } else if (saleActive.statut === 'declare') {
-    await db.updatePendingSaleQuantite(guildId, saleActive.id, nouvelleQuantite);
-    await editDeclaredAlertQuantite(client, saleActive, nouvelleQuantite);
+  } else if (result.statut === 'declare') {
+    await editDeclaredAlertQuantite(client, saleActive, result.quantite);
   } else {
-    await db.accumulatePendingSale(guildId, saleActive.id, nouvelleQuantite, Date.now());
-    await editAccumulatedAlert(client, saleActive, nouvelleQuantite);
+    await editAccumulatedAlert(client, saleActive, result.quantite);
   }
 }
 
 // ─── LOG FINAL DANS log_ventes ────────────────────────────────────────────────
 
-/** Poste le log final dans `log_ventes` pour une ou plusieurs ventes confirmées ensemble, puis met à jour stats/quota (ou alerte si le joueur n'est pas mappé). */
+/** Poste le log final dans `log_ventes` pour une ou plusieurs ventes confirmées ensemble (le crédit de quota lui-même a déjà été fait de façon atomique avec la confirmation, voir `tryConfirmMoneyDeposit`/`db.confirmDeclaredSale`) — alerte seulement si un joueur n'est pas mappé. */
 async function sendLogVente(client: Client, guildId: string, sales: Array<NonNullable<PendingSale>>, montantDepose: number): Promise<void> {
   const channelId = configStore.get(guildId).CHANNELS.log_ventes;
   if (!channelId) return;
@@ -257,10 +303,7 @@ async function sendLogVente(client: Client, guildId: string, sales: Array<NonNul
   await channel.send({ embeds: [embed] });
 
   for (const sale of sales) {
-    if (sale.discordId) {
-      await db.addTransaction(guildId, { user_id: sale.discordId, username: sale.joueur, action: 'vente', quantite: sale.quantite, type: sale.item, timestamp: Date.now() });
-      await db.incrementStat(guildId, sale.discordId, 'vente', sale.quantite, 0);
-    } else {
+    if (!sale.discordId) {
       await alertMissingMapping(client, guildId, sale.joueur, `Vente confirmée — quota de ${sale.quantite.toLocaleString('fr-FR')} × ${sale.item} non attribué`);
     }
   }
@@ -294,7 +337,7 @@ export async function handleTrashReaction(reaction: MessageReaction | PartialMes
     return true;
   }
 
-  await db.updatePendingSaleStatut(guildId, saleId, 'ignore');
+  if (!(await db.transitionPendingSale(guildId, saleId, ['en_attente'], 'ignore'))) return true;
   const embed = EmbedBuilder.from(msg.embeds[0]).setTitle('🗑️ Vente ignorée').setColor(0x95A5A6);
   await msg.edit({ embeds: [embed], components: [] }).catch(() => null);
   return true;
@@ -318,7 +361,7 @@ async function editAlertMessage(client: Client, sale: NonNullable<PendingSale>, 
 // ─── AUTORISATION D'INTERACTION ───────────────────────────────────────────────
 
 /** Vrai si l'auteur de l'interaction est mappé au joueur de la vente (et backfill `discordId` si absent), ou admin ; répond sinon avec un refus. */
-async function authorizeSaleInteraction(interaction: ButtonInteraction, guildId: string, sale: NonNullable<PendingSale>): Promise<boolean> {
+async function authorizeSaleInteraction(interaction: ButtonInteraction | ModalSubmitInteraction, guildId: string, sale: NonNullable<PendingSale>): Promise<boolean> {
   const mappedIds = await db.getUserMappings(guildId, sale.joueur);
 
   if (mappedIds.includes(interaction.user.id)) {
@@ -354,7 +397,10 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
       return;
     }
     if (!(await authorizeSaleInteraction(interaction, guildId, sale))) return;
-    await db.updatePendingSaleStatut(guildId, saleId, 'declare');
+    if (!(await db.transitionPendingSale(guildId, saleId, ['en_attente'], 'declare'))) {
+      await interaction.reply({ content: "❌ Cette vente n'est plus en attente.", flags: MessageFlags.Ephemeral });
+      return;
+    }
     const embed = EmbedBuilder.from(interaction.message.embeds[0]).setTitle("💰 Vente déclarée — en attente du dépôt d'argent").setColor(0xFEE75C);
     await interaction.update({ embeds: [embed], components: [] });
     return;
@@ -368,7 +414,10 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
       return;
     }
     if (!(await authorizeSaleInteraction(interaction, guildId, sale))) return;
-    await db.updatePendingSaleStatut(guildId, saleId, 'repose');
+    if (!(await db.transitionPendingSale(guildId, saleId, ['en_attente'], 'repose'))) {
+      await interaction.reply({ content: "❌ Cette vente n'est plus en attente.", flags: MessageFlags.Ephemeral });
+      return;
+    }
     const embed = EmbedBuilder.from(interaction.message.embeds[0]).setTitle('📦 Drogue reposée — en attente de vérification').setColor(0x5865F2);
     await interaction.update({ embeds: [embed], components: [] });
     return;
@@ -388,7 +437,7 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
         .setTitle('Corriger la quantité')
         .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder().setCustomId('quantite').setLabel('Quantité correcte')
-            .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder(`Actuel : ${sale.quantite}`),
+            .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder(`Actuel : ${sale.quantite} — max ${sale.quantiteRetiree} (retrait réel)`),
         )),
     );
   }
@@ -396,7 +445,13 @@ export async function handleButton(interaction: ButtonInteraction): Promise<void
 
 // ─── HANDLER MODALS ───────────────────────────────────────────────────────────
 
-/** Traite la soumission du modal de correction de quantité (`modal_vente_modifier_<id>`). */
+/**
+ * Traite la soumission du modal de correction de quantité
+ * (`modal_vente_modifier_<id>`). Statut et auteur sont revérifiés ici, pas
+ * seulement au clic : un modal peut rester ouvert pendant que la vente est
+ * déclarée/confirmée/expirée, et l'ID de vente dans `customId` n'est pas une
+ * preuve d'autorisation.
+ */
 export async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
   const id = interaction.customId;
   const guildId = interaction.guildId!;
@@ -404,14 +459,27 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
   if (id.startsWith('modal_vente_modifier_')) {
     const saleId = parseInt(id.replace('modal_vente_modifier_', ''), 10);
     const sale = await db.getPendingSale(guildId, saleId);
-    const raw = interaction.fields.getTextInputValue('quantite').replace(/[\s ]/g, '');
-    const quantite = parseInt(raw, 10);
+    const quantite = parseEntier(interaction.fields.getTextInputValue('quantite')) ?? NaN;
 
-    if (!sale) { await interaction.reply({ content: '❌ Vente introuvable.', flags: MessageFlags.Ephemeral }); return; }
+    if (!sale || sale.statut !== 'en_attente') {
+      await interaction.reply({ content: "❌ Cette vente n'est plus en attente.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!(await authorizeSaleInteraction(interaction, guildId, sale))) return;
     if (isNaN(quantite) || quantite <= 0) { await interaction.reply({ content: '❌ Quantité invalide.', flags: MessageFlags.Ephemeral }); return; }
+    if (quantite > sale.quantiteRetiree) {
+      await interaction.reply({
+        content: `❌ Impossible de déclarer plus que le retrait réel (**${sale.quantiteRetiree.toLocaleString('fr-FR')}**).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
     const ancienneQuantite = sale.quantite;
-    await db.updatePendingSaleQuantite(guildId, saleId, quantite);
+    if (!(await db.updatePendingSaleQuantite(guildId, saleId, quantite))) {
+      await interaction.reply({ content: "❌ Cette vente n'est plus en attente, ou une partie a été redéposée entre-temps : relance la correction.", flags: MessageFlags.Ephemeral });
+      return;
+    }
 
     try {
       const channel = sale.channelId ? await interaction.client.channels.fetch(sale.channelId).catch(() => null) : null;
@@ -431,12 +499,27 @@ export async function handleModal(interaction: ModalSubmitInteraction): Promise<
 
 // ─── NETTOYAGE DES VENTES EXPIRÉES (cron) ────────────────────────────────────
 
+/**
+ * Verrou par guilde contre le chevauchement `node-cron` (même pattern que
+ * `alertes.checkExpiredCooldowns`) : le corps boucle sur un `editAlertMessage`
+ * Discord + un marquage DB par vente expirée — sans lui, un batch qui dépasse
+ * les 10 minutes de l'intervalle ferait démarrer un 2ᵉ passage sur des lignes
+ * pas encore marquées `expire`, éditant deux fois la même alerte.
+ */
+const cleanupRunning = new Set<string>();
+
 /** Cron (toutes les 10 min) : marque expirées les ventes sans action depuis plus de {@link WINDOW_MS}. */
 export async function cleanupExpiredSales(client: Client, guildId: string): Promise<void> {
-  const expired = await db.getExpiredPendingSales(guildId, Date.now() - WINDOW_MS);
-  for (const sale of expired) {
-    await db.updatePendingSaleStatut(guildId, sale.id, 'expire');
-    await editAlertMessage(client, sale, '⏰ Vente expirée — aucune action', 0x95A5A6);
+  if (cleanupRunning.has(guildId)) return;
+  cleanupRunning.add(guildId);
+  try {
+    const expired = await db.getExpiredPendingSales(guildId, Date.now() - WINDOW_MS);
+    for (const sale of expired) {
+      if (!(await db.transitionPendingSale(guildId, sale.id, ['en_attente', 'declare', 'repose'], 'expire'))) continue;
+      await editAlertMessage(client, sale, '⏰ Vente expirée — aucune action', 0x95A5A6);
+    }
+  } finally {
+    cleanupRunning.delete(guildId);
   }
 }
 
@@ -526,6 +609,9 @@ export async function handleListUsersCommand(interaction: ChatInputCommandIntera
     return;
   }
   const lines = mappings.map(m => `**${m.gameName}** → <@${m.discordId}>`);
-  const embed = new EmbedBuilder().setTitle('🔗 Associations nom en jeu ↔ Discord').setColor(0x2b2d31).setDescription(lines.join('\n'));
-  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  const embeds = buildChunkedEmbeds([{ lines }], {
+    title: '🔗 Associations nom en jeu ↔ Discord',
+    color: 0x2b2d31,
+  });
+  await interaction.reply({ embeds, flags: MessageFlags.Ephemeral });
 }

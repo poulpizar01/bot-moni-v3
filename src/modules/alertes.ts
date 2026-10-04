@@ -16,6 +16,7 @@
 import { EmbedBuilder, type Client } from 'discord.js';
 import * as db from '../db';
 import * as configStore from '../config-store';
+import { isMissingAccess } from '../discord-fetch';
 
 // ─── COOLDOWNS EXPIRÉS ───────────────────────────────────────────────────────
 
@@ -51,16 +52,25 @@ export async function checkExpiredCooldowns(client: Client, guildId: string): Pr
     for (const row of expired) {
       const rowCfg = c.ACTIVITY_TYPES[row.action];
       const label = rowCfg ? rowCfg.label : row.action;
-      await channel.send({
-        content: `<@${row.userId}>`,
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x57F287)
-            .setTitle('✅ Cooldown expiré')
-            .setDescription(`**${label}** est à nouveau disponible pour toi !`)
-            .setTimestamp(),
-        ],
-      }).catch(() => null);
+      // Marqué notifié seulement si l'envoi a réussi : sinon le prochain passage le retente.
+      try {
+        await channel.send({
+          content: `<@${row.userId}>`,
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x57F287)
+              .setTitle('✅ Cooldown expiré')
+              .setDescription(`**${label}** est à nouveau disponible pour toi !`)
+              .setTimestamp(),
+          ],
+        });
+      } catch (err) {
+        if (isMissingAccess(err)) {
+          console.warn(`[alertes] Permission manquante dans alertes_actions (${guildId}) — notifications suspendues jusqu'au prochain passage.`);
+          return;
+        }
+        continue;
+      }
       await db.markCooldownNotified(guildId, row.userId, row.action);
     }
   } catch (err) {
@@ -82,7 +92,9 @@ export async function postBraquageAlert(client: Client, guildId: string, action:
   if (!c.CHANNELS.alertes_braquages) return;
   const cfg = c.ACTIVITY_TYPES[action];
   const limit = cfg?.braquageWeeklyLimit;
-  if (!limit) return;
+  // `== null` : pas un braquage. Une limite à 0 est un braquage fermé au tier
+  // courant (`enabled` faux) — rien à annoncer non plus.
+  if (limit == null || !cfg.enabled) return;
 
   try {
     const channel = await client.channels.fetch(c.CHANNELS.alertes_braquages).catch(() => null);
@@ -136,6 +148,8 @@ function stripLaboPrefix(name: string): string {
  * le bon préfixe, pour préserver le quota Discord (2 renommages / 10 min).
  */
 export async function setLaboStatut(client: Client, guildId: string, laboKey: string, available: boolean, tempsRestantMinutes = 0): Promise<void> {
+  // Guilde retirée entre la programmation du timer et son déclenchement.
+  if (!configStore.has(guildId)) return;
   const cfg = configStore.get(guildId).ACTIVITY_TYPES[laboKey];
   const channelId = cfg?.laboChannelId;
   if (!channelId) return;
@@ -146,9 +160,10 @@ export async function setLaboStatut(client: Client, guildId: string, laboKey: st
 
     const baseName = stripLaboPrefix(channel.name || '');
     const timerKey = laboTimerKey(guildId, laboKey);
-    // Un temps restant de 0 (labos sans délai de production, ex. Salvia,
-    // Branche De Cannabis) équivaut à rester disponible — jamais de passage
-    // au rouge sans timer pour en sortir (sinon le salon resterait bloqué).
+
+    // Un labo déclaré indisponible mais sans délai de production réel
+    // (tempsRestantMinutes<=0) reste quand même disponible — sinon le salon
+    // passerait au rouge sans jamais avoir de timer pour repasser au vert.
     const staysAvailable = available || tempsRestantMinutes <= 0;
 
     if (staysAvailable) {
@@ -165,17 +180,24 @@ export async function setLaboStatut(client: Client, guildId: string, laboKey: st
         await channel.setName(`🔴・${baseName}`).catch((err: Error) => console.error('[alertes] rename labo (indispo):', err.message));
       }
 
-      if (laboTimers[timerKey]) clearTimeout(laboTimers[timerKey]);
-
-      const ms = tempsRestantMinutes * 60 * 1000;
-      laboTimers[timerKey] = setTimeout(async () => {
-        await setLaboStatut(client, guildId, laboKey, true);
-        delete laboTimers[timerKey];
-      }, ms);
+      scheduleRetourAuVert(client, guildId, laboKey, tempsRestantMinutes * 60 * 1000);
     }
   } catch (err) {
     console.error(`[alertes] setLaboStatut(${guildId}):`, (err as Error).message);
   }
+}
+
+/**
+ * Remet le salon d'un labo dans l'état qu'il doit avoir (après une
+ * réassociation de salon par `/config channel`) : 🔴 avec son retour au vert
+ * reprogrammé s'il est encore en production, 🟢 sinon — jamais remis au vert
+ * en pleine production, ce qui laisserait relancer un cycle.
+ */
+export async function refreshLaboStatut(client: Client, guildId: string, laboKey: string): Promise<void> {
+  const endsAt = parseInt((await db.getSetting(guildId, `labo_end_${laboKey}`)) || '0', 10);
+  const restantMinutes = Math.ceil((endsAt - Date.now()) / 60_000);
+  if (restantMinutes > 0) await setLaboStatut(client, guildId, laboKey, false, restantMinutes);
+  else await setLaboStatut(client, guildId, laboKey, true);
 }
 
 /**
@@ -199,16 +221,27 @@ export async function initLaboTimers(client: Client, guildId: string): Promise<v
     const stored = await db.getSetting(guildId, `labo_end_${laboKey}`);
     const endsAt = stored ? parseInt(stored, 10) : 0;
     const remaining = endsAt - Date.now();
-    const timerKey = laboTimerKey(guildId, laboKey);
 
     if (!endsAt || remaining <= 0) {
       await setLaboStatut(client, guildId, laboKey, true);
     } else {
-      if (laboTimers[timerKey]) clearTimeout(laboTimers[timerKey]);
-      laboTimers[timerKey] = setTimeout(async () => {
-        await setLaboStatut(client, guildId, laboKey, true);
-        delete laboTimers[timerKey];
-      }, remaining);
+      scheduleRetourAuVert(client, guildId, laboKey, remaining);
     }
   }
+}
+
+/**
+ * Programme le retour au vert d'un labo dans `ms`. La référence n'est retirée
+ * de {@link laboTimers} que si elle désigne encore CE timer : une
+ * reprogrammation faite entre-temps ne doit pas perdre la sienne (elle ne
+ * pourrait plus être annulée).
+ */
+function scheduleRetourAuVert(client: Client, guildId: string, laboKey: string, ms: number): void {
+  const timerKey = laboTimerKey(guildId, laboKey);
+  if (laboTimers[timerKey]) clearTimeout(laboTimers[timerKey]);
+  const timer = setTimeout(async () => {
+    if (laboTimers[timerKey] === timer) delete laboTimers[timerKey];
+    await setLaboStatut(client, guildId, laboKey, true);
+  }, ms);
+  laboTimers[timerKey] = timer;
 }

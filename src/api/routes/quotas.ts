@@ -8,14 +8,25 @@
  * appliqués sont ceux ACTUELLEMENT configurés, pas historisés.
  *
  * Ordre des routes : l'endpoint générique (`/`) en premier, puis les plus
- * spécifiques (`/config`, `/summary`, `/ranking`, `/pay`), et `/:userId` (le paramètre
- * dynamique) toujours en dernier — sinon Express interpréterait
- * `/quotas/ranking` comme une recherche de l'utilisateur "ranking".
+ * spécifiques (`/config`, `/summary`, `/ranking`, `/pay`, `/cooldowns`,
+ * `/braquages`), et `/:userId` (le paramètre dynamique) toujours en dernier
+ * — sinon Express interpréterait `/quotas/ranking` comme une recherche de
+ * l'utilisateur "ranking". `/cooldowns` et `/braquages` n'acceptent PAS
+ * `?week=` (contrairement au reste du groupe) : ce sont des états courants
+ * (cooldown en cours, fenêtre glissante de 7 jours), pas des totaux sur une
+ * plage — pas de notion de "semaine ISO passée" pour eux.
  *
  * Chaque route filtre par `req.apiUser.guildId` (posé par `requireAuth`,
  * voir src/api/auth.ts) — jamais les données d'une autre guilde.
+ *
+ * `/:userId` et `/pay/:userId` exigent en plus `requireSelfOrAdmin` : un
+ * membre normal ne peut consulter que SES PROPRES quota/paie, jamais ceux
+ * d'un autre (voir `../auth.ts`). Les routes de groupe (`/`, `/pay`,
+ * `/ranking`, `/summary`) restent ouvertes à tout membre, comme les vues
+ * équivalentes du panneau Discord (classement/bilan visibles par tous).
  */
 import { Router } from 'express';
+import * as db from '../../db';
 import * as quotas from '../../modules/quotas';
 import * as configStore from '../../config-store';
 import { resolveWeekRange } from '../week';
@@ -38,9 +49,15 @@ router.get('/', async (req, res) => {
  * la plage `[since, until)` effectivement résolue (semaine en cours = depuis
  * le dernier reset hebdo, sinon la semaine ISO demandée), les objectifs
  * hebdomadaires (`/config quota`), les taux de paie (`/config salaire`) et
- * les paliers de paie vente (`/config palier`) ACTUELS — ce sont ceux appliqués à n'importe quelle plage, voir la limite
- * documentée en tête de fichier. Les catégories de quota et leurs libellés
- * viennent du même registre `ACTIVITY_TYPES` que les calculs.
+ * les paliers de paie vente (`/config palier`) ACTUELS — ce sont ceux
+ * appliqués à n'importe quelle plage, voir la limite documentée en tête de
+ * fichier. Les catégories de quota et leurs libellés viennent du même
+ * registre `ACTIVITY_TYPES` que les calculs. `ventePaliers.general` prime
+ * sur `salaryRates.vente`, et `ventePaliers.byItem[item]` prime sur
+ * `general` ET sur `itemSalaryRates[item]` pour cet item précis — voir
+ * `quotas.computeVentePay` pour la résolution exacte. `salaryTiers` est le
+ * même objet sous son ancien nom, gardé pour le site externe de cette
+ * instance (famillemoni.com) qui le lit déjà.
  */
 router.get('/config', async (req, res) => {
   const guildId = req.apiUser!.guildId;
@@ -56,6 +73,7 @@ router.get('/config', async (req, res) => {
     targets: c.QUOTA_TARGETS,
     salaryRates: c.SALARY_RATES,
     itemSalaryRates: c.ITEM_SALARY_RATES,
+    ventePaliers: c.VENTE_PALIERS,
     salaryTiers: c.VENTE_PALIERS,
     classementRates: c.CLASSEMENT_RATES,
     activities,
@@ -86,7 +104,32 @@ router.get('/pay', async (req, res) => {
   res.json(await avecNoms(guildId, await quotas.getAllUserPayForRange(guildId, range)));
 });
 
-/** GET /api/quotas/pay/:userId?week= — paie d'un joueur précis. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). */
+/**
+ * GET /api/quotas/cooldowns — cooldowns personnels actuellement en cours
+ * (`db.getActiveCooldowns`). Un non-admin ne reçoit que les siens, même
+ * principe que `/api/users` — pas de route `:userId` dédiée ici, juste un
+ * filtre sur la réponse (`requireAuth` seul suffit).
+ */
+router.get('/cooldowns', async (req, res) => {
+  const apiUser = req.apiUser!;
+  const activityTypes = configStore.get(apiUser.guildId).ACTIVITY_TYPES;
+  const rows = await db.getActiveCooldowns(apiUser.guildId);
+  const visibles = apiUser.isAdmin ? rows : rows.filter(r => r.userId === apiUser.id);
+  res.json(visibles.map(r => ({ userId: r.userId, action: r.action, label: activityTypes[r.action]?.label ?? r.action, expiresAt: r.expiresAt })));
+});
+
+/**
+ * GET /api/quotas/braquages — slots de braquage restants par activité, à
+ * l'échelle du GROUPE (limite hebdomadaire glissante sur 7 jours, voir
+ * `quotas.getBraquageSummary`) — ouvert à tout membre, comme le panneau
+ * Discord. Pas de `?week=` : contrairement aux autres routes de ce groupe,
+ * la fenêtre glissante de 7 jours n'a pas de notion de "semaine ISO passée".
+ */
+router.get('/braquages', async (req, res) => {
+  res.json(await quotas.getBraquageSummary(req.apiUser!.guildId));
+});
+
+/** GET /api/quotas/pay/:userId?week= — paie d'un joueur précis. Réservé à ce joueur lui-même (ou un admin), voir `requireSelfOrAdmin`. */
 router.get('/pay/:userId', requireSelfOrAdmin, async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);
@@ -94,7 +137,7 @@ router.get('/pay/:userId', requireSelfOrAdmin, async (req, res) => {
   res.json(await quotas.getUserPayForRange(guildId, String(req.params.userId), range));
 });
 
-/** GET /api/quotas/:userId?week= — quota d'un joueur précis. Réservé à soi-même ou un admin (voir `requireSelfOrAdmin`). Toujours en dernier : c'est le paramètre dynamique du groupe. */
+/** GET /api/quotas/:userId?week= — quota d'un joueur précis. Réservé à ce joueur lui-même (ou un admin). Toujours en dernier : c'est le paramètre dynamique du groupe. */
 router.get('/:userId', requireSelfOrAdmin, async (req, res) => {
   const guildId = req.apiUser!.guildId;
   const range = await resolveWeekRange(req, res, guildId);

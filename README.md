@@ -1,6 +1,6 @@
 # Bot Famille — Bot Discord RP FiveM (illégal), 100% configurable
 
-Bot Discord (TypeScript / discord.js v14 / PostgreSQL via Prisma) pour la gestion d'une organisation RP FiveM illégale : stocks de coffre, quotas hebdomadaires, braquages, cooldowns, taxes & racket, armurerie (armes + munitions), fourrière véhicules, cycle de vente de drogue — plus une API REST optionnelle pour exposer ces données à un outil externe (site web, dashboard…).
+Bot Discord (TypeScript / discord.js v14 / PostgreSQL via Prisma) pour la gestion d'une organisation RP FiveM illégale : stocks de coffre, quotas hebdomadaires, braquages, cooldowns, taxes & racket, armurerie (armes + munitions), fourrière véhicules, cycle de vente de drogue — ainsi qu'une API REST pour exposer ces données à un outil externe (site web, dashboard…), mise en place dans le cadre de l'installation standard (voir plus bas).
 
 Contrairement à un bot figé pour un serveur précis, **toute la structure métier est configurable depuis Discord** via la commande `/config` : items suivis, activités déclarables (quotas, cooldowns, limites de braquage, labos), objectifs de quota, taux de paie, salons, rôles, et le **type d'organisation** (Indépendant/Petite Frappe/Gang/Organisation, `/config type-groupe`) qui fait varier les limites de braquage, les labos accessibles et les taxes/zones de vente sans toucher au code. Aucune de ces valeurs n'est codée en dur — un changement prend effet immédiatement, sans redémarrage (jamais besoin de relancer le bot après une écriture `/config`, voir "Robustesse & fiabilité" plus bas). À l'inverse, certaines valeurs restent volontairement fixes dans le code car elles ne bougent jamais une fois le bot déployé pour une organisation donnée : types d'armes, types de taxe, plafonds de munitions, amende de fourrière (voir "Modules" plus bas).
 
@@ -9,9 +9,9 @@ Contrairement à un bot figé pour un serveur précis, **toute la structure mét
 ## Sommaire
 
 - [Prérequis](#prérequis) ([Créer l'application Discord](#créer-lapplication-discord))
-- [Installation](#installation) ([Via systemd](#via-systemd-production-sans-docker), [Via Docker](#via-docker))
+- [Installation](#installation) ([Via Docker (recommandé)](#via-docker-recommandé), [Sans Docker (systemd)](#sans-docker-systemd), [Développement](#développement), [API REST](#api-rest))
 - [Plusieurs guildes — multi-tenant](#plusieurs-guildes--multi-tenant)
-- [Interopérabilité — API REST](#interopérabilité--api-rest-optionnelle)
+- [Interopérabilité — API REST](#interopérabilité--api-rest)
 - [Configuration — `/config`](#configuration--tout-se-fait-depuis-discord-via-config)
 - [Modules](#modules)
 - [Robustesse & fiabilité](#robustesse--fiabilité)
@@ -23,8 +23,8 @@ Contrairement à un bot figé pour un serveur précis, **toute la structure mét
 
 ## Prérequis
 
-- **Node.js** ≥ 18
-- **PostgreSQL** ≥ 14 (local, hébergé — Supabase, Neon, Railway, RDS… — ou via Docker, voir plus bas)
+- **Docker** avec Docker Compose (installation recommandée, voir [Via Docker](#via-docker-recommandé)) — fournit Node.js et PostgreSQL, rien d'autre à installer sur l'hôte.
+- Sans Docker uniquement : **Node.js** ≥ 18 et **PostgreSQL** ≥ 14 (local ou hébergé).
 - Une application Discord avec un bot configuré (voir juste en dessous) — token, permissions et intents privilégiés.
 
 ### Créer l'application Discord
@@ -48,6 +48,40 @@ Contrairement à un bot figé pour un serveur précis, **toute la structure mét
 
 ## Installation
 
+> **Docker est le mode de déploiement recommandé en production.** systemd reste pleinement supporté (voir [Sans Docker](#sans-docker-systemd)) si tu préfères t'en passer — Docker est simplement le choix par défaut.
+
+Pourquoi Docker plutôt que systemd :
+- **PostgreSQL inclus** : la base tourne dans son propre conteneur, avec son volume — pas d'installation ni de création d'utilisateur/base à faire à la main.
+- **Migrations automatiques** : `docker-entrypoint.sh` applique `prisma migrate deploy` à chaque démarrage — impossible d'oublier l'étape après une mise à jour.
+- **Mise à jour en une commande** : `git pull && docker compose up -d --build`, contre cinq étapes enchaînées à la main côté systemd.
+- **Environnement figé** : version de Node.js et dépendances système (OpenSSL pour Prisma) fixées par l'image, identiques d'un serveur à l'autre.
+- **Déjà durci** : bot exécuté en utilisateur non-root, ports publiés en loopback uniquement, rotation des logs et limite mémoire configurées.
+
+### Via Docker (recommandé)
+
+`docker-compose.yml` fournit le bot **et** PostgreSQL (volume nommé `db_data`, migrations appliquées automatiquement au démarrage du conteneur — voir `docker-entrypoint.sh`).
+
+```bash
+git clone https://github.com/poulpizar01/bot-moni-v3.git
+cd bot-moni-v3
+
+cp .env.example .env
+# Éditer .env : TOKEN, CLIENT_ID, POSTGRES_PASSWORD (le bot refuse de démarrer avec la valeur d'exemple change_me)
+# (DATABASE_URL est recalculé par docker-compose pour pointer vers le service "db" — inutile de l'éditer)
+
+docker compose up -d --build
+docker compose logs -f bot-moni-v3
+```
+Mise à jour après un `git pull` : `docker compose up -d --build`. Le port `5432` du service `db` (et `<API_PORT>` du service bot si l'API REST est activée) est publié sur l'hôte **en loopback uniquement** (`127.0.0.1:...`, pratique pour `prisma studio`/`psql` en local) — volontairement pas un simple `5432:5432`/`<API_PORT>:<API_PORT>`, qui publierait sur toutes les interfaces : Docker manipule directement les chaînes iptables et **contourne un pare-feu ufw/iptables classique**, un port publié ainsi resterait joignable depuis l'extérieur même pare-feu actif.
+
+Les deux services ont une rotation de logs (`max-size: 10m`, `max-file: 3` — sinon le driver `json-file` par défaut grossit indéfiniment sur le disque de l'hôte) ; le service `bot-moni-v3` a en plus une limite mémoire (`mem_limit: 512m`, large pour un bot Discord + petite API — à ajuster si `docker stats` montre un dépassement). Nommé ainsi (pas juste `bot`) pour rester identifiable sans ambiguïté si un second bot tourne sur le même hôte.
+
+Si `docker compose build` échoue avec `invalid file request` (observé sur Windows + OneDrive avec BuildKit sur ce projet), désactiver BuildKit pour ce build : `set DOCKER_BUILDKIT=0 && docker compose build` (PowerShell : `$env:DOCKER_BUILDKIT=0`).
+
+### Sans Docker (systemd)
+
+Alternative à Docker, aussi fonctionnelle — mais avec PostgreSQL, les migrations et les mises à jour à gérer soi-même (voir plus haut pourquoi Docker est le choix par défaut).
+
 ```bash
 git clone https://github.com/poulpizar01/bot-moni-v3.git
 cd bot-moni-v3
@@ -64,17 +98,13 @@ npm run build
 npm start
 ```
 
-`DATABASE_URL` pointe vers un PostgreSQL déjà accessible : un service hébergé (Supabase, Neon, Railway, RDS…), ou une instance locale sur le VPS lui-même — sur une base Debian/Ubuntu fraîche, par exemple :
+`DATABASE_URL` pointe vers un PostgreSQL déjà accessible : un service hébergé, ou une instance locale sur le VPS lui-même — sur une base Debian/Ubuntu fraîche, par exemple :
 ```bash
 sudo apt install -y postgresql
 sudo -u postgres psql -c "CREATE USER bot_moni_v3 WITH PASSWORD 'change_me';"
 sudo -u postgres psql -c "CREATE DATABASE bot_moni_v3 OWNER bot_moni_v3;"
 # DATABASE_URL=postgresql://bot_moni_v3:change_me@localhost:5432/bot_moni_v3
 ```
-
-En développement : `npm run dev` (tsx, rechargement à chaud, pas de build).
-
-### Via systemd (production, sans Docker)
 
 Un modèle de service est fourni dans `deploy/bot-moni-v3.service` — à adapter (chemins, utilisateur système) puis installer :
 ```bash
@@ -91,23 +121,31 @@ sudo journalctl -u bot-moni-v3.service -n 50 --no-pager
 ```
 Après toute mise à jour du code : `git pull && npm install && npx prisma migrate deploy && npm run build` (toujours vérifier `npx tsc --noEmit` avant, pour attraper une erreur sans faire planter le service en cours) puis `sudo systemctl restart bot-moni-v3.service`.
 
-### Via Docker
+### Développement
 
-`docker-compose.yml` fournit le bot **et** PostgreSQL (volume nommé `db_data`, migrations appliquées automatiquement au démarrage du conteneur — voir `docker-entrypoint.sh`).
+`npm install`, un `.env` avec `DATABASE_URL` pointant vers un PostgreSQL accessible (le service `db` de Docker fait l'affaire : `docker compose up -d db`, publié sur `127.0.0.1:5432`), `npx prisma migrate deploy`, puis `npm run dev` (tsx, rechargement à chaud, pas de build).
 
-```bash
-cp .env.example .env
-# Éditer .env : TOKEN, CLIENT_ID, POSTGRES_PASSWORD
-# (DATABASE_URL est recalculé par docker-compose pour pointer vers le service "db" — inutile de l'éditer)
+### API REST
 
-docker compose up -d --build
-docker compose logs -f bot-moni-v3
-```
-Mise à jour après un `git pull` : `docker compose up -d --build`. Le port `5432` du service `db` est publié sur l'hôte par défaut (pratique pour `prisma studio`/`psql` en local) — à retirer ou restreindre par pare-feu sur un déploiement exposé publiquement.
+Le bot expose une API REST en lecture seule (`src/api/`) pour un outil externe (site web, tableau de bord…) — voir la section [Interopérabilité](#interopérabilité--api-rest) pour l'authentification et la liste des endpoints. Sa mise en place fait partie de l'installation standard, après le `.env` de base ci-dessus (systemd ou Docker, indifféremment) :
 
-Les deux services ont une rotation de logs (`max-size: 10m`, `max-file: 3` — sinon le driver `json-file` par défaut grossit indéfiniment sur le disque de l'hôte) ; le service `bot-moni-v3` a en plus une limite mémoire (`mem_limit: 512m`, large pour un bot Discord + petite API — à ajuster si `docker stats` montre un dépassement). Nommé ainsi (pas juste `bot`) pour rester identifiable sans ambiguïté si un second bot tourne sur le même hôte.
+1. Dans le [Discord Developer Portal](https://discord.com/developers/applications), onglet **OAuth2** de l'application du bot : noter le **Client Secret**, et ajouter une **Redirect URI** = `<API_BASE_URL>/auth/callback` (ex. `http://localhost:3001/auth/callback` en dev, l'URL publique réelle en prod).
+2. Renseigner dans `.env` : `API_PORT`, `DISCORD_CLIENT_SECRET`, `API_JWT_SECRET` (chaîne aléatoire d'au moins 32 caractères, à générer une fois avec `openssl rand -hex 32` — le bot refuse de démarrer avec la valeur d'exemple ou un secret plus court : quiconque devine ce secret peut forger un token admin pour n'importe quelle guilde), `API_BASE_URL` (en `https://`, sauf `http://localhost` en développement — refusé sinon) — voir `.env.example`. Un `API_PORT` qui n'est pas un numéro de port empêche aussi le démarrage. Rien à renseigner de plus par site externe : chaque **serveur Discord** configure le sien directement depuis Discord, voir `/config site-externe set` (chapitre "Plusieurs guildes" plus bas).
+3. Démarrer/redémarrer le bot : `✅ API REST en écoute sur le port <API_PORT>` dans les logs confirme que c'est actif.
+4. L'API n'écoute que sur `127.0.0.1:<API_PORT>` par défaut (`API_HOST` pour changer l'adresse) : elle n'est joignable que depuis la machine elle-même, via un reverse proxy HTTPS. En prod, choisir un sous-domaine (ex. `bot.exemple.fr`) et pointer son enregistrement DNS **A**/**AAAA** vers l'IP publique du serveur (préalable indispensable : sans DNS déjà propagé, l'émission du certificat ci-dessous échoue), puis mettre le reverse proxy devant l'API — seul le port 443 est exposé publiquement. En Docker, `docker-compose.yml` passe `API_HOST=0.0.0.0` (le loopback du conteneur n'est pas celui de l'hôte) et restreint lui-même la publication du port à `127.0.0.1` côté hôte — à garder tel quel : Docker contourne `ufw`/iptables classique pour un port publié sans adresse explicite. Si le port est déjà pris, l'API est désactivée (erreur dans les logs) mais le bot Discord continue. `API_BASE_URL` doit pointer vers le domaine public, pas vers `localhost`. Vérifier : `curl https://<API_BASE_URL>/health` doit répondre `{"ok":true}`. Le code fait déjà confiance à UN SEUL reverse proxy en amont (`app.set('trust proxy', 1)`, voir `src/api/server.ts`) pour que le rate-limiting fonctionne par visiteur — si tu chaînes plusieurs proxys avant l'API, ajuster ce nombre en conséquence.
 
-Si `docker compose build` échoue avec `invalid file request` (observé sur Windows + OneDrive avec BuildKit sur ce projet), désactiver BuildKit pour ce build : `set DOCKER_BUILDKIT=0 && docker compose build` (PowerShell : `$env:DOCKER_BUILDKIT=0`).
+   Un modèle de config est fourni dans `deploy/nginx-bot-moni-v3.conf` (reverse proxy nginx). La prod de cette instance utilise en fait Caddy (`/etc/caddy/Caddyfile` : `api.famillemoni.com { reverse_proxy 127.0.0.1:3001 }`) — certificat HTTPS automatique, rien d'autre à configurer :
+   ```bash
+   sudo apt install -y nginx certbot python3-certbot-nginx
+   sudo cp deploy/nginx-bot-moni-v3.conf /etc/nginx/sites-available/bot-moni-v3
+   sudo nano /etc/nginx/sites-available/bot-moni-v3   # remplacer server_name par le vrai sous-domaine
+   sudo ln -s /etc/nginx/sites-available/bot-moni-v3 /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo systemctl reload nginx
+   sudo certbot --nginx -d bot.exemple.fr   # obtient le certificat ET modifie le fichier pour ajouter le bloc HTTPS
+   ```
+   nginx n'ayant pas de renouvellement/émission de certificat intégré (contrairement à Caddy, une alternative valable si tu préfères une config plus courte — `bot.exemple.fr { reverse_proxy 127.0.0.1:3001 }` suffit, certificat automatique), `certbot` installe normalement un timer systemd de renouvellement automatique — vérifier avec `sudo certbot renew --dry-run`.
+
+Techniquement toujours désactivable (`API_PORT` omis de `.env` → aucun port ouvert, comportement inchangé) si vraiment aucun site externe n'est prévu pour ce déploiement — mais pour un déploiement standard de ce bot, la mise en place ci-dessus fait partie de l'installation, pas une étape à part.
 
 ---
 
@@ -122,6 +160,17 @@ Un seul déploiement (un process, une base Postgres) peut servir **plusieurs ser
 3. Le bot s'enregistre automatiquement (`guildCreate`) : commandes slash déployées sur ce serveur en quelques secondes, panneaux prêts à être mis en place via `/config category set` ou `/config channel set`.
 
 Si le bot était hors ligne au moment de l'invitation, il rattrape au démarrage suivant (boucle sur tous les serveurs dans lesquels il se trouve).
+
+### Premiers pas après l'invitation
+
+Ordre recommandé pour un serveur tout juste invité (chaque commande est détaillée dans sa section dédiée plus bas) :
+
+1. `/config category set <catégorie>` — crée en une fois tous les salons manquants (stock, quotas, armurerie, taxes, documentation, labos...) dans une catégorie Discord de ton choix. Voir "`/config category`".
+2. `/config type-groupe set tier:<...>` — choisit le tier de l'organisation (`Petite Frappe` par défaut tant que non réglé) ; fait varier les labos/braquages/taxes accessibles. Voir "`/config type-groupe`".
+3. `/config item list` — vérifie les items pré-remplis par défaut (drogues, munitions...). Leur orthographe doit correspondre **EXACTEMENT** à ce qu'écrit le bot de jeu FiveM de CE serveur dans les logs de coffre — jamais supposer, toujours vérifier contre les vrais logs (piège n°1 du projet, voir `CLAUDE.md`). Voir "`/config item`".
+4. `/config channel add-log-coffre <#salon>` (et `add-log-coffre-admin` pour les coffres admin) — pointe vers les VRAIS salons où le bot de jeu FiveM poste ses logs de coffre, pas les salons auto-créés à l'étape 1 (qui restent vides tant que rien n'y écrit). Voir "`/config channel`". Sur ces salons (et `logs_garages`), retirer à `@everyone` et aux rôles membres les permissions `Envoyer des messages`, `Gérer les webhooks`, `Utiliser les commandes de l'application` et `Utiliser des applications externes` : seul le bot de jeu doit pouvoir y poster — le bot ignore déjà les messages humains et les réponses de commandes, c'est une seconde barrière.
+5. `/adduser nom_jeu:<...> membre:@...` pour chaque joueur — sans ce lien, ses mouvements de coffre sont bien suivis en stock mais son quota part dans le vide.
+6. Optionnel : `/config site-externe set <url>` si un site web externe doit lire les données via l'API REST (voir "Interopérabilité" plus bas).
 
 ### Ce qui est isolé par serveur
 
@@ -141,15 +190,9 @@ Un admin peut aussi consulter (`/config site-externe list`) ou retirer (`/config
 
 ---
 
-## Interopérabilité — API REST (optionnelle)
+## Interopérabilité — API REST
 
-Une petite API REST **en lecture seule**, dans le même process que le bot (`src/api/`), permet à un outil externe (ex. un site web) de récupérer les données du bot. **Désactivée par défaut** — n'existe que si `API_PORT` est défini dans `.env` ; sinon aucun port n'est ouvert, comportement inchangé.
-
-### Mise en place
-
-1. Dans le [Discord Developer Portal](https://discord.com/developers/applications), onglet **OAuth2** de l'application du bot : noter le **Client Secret**, et ajouter une **Redirect URI** = `<API_BASE_URL>/auth/callback` (ex. `http://localhost:3001/auth/callback` en dev, l'URL publique réelle en prod).
-2. Renseigner dans `.env` : `API_PORT`, `DISCORD_CLIENT_SECRET`, `API_JWT_SECRET` (une longue chaîne aléatoire, à générer une fois), `API_BASE_URL` — voir `.env.example`. Rien à renseigner de plus par site externe : chaque **serveur Discord** configure le sien directement depuis Discord, voir `/config site-externe set` (chapitre "Plusieurs guildes" ci-dessus).
-3. Démarrer/redémarrer le bot : `✅ API REST en écoute sur le port <API_PORT>` dans les logs confirme que c'est actif.
+Une petite API REST **en lecture seule**, dans le même process que le bot (`src/api/`), permet à un outil externe (ex. un site web) de récupérer les données du bot. Mise en place dans le cadre de l'installation standard — voir [Installation → API REST](#api-rest) pour l'OAuth2, les variables `.env` et le reverse proxy. Référence ci-dessous : authentification et endpoints disponibles.
 
 ### Authentification — connexion via Discord
 
@@ -158,56 +201,67 @@ Pas de clé API statique : l'utilisateur se connecte avec son compte Discord, et
 1. Le site externe redirige le navigateur vers `<API_BASE_URL>/auth/login?guild=<ID_DU_SERVEUR>` (l'ID du serveur Discord concerné — refusé si ce serveur n'a jamais invité le bot, ou si aucun site n'y est configuré via `/config site-externe`).
 2. Après connexion Discord, l'utilisateur revient sur `<url_du_site>#token=<jwt>` (l'URL configurée via `/config site-externe set` PAR CE SERVEUR) — le site récupère ce token côté client (fragment d'URL, jamais envoyé à un serveur) et le stocke.
 3. Chaque appel à `/api/*` doit inclure `Authorization: Bearer <jwt>`. Le token expire au bout de 7 jours (pas de refresh token — se reconnecter via `/auth/login`) et reste scopé au serveur choisi à l'étape 1 : impossible de l'utiliser pour lire les données d'un autre serveur.
-4. Les **rôles ne sont pas figés dans le token** : à chaque requête, l'API revérifie via le client du bot que l'utilisateur est toujours membre du serveur et recalcule `isAdmin`/`isTaxes` depuis ses rôles actuels. Un rôle retiré (ou une expulsion) prend effet immédiatement, pas à l'expiration du token. `/api/me` renvoie donc toujours les droits du moment.
+4. Les **rôles ne sont pas figés dans le token** : à chaque requête, l'API revérifie via le client du bot que l'utilisateur est toujours membre du serveur et recalcule `isAdmin` depuis ses rôles actuels. Un rôle retiré (ou une expulsion) prend effet immédiatement, pas à l'expiration du token. `/api/me` renvoie donc toujours les droits du moment.
 
-Plusieurs niveaux d'accès : **membre du serveur Discord** (suffit pour la plupart des routes de groupe) ; **rôle taxes ou admin** (requis en plus pour `/api/taxes` — le rôle `TAXES_ROLE_ID` de `/config role`, jusqu'ici sans utilisateur réel, sert enfin à ça) ; **soi-même ou admin** (routes `:userId` de `/api/quotas`/`/api/ventes` — un membre ne peut consulter que ses propres données) ; **membre ou admin** (`/api/stocks/channels`/`/api/stocks/:channelId` — les coffres admin ne sont visibles que pour un admin, mais le total global `/api/stocks` reste le même pour tous).
+**Rôle membre (back-office web) — à configurer** : `/config role set membre <@rôle>` réserve l'API aux porteurs de ce rôle (et aux admins). Il donne accès à tout le back-office web (stocks, quotas, ventes, taxes, armurerie, garages) ; les restrictions admin ci-dessous s'y ajoutent. Le rôle est exigé pour obtenir un token (`/auth/login`) et revérifié à chaque requête (`403` sinon). Être sur le serveur Discord ne suffit pas : sans ce rôle, aucun token n'est délivré et aucune requête n'aboutit. Tant qu'il n'est pas configuré, **seuls les admins** ont accès — à configurer dès la mise en service. `/config role list` signale le cas.
+
+**Rôle taxes** : `/config role set taxes <@rôle>` — `/api/taxes` exige en plus ce rôle (ou admin). Le token porte `isTaxes`, lu par le site de cette instance.
+
+Niveau d'accès de base : **membre du serveur Discord porteur du rôle membre** (les admins seulement tant que ce rôle n'est pas configuré), suffit pour les ressources en lecture (`/api/stocks`, `/api/quotas`, `/api/armurerie`, `/api/ventes`), `/api/taxes` exigeant en plus le rôle taxes. Deux restrictions supplémentaires, plus fines qu'un simple accès admin/non-admin :
+- **Soi-même ou admin** (`requireSelfOrAdmin`) sur toute route `:userId` (`/api/quotas/:userId`, `/api/quotas/pay/:userId`, `/api/ventes/:userId`) : un membre normal ne peut consulter que ses propres données, jamais celles d'un autre joueur.
+- **Coffres admin réservés aux admins** sur `/api/stocks/channels` et `/api/stocks/:channelId` : un coffre `logs_coffres_admin` n'apparaît dans la liste, ni n'est interrogeable en détail, que pour un admin. `/api/stocks` (le total global) reste inchangé pour tout le monde — l'exclure casserait le total affiché.
 
 ### Endpoints disponibles
 
 | Endpoint | Accès | Retourne |
 |----------|-------|----------|
 | `GET /api/me` | Membre | Identité résolue (id, username, isAdmin, isTaxes) |
-| `GET /api/users` | Membre | Comptes Discord connus de la guilde (userId, dernier pseudo, nom en jeu `gameName`) — un non-admin ne reçoit que lui-même |
-| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus (total réel, coffres admin inclus pour tout le monde), avec la configuration de l'item (`name`, `group`, `vente`, `visibleStock`, `laboLie`, `stockMultiplier`) |
-| `GET /api/stocks/items` | Membre | Configuration de tous les items suivis (`/config item`), dans l'ordre d'affichage — y compris ceux sans stock |
-| `GET /api/stocks/channels` | Membre/Admin | Liste des salons de logs de coffre suivis (avec leur nom) — coffres admin visibles uniquement pour un admin |
-| `GET /api/stocks/:channelId` | Membre/Admin | Stock actuel de chaque item pour UN coffre précis — 403 si ce coffre est un coffre admin et que le requérant ne l'est pas |
+| `GET /api/users` | Membre | Comptes Discord connus de la guilde (userId, dernier pseudo, `gameName` = nom en jeu) — un non-admin ne reçoit que lui-même |
+| `GET /api/roles` | Membre | Rôles du serveur Discord (`id`, `name`, `color`), du plus haut au plus bas, sans @everyone ni rôles d'intégration — pour qu'un site externe propose les rôles par leur nom |
+| `GET /api/stocks` | Membre | Stock actuel de chaque item suivi, tous coffres confondus (admin inclus, pour tout le monde) |
+| `GET /api/stocks/channels` | Membre/Admin | Liste des coffres surveillés (`logs_coffres` + `logs_coffres_admin` avec leur label) — coffres admin réservés aux admins |
+| `GET /api/stocks/items` | Membre | Catalogue des objets suivis (`/config item`), dans l'ordre du Stock Général — référentiel pour grouper/ordonner comme le panneau Discord |
+| `GET /api/stocks/:channelId` | Membre/Admin | Stock actuel de chaque item pour UN coffre précis — 403 sur un coffre admin pour un non-admin |
 | `GET /api/stocks/history?item=&channelId=&limit=` | Membre/Admin | Derniers mouvements, filtrables par item et/ou coffre (défaut 20, max 200) — les mouvements des coffres admin n'apparaissent que pour un admin (403 si un non-admin les demande explicitement) |
-| `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis, avec leur nom (`name`) |
-| `GET /api/quotas/config?week=` | Membre | De quoi interpréter les autres réponses : plage `[since, until)` résolue, objectifs (`/config quota`), taux (`/config salaire`, `/config classement`) et paliers de paie vente (`/config palier`, champ `salaryTiers`) **actuels**, libellés des activités |
+| `GET /api/quotas?week=` | Membre | Quota (somme par catégorie + détail brut) de tous les joueurs suivis |
+| `GET /api/quotas/config?week=` | Membre | De quoi interpréter les autres réponses : plage `[since, until)` résolue, objectifs (`/config quota`), taux (`/config salaire`, `/config classement`) et paliers de paie vente (`/config palier`) **actuels**, libellés des activités |
+| `GET /api/quotas/cooldowns` | Membre/Admin | Cooldowns personnels en cours — un non-admin ne reçoit que les siens, un admin voit tout le monde. Pas de `?week=` (état courant, pas un total sur une plage) |
+| `GET /api/quotas/braquages` | Membre | Slots de braquage restants par activité, à l'échelle du GROUPE (limite hebdomadaire glissante sur 7 jours) — prochaine place libre indiquée si complet. Pas de `?week=` (fenêtre glissante, pas une semaine ISO) |
+| `GET /api/braquages` | Membre | Plafonds de braquage de la semaine glissante : `limit`, `used`, `available`, `nextFreeAt` (forme propre à cette instance, lue par famillemoni.com) |
+| `GET /api/cooldowns` / `GET /api/cooldowns/:userId` | Membre / Soi-même-Admin | Cooldowns actifs du requérant, ou d'un joueur précis (forme propre à cette instance) |
 | `GET /api/quotas/:userId?week=` | Soi-même/Admin | Quota d'un joueur précis |
-| `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$, avec leur nom (`name`) |
+| `GET /api/quotas/pay?week=` | Membre | Paie de tous les joueurs suivis, y compris à 0$ |
 | `GET /api/quotas/pay/:userId?week=` | Soi-même/Admin | Paie d'un joueur précis |
-| `GET /api/quotas/ranking?week=` | Membre | Classement groupe par points (`/config classement`), triés décroissant, uniquement > 0, avec les noms (`name`) |
+| `GET /api/quotas/ranking?week=` | Membre | Classement groupe par points (`/config classement`), trié décroissant, uniquement > 0 pt |
 | `GET /api/quotas/summary?week=` | Membre | Bilan groupe : total par activité |
 | `GET /api/armurerie?status=` | Membre | Armes, filtrables par statut (`in_stock`/`loaned`/`lost` — sans filtre : tout sauf perdues) |
 | `GET /api/armurerie/search?q=` | Membre | Recherche par nom ou référence (sous-chaîne) |
-| `GET /api/armurerie/types` | Membre | Référentiel des modèles d'armes (`key`, `label`, `category` informative) |
 | `GET /api/armurerie/ammo` | Membre | Stock + compteurs hebdomadaires munitions |
-| `GET /api/armurerie/ammo/history` | Membre | Ventes de munitions depuis le dernier reset hebdomadaire (dimanche 19h), avec le nom de l'acheteur (`name`) |
-| `GET /api/armurerie/ammo/production` | Membre | Déclarations de fabrication de munitions depuis le dernier reset hebdomadaire, avec le nom du déclarant (`name`) |
-| `GET /api/ventes?week=` | Membre | Total vendu par joueur sur la plage (trié décroissant, avec `name`) + total du groupe |
+| `GET /api/armurerie/ammo/history` | Membre | Ventes de munitions depuis le dernier reset hebdomadaire (dimanche 19h) |
+| `GET /api/armurerie/ammo/production` | Membre | Déclarations de fabrication depuis le dernier reset hebdomadaire — pendant de `/ammo/history` côté fabrication |
+| `GET /api/armurerie/types` | Membre | Référentiel des modèles d'armes (`ARME_TYPES`), avec leur catégorie |
+| `GET /api/ventes?week=` | Membre | Total vendu par joueur sur la plage (trié décroissant) + total du groupe |
 | `GET /api/ventes/:userId?week=` | Soi-même/Admin | Ventes d'un joueur précis : total + détail par drogue vendue |
-| `GET /api/braquages` | Membre | Plafonds de braquage de la semaine glissante (7 j) : plafond, consommé, restant, prochain créneau libre |
-| `GET /api/cooldowns` | Membre | Cooldowns actifs du requérant (`/api/cooldowns/:userId` : soi-même ou admin) |
-| `GET /api/garages/vehicles` | Membre | Véhicules actuellement sortis (pas encore rangés), avec leur responsable courant |
-| `GET /api/garages/impounds` | Admin | Classement cumulé des fourrières + montant indicatif par fourrière (même règle que `/fourrieres`) |
-| `GET /api/taxes/types` | Taxes/Admin | Référentiel de tous les types fixes et zones (tous tiers), avec `available` pour le tier courant |
-| `GET /api/taxes?type=&status=` | Taxes/Admin | Taxes filtrables par type (fixe, `zone` = toutes les zones groupées, ou la clé d'une zone précise) et statut (`active`/`expired`, défaut `active`) — infos générales, sans téléphone/mot de passe |
-| `GET /api/taxes/search?type=&q=` | Taxes/Admin | Recherche par nom dans un type donné (`type` requis) — mêmes infos générales que ci-dessus |
-| `GET /api/taxes/:id` | Taxes/Admin | Détail complet d'une taxe précise, téléphone/mot de passe compris |
+| `GET /api/taxes?type=&status=` | Taxes/Admin | Taxes filtrables par type (fixe, `zone` = toutes les zones groupées, ou la clé d'une zone précise) et statut (`active`/`expired`, défaut `active`) — infos générales seulement, jamais téléphone/mot de passe |
+| `GET /api/taxes/search?type=&q=` | Taxes/Admin | Recherche par nom dans un type donné (`type` requis) — infos générales seulement, jamais téléphone/mot de passe |
+| `GET /api/taxes/types` | Taxes/Admin | Référentiel : tier actuel, tous les types fixes et toutes les zones connus, avec `available` pour le tier ACTUEL |
+| `GET /api/taxes/:id` | Taxes/Admin | Détail complet d'UNE taxe précise, téléphone/mot de passe inclus |
+| `GET /api/garages/vehicles` | Membre | Véhicules actuellement sortis et pas encore rangés — qui a quel véhicule dehors |
+| `GET /api/garages/impounds` | Admin | Classement cumulé des mises en fourrière, avec le montant indicatif (350$/fourrière, aucune facturation automatique) — même restriction que `/fourrieres` côté Discord |
+
+Les lignes des routes de groupe (`/api/quotas`, `/api/quotas/pay`, `/api/quotas/ranking`, `/api/ventes`, `/api/armurerie/ammo/history`, `/api/armurerie/ammo/production`) portent un champ `name` (nom en jeu, sinon dernier pseudo Discord — voir `src/api/noms.ts`). `/api/stocks` et `/api/stocks/:channelId` ajoutent à chaque ligne la configuration de l'item (`name`, `group`, `vente`, `visibleStock`, `laboLie`, `laboLieRole`, `stockMultiplier`).
 
 Lecture seule pour l'instant — pas d'écriture depuis l'extérieur (voir docstring de `src/api/server.ts` pour pourquoi).
 
 ### Naviguer sur une semaine passée (`?week=`)
 
-Les 6 endpoints `/api/quotas*` et les 2 endpoints `/api/ventes*` acceptent un paramètre `week` (semaine ISO 8601, ex. `2026-W37`, lundi 00:00 UTC → lundi suivant, résolu par `src/api/week.ts`) — sans ce paramètre, ils portent sur la semaine en cours (depuis le dernier reset hebdomadaire). Reconstruit depuis la table `transactions` (jamais purgée, une ligne par déclaration) plutôt que le cache `stats` (vidé entièrement à chaque reset) — voir les fonctions `*ForRange` dans `modules/quotas.ts` et `getVenteTotalsForRange`/`getVenteDetailForUser` dans `db.ts`. Une vente confirmée écrit une `transaction` (`action: 'vente'`) comme n'importe quelle activité, donc le `total` de `/api/ventes` est toujours identique au `vente` d'un quota pour la même plage — une seule vérité.
+Les 7 endpoints `/api/quotas*` qui acceptent `?week=` (tous sauf `/cooldowns` et `/braquages`, des états courants sans notion de semaine passée) et les 2 endpoints `/api/ventes*` acceptent un paramètre `week` (semaine ISO 8601, ex. `2026-W37`, résolu par `src/api/week.ts` en période de paie : du dimanche 19h précédent au dimanche 19h de cette semaine, heure de Paris — les mêmes bornes que la paie hebdomadaire publiée) — sans ce paramètre, ils portent sur la semaine en cours (depuis le dernier reset hebdomadaire). Reconstruit depuis la table `transactions` (jamais purgée, une ligne par déclaration) plutôt que le cache `stats` (vidé entièrement à chaque reset) — voir les fonctions `*ForRange` dans `modules/quotas.ts` et `getVenteTotalsForRange`/`getVenteDetailForUser` dans `db.ts`. Une vente confirmée écrit une `transaction` (`action: 'vente'`) comme n'importe quelle activité, donc le `total` de `/api/ventes` est toujours identique au `vente` d'un quota pour la même plage — une seule vérité.
 
-**Limite à connaître** : les objectifs (`/config quota`) et taux de paie (`/config salaire`) ne sont **pas historisés** — seule la valeur actuelle existe en base. Une requête sur une semaine passée applique donc les objectifs/taux *actuels* à l'activité de cette semaine-là, pas ceux réellement en vigueur à l'époque si l'admin les a changés depuis (n'affecte pas `/api/ventes`, qui ne dépend d'aucun taux). Même chose pour les paliers de `/config palier`. Si ça devient un problème pour `/api/quotas*`, il faudrait historiser `QuotaTarget`/`SalaryRate` (nouvelle table, logique de résolution "valeur en vigueur à telle date") — pas fait pour l'instant.
+**Limite à connaître** : les objectifs (`/config quota`), taux de paie (`/config salaire`) et paliers (`/config palier`) ne sont **pas historisés** — seule la valeur actuelle existe en base. Une requête sur une semaine passée applique donc les objectifs/taux/paliers *actuels* à l'activité de cette semaine-là, pas ceux réellement en vigueur à l'époque si l'admin les a changés depuis (n'affecte pas `/api/ventes`, qui ne dépend d'aucun taux). Si ça devient un problème pour `/api/quotas*`, il faudrait historiser `QuotaTarget`/`SalaryRate`/`SalaryTier` (nouvelle table, logique de résolution "valeur en vigueur à telle date") — pas fait pour l'instant.
 
 ### Types de taxe (`?type=`)
 
-Valeurs acceptées : les types fixes (`sporex`, `heroine`, `vente`, `fertilisant`, `cannabis`, `mexicana`, `cocaine`), le type fictif `zone` qui regroupe **toutes** les zones (Petite Frappe en a 6, Gang/Organisation en partagent 18 — voir chapitre Taxes plus bas) sous une seule valeur filtrable, ou la clé d'**une** zone précise (ex. `roxwood_village`) pour ne remonter que celle-là. `type` est requis sur `/search`, optionnel sur la liste (omis = tous types confondus).
+Valeurs acceptées : les types fixes (`sporex`, `heroine`, `vente`, `fertilisant`, `cannabis`, `mexicana`, `cocaine`, `salvia`), le type fictif `zone` qui regroupe **toutes** les zones (Petite Frappe en a 7, Gang/Organisation en partagent 18 — voir chapitre Taxes plus bas) sous une seule valeur filtrable, ou la clé d'**une** zone précise (ex. `roxwood_village`) pour ne remonter que celle-là. `type` est requis sur `/search`, optionnel sur la liste (omis = tous types confondus).
 
 ---
 
@@ -216,67 +270,84 @@ Valeurs acceptées : les types fixes (`sporex`, `heroine`, `vente`, `fertilisant
 Contrairement à un `config.js` à éditer, **toute la configuration métier vit en base et se pilote avec la commande `/config`**, réservée aux administrateurs Discord natifs (permission `Administrator` — volontairement indépendante du rôle admin configurable, pour éviter un problème d'œuf-et-poule sur un serveur tout juste configuré).
 
 ### `/config channel`
-Associe un salon Discord à un rôle fonctionnel du bot (`stock_general`, `quotas`, `armurerie`, `taxes`, `admin`, …) ou gère les listes de salons de logs de coffre surveillés — `logs_coffres` (coffres normaux) et `logs_coffres_admin` (coffres admin de l'organisation, marqués 🛡️ dans `historique_stock` ; plusieurs salons possibles pour l'un comme pour l'autre, mais un même salon ne peut appartenir qu'à une seule des deux listes). `set` crée/rafraîchit immédiatement le panneau concerné (stock, armurerie, quotas, taxes) plutôt que d'attendre un événement indirect — pas besoin de redémarrer le bot après coup.
+Associe un salon Discord à un rôle fonctionnel du bot (`stock_general`, `quotas`, `armurerie`, `taxes`, `documentation`, `admin`, …) ou gère les listes de salons de logs de coffre surveillés — `logs_coffres` (coffres normaux) et `logs_coffres_admin` (coffres admin de l'organisation, marqués 🛡️ dans `historique_stock` ; plusieurs salons possibles pour l'un comme pour l'autre, chacun nommable via l'option `nom` pour le distinguer des autres). Un salon ne peut appartenir qu'à l'une des deux listes à la fois, jamais les deux — l'ajout est rejeté tant qu'il n'a pas été retiré de l'autre. `set` crée/rafraîchit immédiatement le panneau concerné (stock, armurerie, quotas, taxes, documentation) plutôt que d'attendre un événement indirect — pas besoin de redémarrer le bot après coup.
 - `/config channel set <role> <#salon>`
-- `/config channel add-log-coffre <#salon>` / `remove-log-coffre`
-- `/config channel add-log-coffre-admin <#salon>` / `remove-log-coffre-admin`
+- `/config channel add-log-coffre <#salon> [nom]` / `remove-log-coffre`
+- `/config channel add-log-coffre-admin <#salon> [nom]` / `remove-log-coffre-admin`
 - `/config channel list`
 
+Les salons auto-créés (voir `/config category` ci-dessous) sont préfixés d'un emoji + "・" (point médian katakana) cohérent par rôle (`📦・stock`, `🔫・armurerie`, `🛃・taxes`…). Les salons de labo n'ont pas d'emoji statique : le leur (🟢 disponible / 🔴 occupé) est posé dynamiquement selon l'état du labo (voir `modules/alertes.ts`).
+
 ### `/config category` — création automatique des salons
-`/config category set <catégorie>` crée en une fois, dans la catégorie Discord donnée, un salon pour chaque rôle fonctionnel pas encore configuré (nom par défaut dérivé du rôle, ex. `stock`, `armurerie`, `alertes-braquages`), les associe automatiquement, puis rafraîchit les panneaux comme `channel set`. Exclut volontairement les salons alimentés par le bot de jeu FiveM (`logs_garages`, et les logs de coffre gérés séparément via `add-log-coffre`/`add-log-coffre-admin`) : ceux-là doivent pointer vers un salon de logs déjà existant, jamais un salon vide fraîchement créé. Un rôle déjà configuré n'est jamais recréé — ré-exécutable sans risque de doublons.
+`/config category set <catégorie>` crée en une fois, dans la catégorie Discord donnée, un salon pour chaque rôle fonctionnel pas encore configuré (nom par défaut dérivé du rôle), les associe automatiquement, puis rafraîchit les panneaux comme `channel set` — y compris republier le message d'accueil du salon `documentation` s'il vient d'être créé. Un salon de labo n'est proposé que s'il est valide pour le tier actuel (voir `/config type-groupe`). Les salons déjà configurés mais mal rangés (pas dans cette catégorie) sont **déplacés** (jamais recréés ni renommés), rapporté séparément des créations. Exclut volontairement les salons alimentés par le bot de jeu FiveM (`logs_garages`, et les logs de coffre gérés séparément via `add-log-coffre`/`add-log-coffre-admin`) : ceux-là doivent pointer vers un salon de logs déjà existant, jamais un salon vide fraîchement créé. Un rôle déjà configuré n'est jamais recréé — ré-exécutable sans risque de doublons.
+
+L'ordre d'affichage des salons auto-créés (dans la liste Discord) est réappliqué après toute création/déplacement, selon un ordre fixe dans le code (`documentation`, puis les panneaux d'activité, puis les salons de labo, puis stock/paie/bilan, puis les logs/alertes en dernier).
 
 ### `/config role`
-Associe un rôle Discord à un usage (`admin` : commandes sensibles ; `taxes` : accès back-office taxes).
+Associe un rôle Discord à un usage (`admin` : commandes sensibles ; `membre` : accès aux données via le site externe ; `taxes` : accès aux taxes sur le site externe — voir la section API REST).
 - `/config role set <cible> <@rôle>` / `list`
 
 ### `/config item`
 Items de coffre suivis. **L'orthographe doit correspondre exactement** (accents, casse) à ce qu'écrit le bot de jeu FiveM — tout item absent de cette liste est silencieusement ignoré lors du parsing des logs. C'est la source de bug la plus fréquente sur ce type de bot : avant d'ajouter un item, vérifier l'orthographe exacte dans les logs récents du salon coffre.
-- `/config item add <nom> [vente_pnj] [groupe] [stock_general] [labo_lie] [multiplicateur]`
+- `/config item add <nom> [vente_pnj] [visible_stock] [labo_associe] [role_labo] [multiplicateur]`
   - `vente_pnj` : déclarable en vente aux PNJ (marché noir) — pas une vente entre joueurs.
-  - `groupe` : libellé de regroupement dans le message Stock Général (ex. "Munitions").
-  - `stock_general` : afficher dans le message Stock Général (défaut oui — le stock reste suivi même à non).
-  - `labo_lie` : ce labo produit cet item ? Exclut alors la vente PNJ pour tout tier ayant ce labo actif (voir `/config type-groupe` ci-dessous).
-  - `multiplicateur` : unités de base par unité de cet item dans son `groupe` (défaut 1) — ex. 24 pour une boîte de munitions qui en contient 24, pour que le total du groupe reste exact plutôt que de compter 1 boîte comme 1 balle.
+  - `visible_stock` : afficher dans le message Stock Général (défaut oui — le stock reste suivi même à non).
+  - `labo_associe` + `role_labo` : lie cet item à un labo. `role_labo: produit` — c'est la drogue que ce labo fabrique, exclue de la vente PNJ tant que ce labo est actif pour le tier courant (défaut si `labo_associe` est fourni sans précision). `role_labo: materiau` — une matière première qu'il consomme, n'affecte jamais la vente PNJ, sert uniquement à catégoriser l'affichage du Stock Général.
+  - `multiplicateur` : unités de base par unité de cet item (défaut 1) — ex. 24 pour une boîte de munitions qui en contient 24, pour que le total du groupe de stock auquel il appartient reste exact plutôt que de compter 1 boîte comme 1 balle. Le regroupement lui-même (`groupe`) n'est pas réglable ici — trop générique pour son seul usage réel (les munitions) — il ne se pose qu'au pré-remplissage (`src/default-items.ts`).
 - `/config item remove <nom>` (autocomplete) / `/config item list [filtre]`
+
+Un nom qui ne diffère d'un item existant que par la casse (« argent sale » face à « Argent Sale ») est refusé : les deux partageraient le même stock et seraient comptés deux fois dans les totaux.
 
 Pas d'option pour désigner l'item qui confirme une vente de drogue (voir `/config item list`, badge 🪙) : un seul item joue ce rôle en pratique, fixé en dur (`CONFIRME_VENTE_ITEM` dans `modules/ventes.ts`, "Argent Sale" par défaut — même principe que `MUNITIONS_STOCK_GROUP` pour les munitions dans `armurerie.ts`) plutôt qu'un flag à poser à la main sur chaque item.
 
-Cinq items sont pré-remplis s'ils sont absents (`src/default-items.ts`) : **Munition de pistolet** et **Boîte mun. pistolet** (même `groupe: "Munition de pistolet"`, alimentent ensemble le compteur de l'armurerie — la boîte a `multiplicateur: 24`, voir `/config item` ci-dessous), **Munition de SMG** (simple item de stock, aucun groupe, mais affiché séparément dans l'armurerie via `MUNITIONS_SMG_ITEM`), **Argent Sale** (= `CONFIRME_VENTE_ITEM`, confirme les ventes en attente) et **Argent** (simple item de stock, distinct de l'Argent Sale). Déclenché au démarrage du bot ET à chaque usage de `/config` (pas seulement au tout premier démarrage — un bot déjà en cours d'exécution en profite dès la prochaine commande `/config`). Un item déjà configuré n'est jamais écrasé — ce n'est qu'un point de départ, modifiable/supprimable ensuite comme n'importe quel autre item via `/config item`.
+Une liste d'items est pré-remplie s'ils sont absents (`src/default-items.ts`, qui fait foi pour la liste exacte) : les items génériques (**Munition de pistolet** + **Boîte mun. pistolet** à `multiplicateur: 24`, **Munition de SMG**, **Argent Sale** = `CONFIRME_VENTE_ITEM`, **Argent**), le butin et les outils de casse, les drogues vendables, et les items/matériaux des labos du registre fixe. Déclenché au démarrage du bot ET à chaque usage de `/config` (pas seulement au tout premier démarrage — un bot déjà en cours d'exécution en profite dès la prochaine commande `/config`). Un item déjà configuré n'est jamais écrasé — ce n'est qu'un point de départ, modifiable/supprimable ensuite comme n'importe quel autre item via `/config item`.
 
 ### `/config type-groupe` — type d'organisation
-Le déploiement passe par 4 tiers — **Indépendant / Petite Frappe / Gang / Organisation** — qui font varier deux choses sans toucher au code :
+Le déploiement passe par 4 tiers — **Indépendant / Petite Frappe / Gang / Organisation** — qui font varier plusieurs choses sans toucher au code :
 - Les limites hebdomadaires de braquage (Fleeca, Armurerie, Bijouterie, Pinebank, Human Labs) : plus le tier est élevé, plus la limite est haute (`0` pour un tier sans accès à l'activité).
-- Les labos accessibles (Indépendant : aucun ; Petite Frappe : Héroïne + Sporex ; Gang : Mexicana + Cannabis ; Organisation : Mexicana + Cocaïne) — un labo hors barème du tier disparaît du panneau, et toute drogue liée (`labo_lie`) devient indisponible en vente PNJ mais apparaît dans la section "🧪 Drogue de production" du Stock Général (voir plus bas).
+- Les labos accessibles (Indépendant : Salvia + Branche De Cannabis ; Petite Frappe : Héroïne + Spore X ; Gang : Mexicana + Cannabis ; Organisation : Mexicana + Cocaïne) — un labo hors barème du tier disparaît du panneau, et toute drogue liée (`labo_associe`, rôle `produit`) **redevient vendable aux PNJ** (si `vente:true`) et **disparaît** de la section "🧪 Drogues de production" du Stock Général (voir plus bas) — l'inverse de quand ce labo est actif pour le tier courant.
+- Les taxes fixes et zones proposées à la création (voir `modules/taxes.ts` dans "Modules").
+- **Les salons de labo** : ceux qui ne sont plus valides pour le nouveau tier sont supprimés (jamais si la suppression Discord échoue — l'association en base est alors conservée plutôt que perdue), ceux qui le deviennent sont créés dans la même catégorie que les autres salons de labo. Un labo commun à deux tiers (ex. Mexicana, Gang et Organisation) garde son salon d'un tier à l'autre.
 - `/config type-groupe set <tier>` / `list` (affiche le barème complet des 4 tiers)
 
 Tant qu'aucun tier n'a jamais été choisi, le bot se comporte comme `Petite Frappe` par défaut.
 
 ### `/config quota`
 Objectif hebdomadaire par catégorie de quota (`actions`, `vente`, `recolte`, `labos` — celles utilisées par le registre d'activités décrit dans "Modules" plus bas). C'est la seule partie du système de quotas qui reste pilotable depuis Discord, parce que les objectifs peuvent être renégociés. **Une catégorie sans objectif défini n'apparaît dans aucun affichage de quota** (panneau perso, `/quotas`, paie hebdomadaire) même si des activités lui sont rattachées — seul le détail par activité la montre encore.
-- `/config quota set <quota_type> <valeur>` / `remove` / `list`
+- `/config quota set <quota_type> <valeur>` / `remove` / `list` — `quota_type` se choisit dans la liste des catégories du registre (`remove` reste en saisie libre, pour retirer une valeur ancienne).
+
+**Rappel du dimanche (catégorie `vente`)** : le dimanche de 00h à 19h (heure de Paris), un message dans le salon `quotas` mentionne chaque membre mappé encore sous son objectif de vente, avec son compte, du plus loin au plus proche de l'objectif. Il se met à jour à chaque vente confirmée et à chaque changement de l'objectif vente, et disparaît au reset de 19h (ou dès que l'objectif vente est retiré).
 
 ### `/config salaire`
-Taux de paie ($ par unité) par catégorie de quota — mêmes catégories que `/config quota`. **Une catégorie sans taux configuré ne génère aucune paie**, même si des activités lui sont rattachées : "Ma Paie", le classement de groupe et la paie hebdomadaire n'affichent que les catégories ayant un taux.
-- `/config salaire set <quota_type> <valeur>` / `remove` / `list`
+Taux de paie ($ par unité) par catégorie de quota — mêmes catégories que `/config quota`. **Une catégorie sans taux configuré ne génère aucune paie**, même si des activités lui sont rattachées : "Ma Paie" et la paie hebdomadaire n'affichent que les catégories ayant un taux (ou, pour "vente" uniquement, un palier — voir `/config palier` ci-dessous).
+- `/config salaire set <quota_type> <valeur> [item]` / `remove <quota_type> [item]` / `list`
+  - `item` (autocomplete sur les items vendables) : optionnel, utilisable uniquement avec `quota_type: vente` — fixe un taux spécifique à une drogue, qui remplace le taux général "vente" pour elle seule. Un item sans taux spécifique utilise le taux général. Il doit être un item suivi (sinon refusé : un taux sous un nom mal orthographié ne s'appliquerait à aucune vente) ; la casse saisie n'importe pas, le nom exact configuré est enregistré.
 
-Exemple : `/config salaire set vente 30` → chaque unité vendue rapporte 30$. On peut faire pareil pour `labos`, `recolte`, etc. — indépendamment des objectifs fixés par `/config quota` (une catégorie peut avoir un objectif sans taux de paie, un taux sans objectif, ou les deux).
+Exemple : `/config salaire set vente 30` → chaque unité vendue rapporte 30$. `/config salaire set vente 45 item:Cocaïne` → la Cocaïne rapporte 45$/unité, tout le reste continue à 30$/unité. On peut faire pareil pour `labos`, `recolte`, etc. — indépendamment des objectifs fixés par `/config quota` (une catégorie peut avoir un objectif sans taux de paie, un taux sans objectif, ou les deux).
 
-`/config salaire set vente <valeur> item:<drogue>` fixe un taux propre à une drogue, qui remplace le taux général "vente" pour elle seule.
+**Coût de calcul** : un taux par item force une relecture de la table `transactions` (jamais purgée) pour reconstruire la répartition des ventes par drogue — mais uniquement si au moins un taux par item (ou un palier par item, voir `/config palier` ci-dessous) est configuré pour la guilde ; pour toute guilde qui n'utilise pas ces options, le calcul de paie reste léger (cache `stats` uniquement, aucune lecture supplémentaire).
 
-### `/config palier` — paie progressive de la vente
-Barème par tranches de quantité vendue dans la semaine, **uniquement pour la catégorie `vente`**. Il remplace le taux plat `/config salaire` quand il existe.
-- `/config palier add <valeur> [jusqua] [item]` — ajoute une tranche après la dernière existante. `jusqua` omis = tranche finale, sans limite (elle ferme le barème). Chaque borne doit dépasser la précédente.
-- `/config palier remove [jusqua] [item]` — retire une tranche (`jusqua` omis = la tranche finale).
-- `/config palier clear [item]` — retire tout le barème.
-- `/config palier list` — affiche les barèmes.
+### `/config palier` — barème de paie progressif (vente de drogue uniquement)
+Alternative à `/config salaire` pour la catégorie "vente" : au lieu d'un taux plat, un barème par tranche de quantité — la première tranche est payée à son propre taux, la suivante au sien, etc. (comme un barème d'impôt, **jamais** un seuil qui repaierait toute la quantité au taux de la dernière tranche atteinte). `item` optionnel cible une drogue précise, sinon le barème général "vente".
+- `/config palier add [item] <jusqua omis = tranche finale> <valeur>` — ajoute une tranche ; la borne doit être strictement croissante, et une seule tranche finale (sans limite) par barème. Même règle que `/config salaire` pour `item` (item suivi obligatoire). Tant qu'un barème n'a pas de tranche finale, sa dernière tranche s'applique au-delà de sa borne (signalé par `add` et `list`) — jamais 0 $.
+- `/config palier remove [item] [jusqua]` — retire une tranche précise (`jusqua` omis = la tranche finale).
+- `/config palier clear [item]` — retire tout le barème visé, retombe sur le taux plat (`/config salaire`) s'il existe.
+- `/config palier list` — liste tous les barèmes configurés.
 
-**Calcul progressif**, comme un barème d'impôt : chaque tranche est payée à son propre taux. Avec `add 10 jusqua:100`, `add 15 jusqua:300`, `add 20`, vendre 250 unités rapporte `100×10 + 150×15 = 3250$` (jamais `250×15`). Sans tranche finale, les unités au-delà de la dernière borne ne rapportent rien (`list` le signale).
+Exemple : `/config palier add jusqua:100 valeur:10` puis `/config palier add valeur:15` (sans `jusqua`) donne un barème général "vente" à deux tranches — les 100 premières unités vendues (toutes drogues confondues) à 10$/unité, puis 15$/unité au-delà. `/config palier add item:Cocaïne jusqua:50 valeur:25` crée un barème propre à la Cocaïne, qui prime sur le barème général pour cette drogue précise (sans tranche finale, la quantité au-delà de 50 pour cet item reste payée à 25$/unité, la dernière tranche se prolongeant).
 
-`item` omis = barème général ; sinon barème propre à une drogue. Priorité, drogue par drogue : **palier de la drogue > taux de la drogue > palier général > taux général**. Les drogues sans palier/taux propre sont additionnées avant d'appliquer le barème général (30 + 80 unités de deux drogues = 110 unités dans le même barème, pas deux fois la première tranche).
+**Priorité de résolution par item, à la lecture** (voir `quotas.computeVentePay`) : barème propre à l'item > taux plat propre à l'item (`/config salaire ... item:`) > barème général > taux plat général. Un item sans aucun override retombe sur le barème/taux général, appliqué à la quantité restante mise en commun (`pooled`, toutes les drogues sans override confondues) — pas item par item, pour que les tranches du barème général se calculent sur le bon total.
+
+### `/config classement` — points de classement de groupe
+Points de classement (entiers, pas des $) par catégorie de quota — **totalement indépendant de `/config salaire`** : un item/une activité peut avoir un taux de paie, des points de classement, les deux, ou aucun. Le classement de groupe (bouton "Classement Groupe" du panneau) se base sur ces points, pas sur le salaire — voir "Ma Paie", qui garde son propre classement (`🏆 Classement (paie)`), distinct de celui-ci.
+- `/config classement set <quota_type> <valeur> [activite]` / `remove <quota_type> [activite]` / `list`
+  - `activite` (choix fixe parmi les activités de catégorie `actions`, pas de texte libre) : optionnel, utilisable uniquement avec `quota_type: actions` — fixe des points spécifiques à une activité précise, qui remplacent le nombre général "actions" pour elle seule.
+
+Contrairement à la paie par item, le calcul des points par activité **ne coûte jamais de requête supplémentaire** : le cache de stats déjà chargé pour "Mon Quota"/le panneau détaille déjà chaque activité individuellement, la catégorie "actions" n'étant qu'un regroupement de clés déjà disponibles.
 
 ### `/config site-externe` — site web autorisé à utiliser l'API REST
 Uniquement pertinent si l'API REST est activée (`API_PORT`, voir "Interopérabilité" plus haut). Chaque serveur Discord (guilde) configure le sien indépendamment.
-- `/config site-externe set <url>` — autorise ce site (ex. `https://mon-site.exemple.com`) ; l'origine CORS acceptée est dérivée automatiquement de cette URL.
+- `/config site-externe set <url>` — autorise ce site (ex. `https://mon-site.exemple.com`) ; l'origine CORS acceptée est dérivée automatiquement de cette URL. `https://` obligatoire (le token de connexion est transmis dans l'URL), sauf `http://localhost` pour le développement ; l'URL ne doit pas contenir de `#`.
 - `/config site-externe remove` — retire le site autorisé (l'API refuse alors toute connexion pour ce serveur).
 - `/config site-externe list` — affiche le site actuellement configuré.
 
@@ -285,19 +356,19 @@ Uniquement pertinent si l'API REST est activée (`API_PORT`, voir "Interopérabi
 ## Modules
 
 ### `src/modules/stocks.ts` — Stocks de coffre
-Parse les logs des salons de coffre suivis, met à jour la table `coffre_stocks` (stock par coffre, par salon `logs_coffres`) et le message permanent du salon `stock_general`. Le total global (panneau Discord, `/api/stocks`) n'est pas stocké : c'est toujours la somme des coffres, recalculée à la lecture — il ne peut donc jamais diverger du détail par coffre (`/coffre-stock`, `/api/stocks/:channelId`). Gère le rattrapage au démarrage et un resync complet à la demande (`/sync-stock`). `/config item add`/`remove` rafraîchit ce panneau immédiatement, sans attendre le prochain mouvement de coffre. `/set-stock` et `/historique-stock` utilisent l'autocomplete (la liste d'items peut dépasser la limite de 25 choix Discord). Le Stock Général affiche en plus deux sections dynamiques (dépendantes du tier, voir `/config type-groupe`) : **💊 Drogue à vendre** (total seul, détail via `/drogues-a-vendre`) et **🧪 Drogue de production** (détail par item). La configuration brute des items est exposée par `/api/stocks/items`. Dès qu'un mouvement de coffre (retrait ou dépôt, n'importe quel item) concerne un joueur sans compte Discord mappé, une alerte est postée dans `admin` (voir `/adduser`).
+Parse les logs des salons de coffre suivis et met à jour `coffre_stocks`, le détail par coffre (par salon `logs_coffres`) — SEULE table de stock, exposée via l'API (voir section Interopérabilité plus haut) et corrigeable individuellement (`/set-stock ... coffre:`). Le total global affiché par le message permanent du salon `stock_general` n'est jamais stocké séparément : il est toujours recalculé comme la somme des coffres actuellement suivis pour chaque item, ce qui empêche structurellement toute divergence entre le panneau et le détail par coffre. Un coffre retiré (`/config channel remove-log-coffre`) ne compte plus dans le total ; réajouté, il retrouve son stock. Gère le rattrapage au démarrage et après une coupure de connexion à Discord, et un resync complet à la demande (`/sync-stock`, une seule à la fois ; elle échoue explicitement si un salon de coffre est illisible plutôt que d'annoncer un stock partiel). `/historique-stock` est réservé au rôle membre (ou admin), sans les coffres admin pour un non-admin. `/config item add`/`remove` rafraîchit ce panneau immédiatement, sans attendre le prochain mouvement de coffre. `/set-stock` et `/historique-stock` utilisent l'autocomplete (la liste d'items peut dépasser la limite de 25 choix Discord). Le Stock Général affiche en plus trois sections dynamiques (dépendantes du tier, voir `/config type-groupe`) : **💊 Drogues à vendre** (détail par item en stock, + total), **🧪 Drogues de production** (détail par item, + total) et **🧱 Matériaux de production** (détail par item, sans total — des matières premières hétérogènes n'ont pas de somme qui fasse sens ensemble). Un item lié à un labo (`labo_associe`) reste totalement invisible du corps principal, que son labo soit actif ou non pour le tier courant. Dès qu'un mouvement de coffre (retrait ou dépôt, n'importe quel item) concerne un joueur sans compte Discord mappé, une alerte est postée dans `admin` (voir `/adduser`).
 
 ### `src/modules/quotas.ts` — Activités & quotas hebdomadaires
-Panneau de boutons **généré dynamiquement** à partir du registre fixe `ACTIVITY_TYPES` (`src/config-store.ts`) : jusqu'à 3 rangées de boutons directs, un menu déroulant de repli au-delà, puis la rangée fixe des vues (mon quota, ma paie, classement, bilan, minuterie). Reset automatique chaque dimanche 19h (bilan + paie envoyés, stats remises à zéro), auto-réparant si le bot était arrêté au moment du cron.
+Panneau de boutons **généré dynamiquement** à partir du registre fixe `ACTIVITY_TYPES` (`src/config-store.ts`) : jusqu'à 3 rangées de boutons directs (sans emoji sur le label, contrairement aux autres affichages de la même activité), un menu déroulant de repli au-delà, puis la rangée fixe des vues (mon quota, ma paie, classement, bilan, minuterie). Reset automatique chaque dimanche 19h (bilan + paie envoyés, stats remises à zéro), auto-réparant si le bot était arrêté au moment du cron. Le classement de groupe (points, voir `/config classement`) et la paie (voir `/config salaire`) sont deux mécanismes entièrement séparés — voir la section Configuration plus haut.
 
 ### `src/modules/alertes.ts` — Cooldowns, braquages, statut labo
 Notifie l'expiration des cooldowns personnels, publie la disponibilité des slots de braquage, renomme les salons "labo" (🔴/🟢) selon disponibilité — pour toute activité marquée `labo: true` dans le registre `ACTIVITY_TYPES_FIXED` (`config-store.ts`), pas seulement les labos d'origine. Un labo restauré au démarrage (timer en mémoire perdu, date de fin persistée en base) ne touche pas au salon d'un labo devenu indisponible pour le tier courant entre-temps.
 
 ### `src/modules/garages.ts` — Fourrière véhicules
-Déduit les mises en fourrière à partir des logs du salon garages (aucune mise en fourrière n'est loggée explicitement) : si un véhicule ressort de la fourrière, le dernier joueur à l'avoir sorti sans l'avoir rangé est enregistré comme responsable — un montant fixe (350$, dans le code) est affiché à titre indicatif, sans aucune facturation automatique. Le classement cumulé se consulte à la demande via `/fourrieres` (admin) et reste posté en archive hebdomadaire dans `bilan`. Exposé aussi par l'API : `/api/garages/vehicles` (véhicules sortis) et `/api/garages/impounds` (classement, admin).
+Déduit les mises en fourrière à partir des logs du salon garages (aucune mise en fourrière n'est loggée explicitement) : si un véhicule ressort de la fourrière, le dernier joueur à l'avoir sorti sans l'avoir rangé est enregistré comme responsable — un montant fixe (350$, `MONTANT_FOURRIERE` dans le code) est affiché à titre indicatif, sans aucune facturation automatique. Cette notification (identifiée par le titre de son embed) n'est jamais nettoyée par la réaction 🗑️ automatique du salon `admin`, contrairement aux autres messages du bot dans ce salon — elle doit rester visible en permanence. Le classement cumulé se consulte à la demande via `/fourrieres` (admin) et reste posté en archive hebdomadaire dans `bilan`. Exposé aussi en lecture seule via `/api/garages` (véhicules actuellement sortis pour tout membre, classement fourrière réservé aux admins — voir section Interopérabilité).
 
 ### `src/modules/taxes.ts` — Taxes & racket
-Types fixes avec leur propre bouton, **dépendants du type d'organisation** (`/config type-groupe`, même principe que les labos) : Petite Frappe a `sporex`, `heroine`, `fertilisant`, `salvia` ; Gang a `cannabis` ; Organisation a `mexicana` et `cocaine` — indépendamment de qui produit quoi via les labos (Mexicana est produite par Gang **et** Organisation, mais sa taxe reste réservée à Organisation, décision métier). `vente` est universelle (tous tiers, y compris Indépendant). Plus un bouton **Taxe Zone** qui demande d'abord de choisir une zone avant d'afficher le même formulaire — le nom de la zone est directement stocké comme `type` de la taxe. Petite Frappe a 7 zones (Roxwood Village, Grapeseed Valley, Richman, Cinéma, Hawick, Carson, Plage Cayo) ; Gang et Organisation partagent les 18 mêmes zones de vente (New Cayo Perico, Paleto, Sandy Shores, Grapeseed, Vinewood, Aéroport, Wardog, Mirror Park, Fête Foraine, Barillo Plage, Del Perro, Roxwood Est, Eclypse Tower, Vespucci, Roxwood Ouest, Terrain de cross, Champ d'éolienne, Cayo Perico) — pas de découpage entre les deux, contrairement aux labos. Indépendant n'a ni taxe fixe ni zone. Une seule taxe active à la fois par groupe (nom, insensible à la casse) et par type (zones incluses) — plusieurs groupes peuvent chacun avoir leur taxe sur le même type ou la même zone, et la taxe Vente n'a aucune limite ; une taxe expirée mais pas supprimée ne bloque pas une nouvelle création. Ces types restent codés en dur (contrairement à items/activités/quotas) car chacun a des champs de modal hétérogènes — les rendre dynamiques demanderait un moteur de formulaire générique, hors du périmètre de généralisation de ce projet. Seuls le salon, le rôle d'accès et les échéances sont configurables.
+Types fixes avec leur propre bouton, **dépendants du type d'organisation** (`/config type-groupe`, même principe que les labos) : Petite Frappe a `sporex`, `heroine`, `fertilisant`, `salvia` ; Gang a `cannabis` ; Organisation a `mexicana` et `cocaine` — indépendamment de qui produit quoi via les labos (Mexicana est produite par Gang **et** Organisation, mais sa taxe reste réservée à Organisation, décision métier ; de même, Salvia est produite par le tier Indépendant via les labos, mais sa taxe reste réservée à Petite Frappe). `vente` est universelle (tous tiers, y compris Indépendant). Plus un bouton **Taxe Zone** qui demande d'abord de choisir une zone avant d'afficher le même formulaire — le nom de la zone est directement stocké comme `type` de la taxe. Petite Frappe a 14 zones (Roxwood Village, Grapeseed Valley, Richman, Cinéma, Hawick, Carson, Plage Cayo, Ponton, S-Mart, Mirror Park, Pétrolière, Docks, Paleto, Roxwood Sud — Mirror Park et Paleto existent aussi côté Gang/Organisation, même clé de zone) ; Gang et Organisation partagent les 18 mêmes zones de vente (New Cayo Perico, Paleto, Sandy Shores, Grapeseed, Vinewood, Aéroport, Wardog, Mirror Park, Fête Foraine, Barillo Plage, Del Perro, Roxwood Est, Eclypse Tower, Vespucci, Roxwood Ouest, Terrain de cross, Champ d'éolienne, Cayo Perico) — pas de découpage entre les deux, contrairement aux labos. Indépendant n'a ni taxe fixe ni zone. Une seule taxe active à la fois par GROUPE (nom, insensible à la casse) et par type (zones incluses) — deux groupes différents peuvent chacun avoir leur taxe active sur le même type/la même zone en parallèle ; une taxe expirée mais pas supprimée ne bloque pas une nouvelle création. Exception : `vente` n'a aucune limite, un même groupe peut cumuler plusieurs taxes Vente actives (elle se paie par vente, pas par groupe). Ces types restent codés en dur (contrairement à items/activités/quotas) car chacun a des champs de modal hétérogènes — les rendre dynamiques demanderait un moteur de formulaire générique, hors du périmètre de généralisation de ce projet. Seuls le salon, le rôle d'accès et les échéances sont configurables.
 
 ### `src/modules/armurerie.ts` — Armurerie & munitions
 Inventaire d'armes individuelles (nom, référence unique, statut `en_stock`/`pretee`/`perdue`). Types d'armes fixes dans le code (constante `ARME_TYPES` en tête de fichier — pas de `/config` dédié, cette liste ne bouge jamais une fois posée), regroupés en 4 catégories (armes de poing, fusils à pompe, armes automatiques, armes lourdes) avec plus de 25 modèles : l'ajout d'une arme passe donc par un modal de recherche avant le select (limite Discord de 25 options). Munitions de pistolet : ligne de stock + deux déclarations indicatives (Fabrication / Vente) avec compteur hebdomadaire — Fabrication a un plafond fixe (5000) dans le code, Vente n'a volontairement aucun plafond (juste le total suivi). Munitions de SMG : juste le stock brut, sans quota de fabrication ni compteur de vente.
@@ -305,18 +376,21 @@ Inventaire d'armes individuelles (nom, référence unique, statut `en_stock`/`pr
 Le stock réel de munitions de pistolet affiché en tête du panneau vient des items suivis comme les autres, associés via leur `groupe` à la constante `MUNITIONS_STOCK_GROUP` (`"Munition de pistolet"`, câblée dans `armurerie.ts`) — items pré-remplis automatiquement (voir `/config item` ci-dessus), donc plus besoin d'y penser. Un item d'un groupe peut représenter plusieurs unités de base ("Boîte mun. pistolet" = 24 "Munition de pistolet") via son `multiplicateur` (`/config item add`, défaut 1) : `armurerie.weightedStockSum` pondère chaque item avant de sommer un groupe, aussi bien pour ce total armurerie que pour les sections `STOCK_GROUPS` du Stock Général. Le stock de munitions SMG affiché juste en dessous vient d'un item unique sans groupe (`MUNITIONS_SMG_ITEM`, `"Munition de SMG"`), lu directement (pas de pondération). Le panneau armurerie n'est rafraîchi à chaque mouvement de coffre que si l'item déplacé appartient à l'un de ces deux (voir `stocks.updateStockMessage`) — pas à chaque mouvement, quel qu'il soit, pour éviter des requêtes et des éditions Discord inutiles.
 
 ### `src/modules/ventes.ts` — Cycle de vie des ventes de drogue
-Un retrait de coffre sur un item marqué `vente_pnj: true` crée une vente en attente et alerte dans le salon `ventes_drogue`. Confirmation automatique dès le dépôt de l'item `CONFIRME_VENTE_ITEM` (fixé en dur dans `ventes.ts`, "Argent Sale" par défaut — fenêtre de 3h), log dans `log_ventes`, mise à jour des stats/quota. `/adduser`, `/removeuser` et `/listusers` gèrent les associations nom en jeu ↔ compte Discord, utilisées ici comme par l'alerte "joueur non mappé" de `stocks.ts`.
+Un retrait de coffre sur un item marqué `vente_pnj: true` crée une vente en attente et alerte dans le salon `ventes_drogue`. Confirmation automatique dès le dépôt de l'item `CONFIRME_VENTE_ITEM` (fixé en dur dans `ventes.ts`, "Argent Sale" par défaut) dans les 3h qui suivent la déclaration — mesurées à l'heure du dépôt, y compris pour un dépôt fait pendant un arrêt du bot et rattrapé ensuite —, log dans `log_ventes`, mise à jour des stats/quota (dans la semaine du dépôt). Une vente reposée n'est vérifiée qu'une fois tout le retrait redéposé (un redépôt partiel la laisse en attente du reste). Si l'alerte de vente ne peut pas être postée (permission manquante), la vente est écartée et les admins prévenus dans `admin`. `/adduser`, `/removeuser` et `/listusers` gèrent les associations nom en jeu ↔ compte Discord, utilisées ici comme par l'alerte "joueur non mappé" de `stocks.ts`.
 
 ---
 
 ## Robustesse & fiabilité
 
 - **Aucun redémarrage requis après une écriture `/config`** : chaque sous-commande qui touche un panneau permanent (salon, item, type d'organisation…) rafraîchit explicitement le message concerné dans son propre handler, plutôt que de compter sur le prochain mouvement de coffre ou une déclaration d'activité pour le déclencher indirectement.
-- **Reset hebdomadaire auto-réparant** : plutôt que de compter sur un cron qui tombe pile à l'heure, le bot vérifie à chaque démarrage *et* toutes les 15 minutes si le reset attendu (dimanche 19h Europe/Paris) est en retard, et le déclenche si besoin — un redémarrage pendant la fenêtre de reset ne fait pas perdre le cycle.
-- **Crash-restart** : le process peut s'arrêter sur un événement `error` non catché du WebSocket Discord (rare, pas un bug applicatif) — un service systemd avec `Restart=` (déjà dans le déploiement documenté plus haut) le relance automatiquement en quelques secondes. En Docker, `restart: unless-stopped` fait pareil.
+- **Reset hebdomadaire auto-réparant** : plutôt que de compter sur un cron qui tombe pile à l'heure, le bot vérifie à chaque démarrage *et* toutes les 15 minutes si le reset attendu (dimanche 19h Europe/Paris) est en retard, et le déclenche si besoin — un redémarrage pendant la fenêtre de reset ne fait pas perdre le cycle. La remise à zéro est une seule transaction ; la publication du bilan, de la paie et des fourrières se fait ensuite depuis l'historique des déclarations et reprend là où elle s'était arrêtée en cas d'erreur Discord ou d'arrêt du bot, sans rien poster deux fois. Chaque semaine est close pile au dimanche 19h, même si le reset passe plus tard (une déclaration faite entre-temps compte dans la nouvelle semaine) ; plusieurs dimanches manqués donnent une publication par semaine, et une publication en retard n'est jamais écrasée par la suivante. La paie est découpée en plusieurs messages si elle dépasse la taille d'un message Discord.
+- **Aucun mouvement perdu ni compté deux fois** : chaque message de coffre est appliqué en une seule transaction (mouvements, historique, curseur) ; les messages d'une même guilde sont traités l'un après l'autre (temps réel, rattrapage et `/sync-stock` compris) ; une lecture d'historique Discord en échec est retentée puis signalée, jamais prise pour une fin d'historique ; après une coupure de connexion à Discord, le bot rattrape les messages manqués. Les déclarations, `/supp`, ventes et taxes revérifient limites, cooldowns et statuts au moment d'écrire, pas seulement à l'ouverture du formulaire. Une erreur de base de données sur un message de coffre ou de garage le fait rejouer au message suivant, au lieu de le perdre.
+- **Arrêt propre** : à l'arrêt (`docker compose up --build`, `systemctl restart`), le bot finit les messages en cours de traitement (8 s au plus) avant de se couper.
+- **Erreurs isolées sans crash** : une erreur WebSocket Discord (discord.js se reconnecte seul), une erreur dans un handler d'événement ou une promesse rejetée non attrapée sont loggées sans arrêter le process — une erreur sur une guilde ne coupe pas le bot pour les autres. Un message reçu d'une guilde dont la config n'est pas encore chargée (démarrage en cours) est ignoré, et un message de log coffre/garage attend la fin du rattrapage de sa guilde (sans ça, il ferait sauter les messages publiés pendant l'arrêt du bot).
+- **Crash-restart** : si l'initialisation globale échoue (base injoignable au démarrage, typiquement), le process s'arrête volontairement plutôt que de rester connecté sans config — le service systemd (`Restart=always`, `RestartSec=10`, sans limite de redémarrages) ou Docker (`restart: unless-stopped`) le relance jusqu'à ce que ça passe.
 - **Purge automatique des données opérationnelles obsolètes** : un cron quotidien (4h Europe/Paris) supprime les ventes en attente **terminées** (confirmée/reposée/ignorée/expirée — jamais une vente encore en cours) et les ventes de munitions de plus de 30 jours — pur historique de workflow sans valeur une fois le cycle clos. **`transactions`** (le journal de toute activité déclarée, y compris les ventes confirmées) n'est en revanche **jamais purgée** : c'est ce qui permet à `/api/quotas`/`/api/ventes` de remonter une semaine passée via `?week=` (voir Interopérabilité) — une purge casserait cette navigation.
-- **Cron sans chevauchement** : `node-cron` ne protège pas nativement contre une exécution qui démarre alors que la précédente tourne encore. Le cron le plus fréquent (vérification des cooldowns expirés, toutes les minutes) a un verrou en mémoire pour éviter qu'un batch particulièrement long fasse partir un second passage sur les mêmes lignes (ex. double notification).
-- **Mémoire** : le cache de messages de discord.js est vidé au bout d'une heure (`sweepers`, sans impact sur les panneaux permanents — toujours re-récupérés par ID, jamais lus depuis ce cache) ; en Docker, `mem_limit: 512m` sur le bot évite qu'une fuite mémoire fasse tomber tout l'hôte plutôt que le seul conteneur (voir "Via Docker").
+- **Cron sans chevauchement** : `node-cron` ne protège pas nativement contre une exécution qui démarre alors que la précédente tourne encore. Les crons dont un passage peut durer (cooldowns expirés, expiration des ventes, reset hebdomadaire) ont un verrou en mémoire pour éviter qu'un second passage reparte sur les mêmes lignes (ex. double notification). Une guilde dont l'initialisation a échoué est retentée toutes les 5 minutes.
+- **Mémoire** : le cache de messages de discord.js est vidé au bout d'une heure (`sweepers`, sans impact sur les panneaux permanents — toujours re-récupérés par ID, jamais lus depuis ce cache) ; une fuite mémoire est contenue au seul bot plutôt que de faire tomber tout l'hôte — `MemoryMax=512M` dans le service systemd, `mem_limit: 512m` en Docker (voir "Via Docker").
 
 ---
 
@@ -326,8 +400,8 @@ PostgreSQL via [Prisma](https://www.prisma.io/) (`prisma/schema.prisma`, migrati
 
 **Multi-tenant** : toutes les tables métier ci-dessous ont une colonne `guild_id` qui fait partie de leur clé primaire/unique — chaque ligne appartient à un seul serveur Discord, jamais partagée entre deux. La table `guilds` (voir `src/guild-registry.ts`) est à part : c'est le registre des serveurs connus (actif/inactif, site externe autorisé), pas une table de config métier.
 
-Tables de configuration (pilotées par `/config`) : `channels` (rôle fonctionnel → salon(s)), `discord_roles` (admin/taxes → rôle Discord), `items` (nom, groupe, `vente`/`visibleStock`/`laboLie`), `quota_targets`, `salary_rates`. Le type d'organisation (`/config type-groupe`) est stocké comme un `Setting` scalaire (clé `type_groupe`). Le registre des activités déclarables et les barèmes par tier (braquage, labos) n'ont pas de table — ce sont des constantes fixes dans `src/config-store.ts` (voir plus haut).
-Tables métier (génériques) : `coffre_stocks` (stock par coffre — le total global en est la somme, calculée à la lecture), `stock_history`, `transactions`, `stats`, `cooldowns`, `braquages`, `taxes`, `armurerie`, `user_mapping`, `pending_sales`, `vehicules`, `fourrieres`, `munitions_ventes`.
+Tables de configuration (pilotées par `/config`) : `channels` (rôle fonctionnel → salon(s)), `discord_roles` (admin/membre → rôle Discord), `items` (nom, groupe, `vente`/`visibleStock`/`laboLie`), `quota_targets`, `salary_rates`. Le type d'organisation (`/config type-groupe`) est stocké comme un `Setting` scalaire (clé `type_groupe`). Le registre des activités déclarables et les barèmes par tier (braquage, labos) n'ont pas de table — ce sont des constantes fixes dans `src/config-store.ts` (voir plus haut).
+Tables métier (génériques) : `coffre_stocks` (détail par coffre — seule table de stock, le total global se recalcule à la lecture, voir section Interopérabilité), `stock_history`, `transactions`, `stats` (compteurs de la semaine en cours, reconstruits depuis `transactions` au reset), `cooldowns`, `braquages`, `taxes`, `armurerie`, `user_mapping`, `pending_sales`, `vehicules`, `fourrieres`, `munitions_ventes`.
 
 ---
 
@@ -352,7 +426,7 @@ bot-moni-v3/
 │   │   ├── taxes.ts
 │   │   ├── armurerie.ts
 │   │   └── ventes.ts
-│   └── api/                    # API REST optionnelle (voir "Interopérabilité")
+│   └── api/                    # API REST (voir "Interopérabilité")
 │       ├── server.ts
 │       ├── auth.ts             # Connexion via Discord (OAuth2)
 │       ├── week.ts             # Résolution de ?week= (semaine ISO 8601)
@@ -361,9 +435,12 @@ bot-moni-v3/
 │   ├── schema.prisma
 │   └── migrations/
 ├── scripts/
-│   └── backfill-guild-id.ts    # One-off migration multi-tenant (voir historique du projet)
+│   └── check-description-lengths.ts     # Vérifie la limite Discord de 100 caractères (descriptions de commande/option, libellés de choix)
+├── docs/
+│   └── audits.md                         # Prompts d'audit par angle (fiabilité, sécurité, multi-tenant, données, pièges)
 ├── deploy/
-│   └── bot-moni-v3.service  # Modèle de service systemd (voir "Via systemd")
+│   ├── bot-moni-v3.service       # Modèle de service systemd (voir "Sans Docker (systemd)")
+│   └── nginx-bot-moni-v3.conf    # Modèle de reverse proxy nginx (voir "Interopérabilité — API REST")
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-entrypoint.sh        # Applique les migrations puis démarre le bot (voir "Via Docker")

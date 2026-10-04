@@ -4,7 +4,7 @@
 // sont des `DateTime` Postgres (TIMESTAMPTZ), pas des entiers millisecondes
 // bruts — plus idiomatique côté Postgres/Prisma. La couche src/db.ts est la
 // SEULE à convertir entre `Date` et millisecondes (Date.now()/getTime()) ;
-// tout le reste du bot manipule des nombres, comme avec l'ancien SQLite.
+// tout le reste du bot manipule des nombres (millisecondes epoch).
 
 generator client {
   provider = "prisma-client-js"
@@ -22,14 +22,14 @@ datasource db {
 /// est la config MÉTIER d'une guilde, pas son statut de tenant). `active`
 /// passe à false quand le bot est retiré (guildDelete) : soft-delete
 /// uniquement, on ne supprime jamais les données métier d'une guilde qui
-/// part — elle peut revenir. `frontendUrl`/`corsOrigin` remplacent, PAR
-/// GUILDE, les anciennes variables d'env globales FRONTEND_URL/
-/// API_CORS_ORIGIN (une seule guilde ne peut plus les définir pour tout le
-/// monde) — voir src/api/auth.ts et src/api/server.ts.
+/// part — elle peut revenir. `frontendUrl`/`corsOrigin` (site externe
+/// autorisé pour l'API) sont réglés PAR GUILDE, jamais globalement — voir
+/// src/api/auth.ts et src/api/server.ts.
 model Guild {
   guildId     String    @id @map("guild_id")
   name        String?
   active      Boolean   @default(true)
+  /// Colonne historique de cette instance, jamais lue par le code — gardée pour ne perdre aucune donnée.
   addedAt     DateTime  @default(now()) @map("added_at")
   removedAt   DateTime? @map("removed_at")
   frontendUrl String?   @map("frontend_url")
@@ -71,10 +71,10 @@ model Channel {
   guildId   String  @map("guild_id")
   role      String
   channelId String  @map("channel_id")
-  /// Nom donné par l'admin (ex. "Coffre principal") — seulement utile pour un
-  /// rôle à valeurs multiples (logs_coffres/logs_coffres_admin), où plusieurs
-  /// salons partagent le même rôle et ne se distinguent que par ce nom. Voir
-  /// `/config channel add-log-coffre nom:`. `null` tant que non renseigné.
+  /// Nom donné par l'admin pour distinguer ce salon des autres du même rôle
+  /// à valeurs multiples (ex. "Coffre principal" pour un `logs_coffres`) —
+  /// `null` tant que non renseigné. Sans intérêt pour un rôle à valeur
+  /// unique (une seule ligne de toute façon).
   label     String?
 
   @@id([guildId, role, channelId])
@@ -82,7 +82,7 @@ model Channel {
 }
 
 /// Association usage du bot → rôle Discord ('admin' : commandes sensibles ;
-/// 'taxes' : accès back-office taxes), pilotée par `/config role`.
+/// 'membre' : accès à l'API du site externe), pilotée par `/config role`.
 model DiscordRole {
   guildId String @map("guild_id")
   target  String
@@ -104,34 +104,28 @@ model DiscordRole {
 /// visibleStock : l'item reste suivi (stock à jour, historique) même à
 /// `false` — seul son affichage dans le message "Stock Général" est masqué.
 /// laboLie : clé d'une activité "labo" (ex. "labo_cocaine", voir
-/// ACTIVITY_TYPES_FIXED dans config-store.ts) si cet item est lié à ce labo
-/// — `laboLieRole` précise COMMENT : 'produit' (c'est LA drogue que ce labo
-/// produit) ou 'materiau' (c'est une matière PREMIÈRE qu'il consomme, ex.
-/// Psilocybe pour labo_sporex). Jamais les deux à la fois pour un item, d'où
-/// un seul couple de champs plutôt que deux colonnes mutuellement
-/// exclusives. 'produit' sert à dériver, par tier d'organisation,
+/// ACTIVITY_TYPES_FIXED dans config-store.ts) si cet item est LA drogue que
+/// ce labo produit. Sert uniquement à dériver, par tier d'organisation,
 /// l'exclusion de vente_pnj : une drogue que le tier courant peut produire
 /// lui-même (labo actif pour ce tier, voir LABO_TIERS) n'est pas vendable en
-/// PNJ à ce tier — vente_pnj reste sinon tel que configuré ici. 'materiau'
-/// sert uniquement à l'affichage ("Matériaux de production" dans le message
-/// Stock Général, voir modules/stocks.ts), jamais à l'exclusion de vente_pnj.
-/// `laboLie` `null` pour un item sans lien avec un labo (jamais exclu,
-/// jamais affiché dans ces deux champs) ; `laboLieRole` n'a alors aucun sens
-/// et reste `null` aussi. stockMultiplier : nombre d'unités de base que
-/// représente une unité de cet item (ex. une boîte de munitions) — appliqué
-/// au stock de cet item avant de le sommer dans un STOCK_GROUP (voir
-/// armurerie.weightedStockSum). `1` = pas de conversion.
+/// PNJ à ce tier — vente_pnj reste sinon tel que configuré ici. `null` pour
+/// un item sans lien avec un labo (jamais exclu). stockMultiplier : nombre
+/// d'unités de base que représente une unité de cet item (ex. une boîte de
+/// munitions) — appliqué au stock de cet item avant de le sommer dans un
+/// STOCK_GROUP (voir armurerie.weightedStockSum). `1` = pas de conversion.
 model Item {
   guildId         String  @map("guild_id")
   /// Auto-incrémenté, jamais réglable via `/config item` — capture l'ordre
   /// d'INSERTION réel (les items par défaut, ajoutés au tout premier
   /// démarrage, obtiennent les valeurs les plus basses). Départage
-  /// `displayOrder` (toujours 0 en pratique, aucune commande ne le règle
-  /// actuellement) dans `db.getAllItems`. `@unique`, pas `@id` : la clé
-  /// primaire de cette table reste `@@id([guildId, name])` — convention
-  /// différente des autres tables de ce schéma (Braquage, Taxe, Arme,
-  /// PendingSale…) qui, elles, n'ont pas de clé primaire naturelle
-  /// composite et utilisent `id` comme `@id`.
+  /// `displayOrder` (négatif pour quelques items par défaut, 0 pour tous les
+  /// autres : aucune commande ne le règle) dans `db.getAllItems` — c'est lui
+  /// qui donne au Stock Général l'ordre d'ajout plutôt que l'ordre
+  /// alphabétique (voir `stocks.buildStockEmbed`). `@unique`, pas `@id` : la clé
+  /// primaire de cette table reste `@@id([guildId, name])` (voir plus bas),
+  /// pas cet `id` — convention différente des autres tables de ce schéma
+  /// (Braquage, Taxe, Arme, PendingSale…) qui, elles, n'ont pas de clé
+  /// primaire naturelle composite et utilisent `id` comme `@id`.
   id              Int     @unique @default(autoincrement())
   name            String
   stockGroup      String? @map("stock_group")
@@ -139,6 +133,9 @@ model Item {
   displayOrder    Int     @default(0) @map("display_order")
   visibleStock    Boolean @default(true) @map("visible_stock")
   laboLie         String? @map("labo_lie")
+  /// 'produit' (LA drogue que le labo `laboLie` fabrique) ou 'materiau'
+  /// (consommé par ce labo) — `null` si `laboLie` est `null`. Voir
+  /// `db.upsertItem` pour la règle de cohérence entre les deux champs.
   laboLieRole     String? @map("labo_lie_role")
   stockMultiplier Int     @default(1) @map("stock_multiplier")
 
@@ -170,13 +167,11 @@ model SalaryRate {
   @@map("salary_rates")
 }
 
-/// Taux de paie ($ par unité) spécifique à UN item, en override du taux
-/// général de la catégorie "vente" (SalaryRate) pour cet item précis — voir
-/// `computeSalaire` dans src/modules/quotas.ts. N'a de sens que pour un item
-/// vendu au PNJ (quota_type "vente") ; un item sans ligne ici utilise le taux
-/// général de SalaryRate("vente"). Fiable car `item` correspond exactement au
-/// nom détecté dans les logs FiveM (voir Transaction.type pour l'action
-/// "vente"), jamais un texte tapé librement par un joueur.
+/// Taux de paie ($ par unité) spécifique à UN item vendu, remplace le taux
+/// général de la catégorie "vente" (SalaryRate) pour cet item précis — un
+/// item sans ligne ici utilise le taux général. Voir `/config salaire` et
+/// `quotas.getVenteByItemMap` (lu seulement si au moins une ligne existe
+/// pour la guilde, jamais par défaut).
 model ItemSalaryRate {
   guildId String @map("guild_id")
   item    String
@@ -186,13 +181,17 @@ model ItemSalaryRate {
   @@map("item_salary_rates")
 }
 
-/// Tranche d'un barème de paie progressif pour la catégorie "vente" — voir
-/// `computeTierPay` dans src/modules/quotas.ts. `item` null = barème général,
-/// sinon propre à cette drogue. Chaque tranche [borne précédente, upTo] est
-/// payée à SON taux (comme un barème d'impôt). `upTo` null = tranche finale
-/// sans limite : au plus une par (guildId, item), vérifié dans le code
-/// (`/config palier add`), pas par une contrainte DB — un NULL n'est jamais
-/// égal à un autre NULL pour un index unique Postgres.
+/// Palier de paie progressif pour la vente de drogue (voir `/config palier`)
+/// — barème par tranche : chaque tranche [borne précédente, upTo] est payée
+/// à son propre taux, sommées comme un barème d'impôt (pas un seuil qui
+/// repaierait toute la quantité au dernier taux atteint, voir
+/// `quotas.computeVentePay`). `item` null = barème général "vente" ; sinon
+/// propre à cette drogue précise, remplace le barème général pour cet item
+/// (même principe que {@link ItemSalaryRate}, avec un barème au lieu d'un
+/// taux plat — les deux peuvent coexister par item, le barème prime s'il
+/// existe). `upTo` null = tranche finale, sans limite — au plus une par
+/// (guildId, item), vérifié en code (pas par une contrainte DB, même logique
+/// que l'unicité des taxes par groupe+type dans `taxes.ts`).
 model SalaryTier {
   guildId String  @map("guild_id")
   id      Int     @id @default(autoincrement())
@@ -204,9 +203,8 @@ model SalaryTier {
   @@map("salary_tiers")
 }
 
-/// Points de classement ($ par unité → ici points par unité) par catégorie de
-/// quota — même principe que SalaryRate, pour un classement par points plutôt
-/// que par salaire. Voir `computeClassement` dans src/modules/quotas.ts.
+/// Points de classement (entiers, pas $ — indépendant de SalaryRate) par
+/// catégorie de quota. Voir `/config classement` et `quotas.computeClassement`.
 model ClassementRate {
   guildId   String @map("guild_id")
   quotaType String @map("quota_type")
@@ -216,13 +214,9 @@ model ClassementRate {
   @@map("classement_rates")
 }
 
-/// Points de classement spécifiques à UNE activité de la famille "actions"
-/// (atm, cambu, superette, gofast, braq_armurerie, fleeca, bijouterie,
-/// pinebank, human_labs), en override du nombre général de la catégorie
-/// "actions" pour cette activité précise — voir `computeClassement`. N'a de
-/// sens que pour une activité de quotaType "actions" ; `activityKey` est une
-/// clé fixe du registre `ACTIVITY_TYPES_FIXED` (jamais un texte libre,
-/// contrairement à `ItemSalaryRate.item`).
+/// Points de classement spécifiques à UNE activité de la catégorie "actions"
+/// (clé fixe du registre `ACTIVITY_TYPES`, jamais du texte libre), remplace
+/// le nombre général de ClassementRate pour cette activité précise.
 model ActivityClassementRate {
   guildId     String @map("guild_id")
   activityKey String @map("activity_key")
@@ -234,12 +228,13 @@ model ActivityClassementRate {
 
 // ═══ DONNÉES MÉTIER (génériques, indépendantes de la config ci-dessus) ═══
 
-/// Stock PAR coffre (un salon `logs_coffres`/`logs_coffres_admin`) — seule
-/// source de vérité du stock : le total global (panneau "Stock Général",
-/// `/api/stocks`) est toujours la somme de ces lignes, jamais un compteur
-/// séparé (voir `db.applyStockMovement`/`db.getAllStocks`) — l'ancienne table
-/// `stocks` divergeait de la somme des coffres (plancher à 0 appliqué de
-/// chaque côté indépendamment). Vidé et reconstruit lors d'un `/sync-stock`.
+/// Stock détaillé PAR coffre (un salon `logs_coffres`) — SEULE table de
+/// stock : il n'existe pas de total global stocké séparément. Le panneau
+/// "Stock Général" et l'API (`db.getAllStocks`) recalculent ce total à la
+/// lecture comme la somme de tous les coffres pour chaque item (voir
+/// docstring de section STOCKS dans `db.ts`) — un total tenu à part
+/// divergerait, chaque table plafonnant sa propre valeur à 0
+/// indépendamment. Vidé et reconstruit lors d'un `/sync-stock` complet.
 model CoffreStock {
   guildId   String @map("guild_id")
   channelId String @map("channel_id")
@@ -293,6 +288,7 @@ model Stat {
   userId  String @map("user_id")
   action  String
   count   Float  @default(0)
+  /// Colonne historique de cette instance, jamais lue par le code (les points se calculent depuis `count` et `/config classement`) — gardée pour ne perdre aucune donnée.
   points  Float  @default(0)
 
   @@id([guildId, userId, action])
@@ -339,6 +335,7 @@ model Taxe {
   paye       Boolean  @default(true)
 
   @@index([guildId, actif])
+  @@index([guildId, type])
   @@map("taxes")
 }
 
@@ -370,16 +367,24 @@ model PendingSale {
   joueur     String
   discordId  String?  @map("discord_id")
   item       String
+  /// Quantité vendue, corrigeable par le joueur (bouton "Modifier la
+  /// quantité") — c'est elle qui est créditée à la confirmation.
   quantite   Int
+  /// Retrait net réel constaté dans les logs de coffre (retraits cumulés
+  /// moins redépôts) — jamais modifié par une correction manuelle, il borne
+  /// `quantite` : on ne peut pas déclarer avoir vendu plus que retiré.
+  quantiteRetiree Int @map("quantite_retiree")
   timestamp  DateTime @default(now())
   statut     String   @default("en_attente")
   montant    Int?
+  /// Colonne historique de cette instance, jamais lue par le code — gardée pour ne perdre aucune donnée.
   prixPochon Float?   @map("prix_pochon")
   messageId  String?  @map("message_id")
   channelId  String?  @map("channel_id")
   confirmed  Boolean  @default(false)
 
   @@index([guildId, statut])
+  @@index([guildId, joueur, item])
   @@map("pending_sales")
 }
 

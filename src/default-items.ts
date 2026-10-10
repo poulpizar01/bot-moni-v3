@@ -25,7 +25,7 @@ import * as configStore from './config-store';
 import { MUNITIONS_STOCK_GROUP, MUNITIONS_SMG_ITEM } from './modules/armurerie';
 import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 
-// `display_order` négatif : garantit que les 5 items par défaut restent
+// `display_order` négatif : garantit que les 5 items génériques ci-dessous restent
 // TOUJOURS en tête du Stock Général, quel que soit l'ordre d'insertion réel
 // ou de futurs items ajoutés via `/config item add` (qui n'expose pas cette
 // option et retombe donc sur le défaut 0, donc toujours après). Valeurs
@@ -47,6 +47,11 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   // Simple item de stock, sans groupe : affiché dans l'armurerie via
   // MUNITIONS_SMG_ITEM (stock brut uniquement, pas de quota fabrication/vente).
   { name: MUNITIONS_SMG_ITEM, display_order: -1 },
+  // Labo Vénia (Petite Frappe) — produit + matériaux. Sans vente:true, comme
+  // les autres produits de labo Petite Frappe.
+  { name: 'Vénia', labo_lie: 'labo_venia', labo_lie_role: 'produit' },
+  { name: 'Fleur Séchée', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
+  { name: 'Cendre Noir', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
 ];
 
 /**

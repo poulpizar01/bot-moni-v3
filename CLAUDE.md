@@ -224,5 +224,6 @@ Différences volontaires, à préserver à chaque reprise :
 - **Items par défaut** : nos cinq items seulement (voir section piège n°1) — y compris pour la 1.1 : « Vénia », « Fleur Séchée », « Cendre Noir » ne sont pas pré-remplis, à ajouter via `/config item add` (`labo_associe:labo_venia`) après vérification de l'orthographe dans nos logs.
 - **Avertissements** : module entier propre à cette instance (voir section dédiée) — table `avertissements`, rôle de salon `avertissements`, événements de membres dans `index.ts`.
 - **Manuel** : `MANUEL_URL` pointe vers le manuel de CETTE instance, pas celui de roxwood.
+- **Pas de `.github/workflows/ci.yml`** : le jeton `gh` de ce serveur n'a pas le scope `workflow`, GitHub refuse tout push qui ajoute un workflow. Ne pas le reprendre de roxwood sans avoir d'abord lancé `gh auth refresh -h github.com -s workflow`.
 - **Noms** : `bot-moni-v3` partout (compose, service systemd, base `bot_moni_v3`) ; Caddy plutôt que nginx (`deploy/nginx-*.conf` de roxwood non repris).
 

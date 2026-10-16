@@ -34,12 +34,10 @@ import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 // `display_order` n'est pas fourni (voir docstring de `upsertItem`), donc un
 // futur /config item add sur l'un de ces 5 items ne peut pas la réinitialiser.
 const DEFAULT_ITEMS: db.ItemInput[] = [
-  // CONFIRME_VENTE_ITEM (voir ventes.ts) — simple item de stock ici, son rôle
-  // de confirmation de vente est fixe dans le code, pas un flag à poser.
-  { name: CONFIRME_VENTE_ITEM, display_order: -5 },
-  // Distinct de CONFIRME_VENTE_ITEM ("Argent Sale") : simple item de stock,
-  // ne joue aucun rôle dans le cycle de vente.
-  { name: 'Argent', display_order: -4 },
+  // L'argent précède les munitions dans le Stock Général.
+  { name: 'Argent', display_order: -5 },
+  // CONFIRME_VENTE_ITEM joue aussi le rôle fixe de confirmation des ventes.
+  { name: CONFIRME_VENTE_ITEM, display_order: -4 },
   { name: 'Munition de pistolet', stock_group: MUNITIONS_STOCK_GROUP, display_order: -3 },
   // Vaut 24x "Munition de pistolet" (stock_multiplier) — même groupe, comptée
   // en conséquence dans le total munitions pondéré (voir armurerie.weightedStockSum).
@@ -47,6 +45,11 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   // Simple item de stock, sans groupe : affiché dans l'armurerie via
   // MUNITIONS_SMG_ITEM (stock brut uniquement, pas de quota fabrication/vente).
   { name: MUNITIONS_SMG_ITEM, display_order: -1 },
+  // « Héroine » sans tréma : orthographe exacte des items de purification.
+  { name: 'Héroine Pure À 99', vente: true },
+  { name: 'Héroine Pure À 90', vente: true },
+  { name: 'Héroine Pure À 70', vente: true },
+  { name: 'Héroine Pure À 50', vente: true },
   // Labo Vénia (Petite Frappe) — produit + matériaux. Sans vente:true, comme
   // les autres produits de labo Petite Frappe.
   { name: 'Vénia', labo_lie: 'labo_venia', labo_lie_role: 'produit' },

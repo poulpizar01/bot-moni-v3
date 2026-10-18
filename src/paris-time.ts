@@ -84,3 +84,20 @@ export function nextWeekStartAfter(ms: number): number {
   wall.setDate(wall.getDate() + 7);
   return parisWallToUtc(wall.getFullYear(), wall.getMonth(), wall.getDate(), 19);
 }
+
+/**
+ * Semaine ISO (`AAAA-Www`) qui clôt à `ms` (heure de Paris) — l'inverse de
+ * `week.parseIsoWeek`. `ms` étant la frontière de fin (dimanche 19h), sa date
+ * murale de Paris EST le dimanche de la semaine ISO recherchée ; l'algorithme
+ * standard (jeudi de la semaine ISO, puis semaine depuis le 1er janvier)
+ * donne alors directement le bon numéro, sans reconstruire les bornes.
+ */
+export function isoWeekLabelOf(ms: number): string {
+  const wall = parisWallClock(new Date(ms));
+  const date = new Date(Date.UTC(wall.getFullYear(), wall.getMonth(), wall.getDate()));
+  const day = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - day);
+  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+  const week = Math.ceil(((date.getTime() - yearStart) / 86400000 + 1) / 7);
+  return `${date.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}

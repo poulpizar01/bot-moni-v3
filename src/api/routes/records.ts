@@ -9,6 +9,7 @@
 import { Router } from 'express';
 import * as db from '../../db';
 import { RECORD_CATEGORIES } from '../../modules/quotas';
+import { isoWeekLabelOf } from '../../paris-time';
 import { avecNoms } from '../noms';
 
 const router = Router();
@@ -18,11 +19,14 @@ const router = Router();
  * `labos`, `recolte`), en portée `individuel` (top 3 joueurs,
  * avec `name`) et `groupe` (meilleure semaine de la guilde entière, `userId`
  * et `name` toujours `null`). Une catégorie/portée sans record encore établi
- * renvoie un tableau vide plutôt qu'une absence de clé.
+ * renvoie un tableau vide plutôt qu'une absence de clé. `week` (`AAAA-Www`,
+ * voir `paris-time.isoWeekLabelOf`) est dérivé de `weekUntil` ici plutôt que
+ * recalculé côté site : une seule implémentation du découpage des semaines.
  */
 router.get('/', async (req, res) => {
   const guildId = req.apiUser!.guildId;
-  const rows = await avecNoms(guildId, await db.getAllWeeklyRecords(guildId));
+  const rows = (await avecNoms(guildId, await db.getAllWeeklyRecords(guildId)))
+    .map(row => ({ ...row, week: isoWeekLabelOf(row.weekUntil) }));
 
   const result: Record<string, { individuel: typeof rows; groupe: typeof rows }> = {};
   for (const category of RECORD_CATEGORIES) result[category] = { individuel: [], groupe: [] };

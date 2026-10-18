@@ -70,7 +70,7 @@ async function getSemaineAffichee(guildId: string): Promise<number> {
 }
 
 function jourOptions(): Array<{ label: string; value: string; default?: boolean }> {
-  return [...JOURS.map((label, i) => ({ label, value: String(i) })), { label: 'Toute la semaine', value: 'semaine' }];
+  return [{ label: 'Toute la semaine', value: 'semaine' }, ...JOURS.map((label, i) => ({ label, value: String(i) }))];
 }
 
 function parseJourValue(value: string): number | null {

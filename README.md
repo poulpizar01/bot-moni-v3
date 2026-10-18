@@ -252,7 +252,8 @@ Niveau d'accès de base : **membre du serveur Discord porteur du rôle membre** 
 | `GET /api/taxes/:id` | Taxes/Admin | Détail complet d'UNE taxe précise, téléphone/mot de passe inclus |
 | `GET /api/garages/vehicles` | Membre | Véhicules actuellement sortis et pas encore rangés — qui a quel véhicule dehors |
 | `GET /api/garages/impounds` | Admin | Classement cumulé des mises en fourrière, avec le montant indicatif (350$/fourrière, aucune facturation automatique) — même restriction que `/fourrieres` côté Discord |
-| `GET /api/records` | Membre | Top 3 hebdomadaire par catégorie de quota (`actions`, `vente`, `labos`, `recolte`), en portée `individuel` (joueur) et `groupe` (guilde entière) — calculé une fois par semaine close, jamais à la lecture |
+| `GET /api/records` | Membre | Top 3 hebdomadaire par catégorie de quota (`actions`, `vente`, `labos`, `recolte`), en portée `individuel` (joueur) et `groupe` (guilde entière) — calculé une fois par semaine close, jamais à la lecture ; chaque entrée porte `weekUntil` (ms) et `week` (`AAAA-Www`, dérivé de `weekUntil`) |
+| `GET /api/planning?week=` | Membre | Objectifs de planning RP de la semaine demandée — passée, courante **ou future** (par jour précis ou "toute la semaine") |
 
 Les lignes des routes de groupe (`/api/quotas`, `/api/quotas/pay`, `/api/quotas/ranking`, `/api/ventes`, `/api/armurerie/ammo/history`, `/api/armurerie/ammo/production`, `/api/records`) portent un champ `name` (nom en jeu, sinon dernier pseudo Discord — voir `src/api/noms.ts`) ; `name` est `null` sur les entrées `groupe` de `/api/records` (pas de joueur associé). `/api/stocks` et `/api/stocks/:channelId` ajoutent à chaque ligne la configuration de l'item (`name`, `group`, `vente`, `visibleStock`, `laboLie`, `laboLieRole`, `stockMultiplier`).
 
@@ -263,6 +264,8 @@ Lecture seule pour l'instant — pas d'écriture depuis l'extérieur (voir docst
 Les 7 endpoints `/api/quotas*` qui acceptent `?week=` (tous sauf `/cooldowns` et `/braquages`, des états courants sans notion de semaine passée), les 2 endpoints `/api/ventes*` et les 3 endpoints `/api/argent*` acceptent un paramètre `week` (semaine ISO 8601, ex. `2026-W37`, résolu par `src/api/week.ts` en période de paie : du dimanche 19h précédent au dimanche 19h de cette semaine, heure de Paris — les mêmes bornes que la paie hebdomadaire publiée) — sans ce paramètre, ils portent sur la semaine en cours (depuis le dernier reset hebdomadaire). Reconstruit depuis la table `transactions` (jamais purgée, une ligne par déclaration) plutôt que le cache `stats` (vidé entièrement à chaque reset) — voir les fonctions `*ForRange` dans `modules/quotas.ts` et `getVenteTotalsForRange`/`getVenteDetailForUser` dans `db.ts`. Une vente confirmée écrit une `transaction` (`action: 'vente'`) comme n'importe quelle activité, donc le `total` de `/api/ventes` est toujours identique au `vente` d'un quota pour la même plage — une seule vérité. `/api/argent` lit les montants saisis dans `transactions` et compare les instantanés de `argent_stock_snapshots`. Chaque instantané porte sur la somme de tous les coffres suivis, coffres admin compris. Il est pris juste avant le premier mouvement de la semaine afin de représenter exactement le dimanche 19h ; sans mouvement, le stock suivant ou le stock courant donne la même valeur.
 
 **Limite à connaître** : les objectifs (`/config quota`), taux de paie (`/config salaire`) et paliers (`/config palier`) ne sont **pas historisés** — seule la valeur actuelle existe en base. Une requête sur une semaine passée applique donc les objectifs/taux/paliers *actuels* à l'activité de cette semaine-là, pas ceux réellement en vigueur à l'époque si l'admin les a changés depuis (n'affecte pas `/api/ventes`, qui ne dépend d'aucun taux). Si ça devient un problème pour `/api/quotas*`, il faudrait historiser `QuotaTarget`/`SalaryRate`/`SalaryTier` (nouvelle table, logique de résolution "valeur en vigueur à telle date") — pas fait pour l'instant.
+
+**Exception** : `/api/planning` accepte aussi `?week=` pour une semaine **future** — contrairement à tous les endpoints ci-dessus (où une semaine future serait toujours vide), c'est l'usage normal du planning : les HG préparent les objectifs en avance via la navigation ◀/▶ du panneau Discord, et le site peut afficher la semaine prochaine avant qu'elle ne commence.
 
 ### Types de taxe (`?type=`)
 
@@ -386,6 +389,9 @@ Types fixes avec leur propre bouton, **dépendants du type d'organisation** (`/c
 ### `src/modules/avertissements.ts` — Avertissements
 Panneau permanent (salon `avertissements`) : les admins déclarent un avertissement pour une ou plusieurs personnes (date, raison) et en retirent ; la liste par personne, numérotée par date, est affichée dans l'embed. Chaque personne avertie est pingée par un message supprimé automatiquement 12h plus tard. Les avertissements d'une personne sont purgés quand elle perd le rôle membre ou quitte le serveur.
 
+### `src/modules/planning.ts` — Planning RP par jour/semaine
+Panneau permanent (salon `planning`) : les admins y déclarent des objectifs RP datés par semaine (frontière dimanche 19h, comme les quotas/paie), ciblant un jour précis (horaire optionnel) ou toute la semaine (jamais d'horaire dans ce cas). Navigation ◀/▶ sur le panneau pour préparer le planning d'une semaine future sans attendre qu'elle commence ; toute action Ajouter/Modifier/Supprimer porte sur la semaine actuellement affichée. Le jour est toujours choisi via un menu déroulant (jamais en texte libre) pour éviter toute faute de frappe. Éditer un créneau qui a déjà un ou plusieurs objectifs se fait par sélection explicite (modal préremplie avec les valeurs existantes) plutôt que par un matching silencieux sur le texte de l'horaire. Exposé en lecture seule via `/api/planning?week=` (voir Interopérabilité), y compris pour une semaine future.
+
 ### `src/modules/armurerie.ts` — Armurerie & munitions
 Inventaire d'armes individuelles (nom, référence unique, statut `en_stock`/`pretee`/`perdue`). Types d'armes fixes dans le code (constante `ARME_TYPES` en tête de fichier — pas de `/config` dédié, cette liste ne bouge jamais une fois posée), regroupés en 4 catégories (armes de poing, fusils à pompe, armes automatiques, armes lourdes) avec plus de 25 modèles : l'ajout d'une arme passe donc par un modal de recherche avant le select (limite Discord de 25 options). Une référence déjà enregistrée comme perdue est remise en stock par « Ajouter » (arme retrouvée) ; une référence en stock ou prêtée est refusée, avec son état actuel. Munitions de pistolet : ligne de stock + deux déclarations indicatives (Fabrication / Vente) avec compteur hebdomadaire — Fabrication a un plafond fixe (5000) dans le code, Vente n'a volontairement aucun plafond (juste le total suivi). Munitions de SMG : juste le stock brut, sans quota de fabrication ni compteur de vente.
 
@@ -441,6 +447,8 @@ bot-moni-v3/
 │   │   ├── garages.ts
 │   │   ├── taxes.ts
 │   │   ├── armurerie.ts
+│   │   ├── avertissements.ts
+│   │   ├── planning.ts
 │   │   └── ventes.ts
 │   └── api/                    # API REST (voir "Interopérabilité")
 │       ├── server.ts

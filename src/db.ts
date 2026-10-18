@@ -970,6 +970,58 @@ export async function upsertWeeklyRecordSlot(
   });
 }
 
+// ─── PLANNING ─────────────────────────────────────────────────────────────
+
+export interface PlanningRow {
+  id: number; weekStart: number; jour: number | null; horaire: string | null;
+  titre: string; description: string | null; createdBy: string;
+}
+
+function toPlanningRow(r: { id: number; weekStart: Date; jour: number | null; horaire: string | null; titre: string; description: string | null; createdBy: string }): PlanningRow {
+  return { id: r.id, weekStart: toMs(r.weekStart), jour: r.jour, horaire: r.horaire, titre: r.titre, description: r.description, createdBy: r.createdBy };
+}
+
+/** Crée un objectif de planning, retourne son id. */
+export async function addPlanning(guildId: string, data: {
+  weekStart: number; jour: number | null; horaire: string | null; titre: string; description: string | null; createdBy: string;
+}): Promise<number> {
+  const row = await prisma.planning.create({
+    data: { guildId, weekStart: new Date(data.weekStart), jour: data.jour, horaire: data.horaire, titre: data.titre, description: data.description, createdBy: data.createdBy },
+  });
+  return row.id;
+}
+
+/** Les objectifs d'une semaine (début `weekStart`), triés par jour (null en dernier) puis id. */
+export async function getPlanningsForWeek(guildId: string, weekStart: number): Promise<PlanningRow[]> {
+  const rows = await prisma.planning.findMany({
+    where: { guildId, weekStart: new Date(weekStart) },
+    orderBy: [{ id: 'asc' }],
+  });
+  const avecJour = rows.filter(r => r.jour !== null).sort((a, b) => a.jour! - b.jour!);
+  const sansJour = rows.filter(r => r.jour === null);
+  return [...avecJour, ...sansJour].map(toPlanningRow);
+}
+
+/** Un objectif par id, pour préremplir le flux de modification — `null` si absent ou d'une autre guilde. */
+export async function getPlanningById(guildId: string, id: number): Promise<PlanningRow | null> {
+  const row = await prisma.planning.findFirst({ where: { id, guildId } });
+  return row ? toPlanningRow(row) : null;
+}
+
+/** Met à jour un objectif existant. `updateMany` avec `{ id, guildId }` : un id d'une autre guilde n'affecte silencieusement aucune ligne. */
+export async function updatePlanning(guildId: string, id: number, data: {
+  jour?: number | null; horaire?: string | null; titre?: string; description?: string | null;
+}): Promise<boolean> {
+  const { count } = await prisma.planning.updateMany({ where: { id, guildId }, data });
+  return count > 0;
+}
+
+/** Supprime un objectif existant (même garde-fou `{ id, guildId }` que `updatePlanning`). */
+export async function deletePlanning(guildId: string, id: number): Promise<boolean> {
+  const { count } = await prisma.planning.deleteMany({ where: { id, guildId } });
+  return count > 0;
+}
+
 /** Total de munitions déclarées fabriquées depuis `sinceTs`. */
 export async function getMunitionsFabriqueesDepuis(guildId: string, sinceTs: number): Promise<number> {
   const agg = await prisma.transaction.aggregate({

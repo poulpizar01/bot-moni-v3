@@ -223,6 +223,29 @@ model WeeklyRecord {
   @@map("weekly_records")
 }
 
+/// Objectif de planning RP d'une guilde pour une semaine donnée (frontière
+/// dimanche 19h Europe/Paris, voir paris-time.weekStartOf). `jour` (0=lundi
+/// .. 6=dimanche) cible un jour précis ; `null` = objectif valable sur toute
+/// la semaine (jamais d'horaire dans ce cas). Plusieurs objectifs possibles
+/// pour un même (guildId, weekStart, jour) — pas de clé naturelle, donc pas
+/// de @@unique dessus (voir modules/planning.ts pour le flux d'édition qui
+/// évite les doublons par sélection explicite plutôt qu'une contrainte DB).
+model Planning {
+  guildId     String    @map("guild_id")
+  id          Int       @id @default(autoincrement())
+  weekStart   DateTime  @map("week_start")
+  jour        Int?
+  horaire     String?
+  titre       String
+  description String?
+  createdBy   String    @map("created_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@index([guildId, weekStart])
+  @@map("planning")
+}
+
 /// Points de classement (entiers, pas $ — indépendant de SalaryRate) par
 /// catégorie de quota. Voir `/config classement` et `quotas.computeClassement`.
 model ClassementRate {

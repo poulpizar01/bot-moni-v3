@@ -41,6 +41,7 @@ import * as alertes from './modules/alertes';
 import * as ventes from './modules/ventes';
 import * as garages from './modules/garages';
 import * as avertissements from './modules/avertissements';
+import * as planning from './modules/planning';
 import { startApiServer } from './api/server';
 import { assertAuthEnv } from './api/auth';
 
@@ -172,6 +173,7 @@ async function initGuild(guild: Guild): Promise<void> {
   await step(guildId, 'avertissements.reconcile', () => avertissements.reconcile(client, guildId));
   await step(guildId, 'avertissements.initPermanentMessage', () => avertissements.initPermanentMessage(client, guildId));
   await step(guildId, 'avertissements.deleteExpiredPings', () => avertissements.deleteExpiredPings(client, guildId));
+  await step(guildId, 'planning.initPermanentMessage', () => planning.initPermanentMessage(client, guildId));
   await step(guildId, 'alertes.initLaboTimers', () => alertes.initLaboTimers(client, guildId));
 }
 
@@ -439,7 +441,7 @@ function isProtectedMessage(guildId: string, message: Message): boolean {
   const c = configStore.get(guildId).CHANNELS;
   const protectedChannels = [
     c.stock_general, c.bilan, c.paie, c.historique_stock, c.log_ventes,
-    c.logs_activites, c.ventes_drogue, c.alertes_braquages, c.alertes_actions, c.avertissements,
+    c.logs_activites, c.ventes_drogue, c.alertes_braquages, c.alertes_actions, c.avertissements, c.planning,
   ];
   return protectedChannels.includes(message.channelId)
     || quotas.isQuotaReminderMessage(message)
@@ -550,6 +552,7 @@ client.on('interactionCreate', async (interaction) => {
       if (cid.startsWith('arm_')) return await armurerie.handleButton(interaction);
       if (cid.startsWith('vente_')) return await ventes.handleButton(interaction);
       if (cid.startsWith('avert_')) return await avertissements.handleButton(interaction);
+      if (cid.startsWith('planning_') && !cid.startsWith('planning_select_')) return await planning.handleButton(interaction);
       return;
     }
 
@@ -561,6 +564,7 @@ client.on('interactionCreate', async (interaction) => {
       if (cid.startsWith('modal_arm_')) return await armurerie.handleModal(interaction);
       if (cid.startsWith('modal_vente_')) return await ventes.handleModal(interaction);
       if (cid.startsWith('modal_avert_')) return await avertissements.handleModal(interaction);
+      if (cid.startsWith('modal_planning_')) return await planning.handleModal(interaction);
       return;
     }
 
@@ -571,6 +575,7 @@ client.on('interactionCreate', async (interaction) => {
       if (cid.startsWith('arm_select_')) return await armurerie.handleSelect(interaction);
       if (cid.startsWith('tax_select_')) return await taxes.handleSelect(interaction);
       if (cid.startsWith('avert_select_')) return await avertissements.handleStringSelect(interaction);
+      if (cid.startsWith('planning_select_')) return await planning.handleStringSelect(interaction);
       return;
     }
 

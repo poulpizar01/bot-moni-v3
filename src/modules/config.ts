@@ -51,6 +51,7 @@ import * as taxes from './taxes';
 import * as armurerie from './armurerie';
 import * as alertes from './alertes';
 import * as avertissements from './avertissements';
+import * as planning from './planning';
 import { CONFIRME_VENTE_ITEM } from './ventes';
 import { seedDefaultItems } from '../default-items';
 import { upsertPanel } from '../permanent-message';
@@ -330,6 +331,7 @@ async function handleChannel(interaction: ChatInputCommandInteraction, guildId: 
     if (role === 'taxes') await taxes.initPermanentMessage(interaction.client, guildId);
     if (role === 'documentation') await initDocumentationMessage(interaction.client, guildId);
     if (role === 'avertissements') await avertissements.initPermanentMessage(interaction.client, guildId);
+    if (role === 'planning') await planning.initPermanentMessage(interaction.client, guildId);
     // Idem pour le préfixe du salon d'un labo actif pour le tier courant : sans
     // ça, il resterait sans préfixe jusqu'à la première déclaration. Un labo
     // en pleine production garde son 🔴 et son retour au vert programmé.
@@ -797,6 +799,7 @@ const CHANNEL_NAME_BY_ROLE: Partial<Record<configStore.ChannelRole, string>> = {
   labo_venia: 'labo-venia',
   labo_branche_cannabis: 'labo-branche-cannabis',
   avertissements: '⚠️・avertissements',
+  planning: '📅・planning',
 };
 
 /**

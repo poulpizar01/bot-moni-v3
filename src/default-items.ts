@@ -33,6 +33,17 @@ import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 // db.upsertItem ne touche jamais cette valeur pour un item déjà existant si
 // `display_order` n'est pas fourni (voir docstring de `upsertItem`), donc un
 // futur /config item add sur l'un de ces 5 items ne peut pas la réinitialiser.
+// Repris de roxwood-network-famille, branche `release/1.1` (celle qui ajoute
+// Vénia comme labo générique, pas seulement notre instance) — chaque nom est
+// RÉELLEMENT présent dans nos propres logs de coffre (script `_check-items.ts`,
+// lecture seule, exécuté le 18/10/2026 sur les salons configurés) ou déjà
+// configuré en base sur cette instance depuis un ajout manuel antérieur
+// (`/config item add`) ; « Vénia Purifier À 99 » est confirmé par le scan,
+// les trois autres paliers (50/70/90) suivent la même convention de nommage
+// que toutes les autres drogues purifiées ci-dessous, jamais vérifiés un par
+// un séparément. Deux noms de la liste roxwood sont volontairement ABSENTS,
+// confirmés faux pour nous : « Or Rouge » (jamais vu dans nos coffres) et
+// « Outil de crochetage » (nos logs écrivent « Outil de crochettage », deux "t").
 const DEFAULT_ITEMS: db.ItemInput[] = [
   // L'argent précède les munitions dans le Stock Général.
   { name: 'Argent', display_order: -5 },
@@ -45,28 +56,6 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   // Simple item de stock, sans groupe : affiché dans l'armurerie via
   // MUNITIONS_SMG_ITEM (stock brut uniquement, pas de quota fabrication/vente).
   { name: MUNITIONS_SMG_ITEM, display_order: -1 },
-  // « Héroine » sans tréma : orthographe exacte des items de purification.
-  { name: 'Héroine Pure À 99', vente: true },
-  { name: 'Héroine Pure À 90', vente: true },
-  { name: 'Héroine Pure À 70', vente: true },
-  { name: 'Héroine Pure À 50', vente: true },
-  // Labo Vénia (Petite Frappe) — produit + matériaux. Sans vente:true, comme
-  // les autres produits de labo Petite Frappe.
-  { name: 'Vénia', labo_lie: 'labo_venia', labo_lie_role: 'produit' },
-  { name: 'Fleur Séchée', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
-  { name: 'Cendre Noir', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
-
-  // Repris de roxwood-network-famille (liste par défaut de la release 1.1) —
-  // chaque nom ci-dessous est RÉELLEMENT présent dans nos propres logs de
-  // coffre (script `_check-items.ts`, lecture seule, exécuté le 18/10/2026
-  // sur les salons configurés) et déjà configuré en base sur cette instance
-  // depuis un ajout manuel antérieur (`/config item add`) : cette section ne
-  // fait que faire rattraper le code à ce qui est déjà réellement déployé,
-  // pour qu'un futur déploiement neuf les reçoive aussi. Deux noms de la
-  // liste roxwood sont volontairement ABSENTS, confirmés faux pour nous :
-  // « Or Rouge » (jamais vu dans nos coffres) et « Outil de crochetage »
-  // (nos logs écrivent « Outil de crochettage », deux "t", déjà plus bas).
-
   // Butin/outils de casse — simple suivi de stock, pas de vente:true.
   { name: 'Or Bleu' },
   { name: 'Jetons ETI' },
@@ -74,7 +63,10 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   { name: 'Boîtier de piratage' },
   { name: 'Perceuse' },
   { name: 'Carte Piratage Fleeca' },
-  // Drogues vendables aux PNJ sans lien avec un labo particulier.
+  // Drogues vendables aux PNJ sans lien avec un labo particulier (variantes de
+  // pureté/formes commerciales). "Cocaine Pure", "Héroine Pure" et "Vénia
+  // Purifier" s'écrivent bien sans tréma dans les logs, contrairement aux
+  // items "Cocaïne"/"Héroïne"/"Vénia" des labos plus bas.
   { name: 'Mexicana Pure À 99', vente: true },
   { name: 'Mexicana Pure À 90', vente: true },
   { name: 'Mexicana Pure À 70', vente: true },
@@ -87,6 +79,14 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   { name: 'Weed Pure À 90', vente: true },
   { name: 'Weed Pure À 70', vente: true },
   { name: 'Weed Pure À 50', vente: true },
+  { name: 'Héroine Pure À 99', vente: true },
+  { name: 'Héroine Pure À 90', vente: true },
+  { name: 'Héroine Pure À 70', vente: true },
+  { name: 'Héroine Pure À 50', vente: true },
+  { name: 'Vénia Purifier À 99', vente: true },
+  { name: 'Vénia Purifier À 90', vente: true },
+  { name: 'Vénia Purifier À 70', vente: true },
+  { name: 'Vénia Purifier À 50', vente: true },
   { name: 'Carte Prépayée', vente: true },
   { name: 'B-magic', vente: true },
   { name: 'Ecstasy', vente: true },
@@ -102,7 +102,10 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   { name: 'Graine de strawberry', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
   { name: 'Pot de plantation', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
   { name: 'Fertilisant', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
-  // Labo Spore X (Petite Frappe) — produit + matériaux.
+  // Labo Spore X (Petite Frappe) — produit + matériaux. Sans vente:true, comme
+  // sur cette instance aujourd'hui (roxwood release/1.1 l'ajoute ; pas repris
+  // ici, décision à confirmer explicitement avec l'utilisateur avant de
+  // changer un comportement déjà en place).
   { name: 'Pochon De SporeX', labo_lie: 'labo_sporex', labo_lie_role: 'produit' },
   { name: 'Psilocybe Rouge', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
   { name: 'Psilocybe Vert', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
@@ -110,10 +113,17 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   { name: 'Poudre à canon', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
   { name: 'Fragment de métal', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
   // Labo Héroïne (Petite Frappe) — produit (avec tréma, distinct des 4 variantes
-  // « Héroine Pure À X » ci-dessus, sans tréma) + matériaux.
+  // « Héroine Pure À X » plus haut, sans tréma) + matériaux. Même remarque
+  // vente:true que Spore X ci-dessus.
   { name: 'Héroïne', labo_lie: 'labo_heroine', labo_lie_role: 'produit' },
   { name: 'Datura', labo_lie: 'labo_heroine', labo_lie_role: 'materiau' },
   { name: 'Morphine', labo_lie: 'labo_heroine', labo_lie_role: 'materiau' },
+  // Labo Vénia (Petite Frappe) — produit (avec tréma, distinct des 4 variantes
+  // « Vénia Purifier À X » plus haut, sans tréma) + matériaux. Même remarque
+  // vente:true que Spore X ci-dessus.
+  { name: 'Vénia', labo_lie: 'labo_venia', labo_lie_role: 'produit' },
+  { name: 'Fleur Séchée', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
+  { name: 'Cendre Noir', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
   // Labo Cannabis (Gang) — produit seul. vente:true : reste vendable au PNJ
   // pour un tier qui n'a pas ce labo actif (voir config-store.ts, laboLieRole).
   { name: 'Cannabis', vente: true, labo_lie: 'labo_cannabis', labo_lie_role: 'produit' },

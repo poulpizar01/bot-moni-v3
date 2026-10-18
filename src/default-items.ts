@@ -102,11 +102,10 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   { name: 'Graine de strawberry', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
   { name: 'Pot de plantation', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
   { name: 'Fertilisant', labo_lie: 'labo_branche_cannabis', labo_lie_role: 'materiau' },
-  // Labo Spore X (Petite Frappe) — produit + matériaux. Sans vente:true, comme
-  // sur cette instance aujourd'hui (roxwood release/1.1 l'ajoute ; pas repris
-  // ici, décision à confirmer explicitement avec l'utilisateur avant de
-  // changer un comportement déjà en place).
-  { name: 'Pochon De SporeX', labo_lie: 'labo_sporex', labo_lie_role: 'produit' },
+  // Labo Spore X (Petite Frappe) — produit + matériaux. vente:true (comme
+  // Cannabis/Cocaïne/Mexicana plus bas, release/1.1 de roxwood) : reste
+  // vendable au PNJ pour un tier qui n'a pas ce labo actif.
+  { name: 'Pochon De SporeX', vente: true, labo_lie: 'labo_sporex', labo_lie_role: 'produit' },
   { name: 'Psilocybe Rouge', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
   { name: 'Psilocybe Vert', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
   { name: 'Psilocybe Violet', labo_lie: 'labo_sporex', labo_lie_role: 'materiau' },
@@ -115,13 +114,13 @@ const DEFAULT_ITEMS: db.ItemInput[] = [
   // Labo Héroïne (Petite Frappe) — produit (avec tréma, distinct des 4 variantes
   // « Héroine Pure À X » plus haut, sans tréma) + matériaux. Même remarque
   // vente:true que Spore X ci-dessus.
-  { name: 'Héroïne', labo_lie: 'labo_heroine', labo_lie_role: 'produit' },
+  { name: 'Héroïne', vente: true, labo_lie: 'labo_heroine', labo_lie_role: 'produit' },
   { name: 'Datura', labo_lie: 'labo_heroine', labo_lie_role: 'materiau' },
   { name: 'Morphine', labo_lie: 'labo_heroine', labo_lie_role: 'materiau' },
   // Labo Vénia (Petite Frappe) — produit (avec tréma, distinct des 4 variantes
   // « Vénia Purifier À X » plus haut, sans tréma) + matériaux. Même remarque
   // vente:true que Spore X ci-dessus.
-  { name: 'Vénia', labo_lie: 'labo_venia', labo_lie_role: 'produit' },
+  { name: 'Vénia', vente: true, labo_lie: 'labo_venia', labo_lie_role: 'produit' },
   { name: 'Fleur Séchée', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
   { name: 'Cendre Noir', labo_lie: 'labo_venia', labo_lie_role: 'materiau' },
   // Labo Cannabis (Gang) — produit seul. vente:true : reste vendable au PNJ

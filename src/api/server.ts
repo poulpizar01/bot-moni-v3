@@ -50,6 +50,7 @@ import { braquagesRouter, cooldownsRouter } from './routes/activites';
 import garagesRouter from './routes/garages';
 import rolesRouter from './routes/roles';
 import argentRouter from './routes/argent';
+import recordsRouter from './routes/records';
 
 /** Démarre l'API REST. N'a d'effet que si `API_PORT` est défini dans `.env` — absent = API désactivée, déploiement existant inchangé. */
 export function startApiServer(client: Client): void {
@@ -144,6 +145,7 @@ export function startApiServer(client: Client): void {
   api.use('/braquages', braquagesRouter);
   api.use('/cooldowns', cooldownsRouter);
   api.use('/garages', garagesRouter);
+  api.use('/records', recordsRouter);
   api.use('/roles', rolesRouter(client));
   app.use('/api', api);
 

@@ -938,6 +938,38 @@ export async function getUserActionTotals(guildId: string, sinceTs: number, unti
   return [...totals.values()];
 }
 
+// ─── RECORDS HEBDOMADAIRES ────────────────────────────────────────────────────
+
+/** Un emplacement de podium : `userId` est `null` en portée "groupe" (voir `WeeklyRecord`). */
+export interface WeeklyRecordRow { category: string; scope: string; rank: number; userId: string | null; total: number; weekUntil: number }
+
+function toWeeklyRecordRow(r: { category: string; scope: string; rank: number; userId: string | null; total: number; weekUntil: Date }): WeeklyRecordRow {
+  return { category: r.category, scope: r.scope, rank: r.rank, userId: r.userId, total: r.total, weekUntil: toMs(r.weekUntil) };
+}
+
+/** Le podium actuel (jusqu'à 3 emplacements, triés par rang) d'une catégorie/portée — base de la comparaison avant mise à jour, voir `quotas.checkAndUpdateRecords`. */
+export async function getWeeklyRecordSlots(guildId: string, category: string, scope: string): Promise<WeeklyRecordRow[]> {
+  const rows = await prisma.weeklyRecord.findMany({ where: { guildId, category, scope }, orderBy: { rank: 'asc' } });
+  return rows.map(toWeeklyRecordRow);
+}
+
+/** Tous les records d'une guilde, toutes catégories/portées confondues — voir `/api/records`. */
+export async function getAllWeeklyRecords(guildId: string): Promise<WeeklyRecordRow[]> {
+  const rows = await prisma.weeklyRecord.findMany({ where: { guildId }, orderBy: [{ category: 'asc' }, { scope: 'asc' }, { rank: 'asc' }] });
+  return rows.map(toWeeklyRecordRow);
+}
+
+/** Remplace (ou crée) un emplacement de podium. */
+export async function upsertWeeklyRecordSlot(
+  guildId: string, category: string, scope: string, rank: number, userId: string | null, total: number, weekUntil: number,
+): Promise<void> {
+  await prisma.weeklyRecord.upsert({
+    where: { guildId_category_scope_rank: { guildId, category, scope, rank } },
+    create: { guildId, category, scope, rank, userId, total, weekUntil: new Date(weekUntil) },
+    update: { userId, total, weekUntil: new Date(weekUntil) },
+  });
+}
+
 /** Total de munitions déclarées fabriquées depuis `sinceTs`. */
 export async function getMunitionsFabriqueesDepuis(guildId: string, sinceTs: number): Promise<number> {
   const agg = await prisma.transaction.aggregate({
@@ -1027,7 +1059,7 @@ export async function deleteOldMunitionVentes(guildId: string, beforeTs: number)
 }
 
 /** Une semaine close qui reste à publier (voir `quotas.checkWeeklyReset`) : sa période, et les étapes déjà postées. */
-export interface PendingPublication { since: number; until: number; bilan: boolean; paie: boolean; fourrieres: boolean }
+export interface PendingPublication { since: number; until: number; bilan: boolean; paie: boolean; fourrieres: boolean; records: boolean }
 
 /** Semaines closes restant à publier, de la plus ancienne à la plus récente. */
 export async function getPendingPublications(guildId: string, key: string): Promise<PendingPublication[]> {
@@ -1091,7 +1123,7 @@ export async function performWeeklyReset(
     if (existing) {
       try { const parsed = JSON.parse(existing.value); pending = Array.isArray(parsed) ? parsed : [parsed]; } catch { /* illisible : remplacée */ }
     }
-    pending.push(...periods.map(period => ({ ...period, bilan: false, paie: false, fourrieres: false })));
+    pending.push(...periods.map(period => ({ ...period, bilan: false, paie: false, fourrieres: false, records: false })));
 
     const upsert = (key: string, value: string) => tx.setting.upsert({
       where: { guildId_key: { guildId, key } },

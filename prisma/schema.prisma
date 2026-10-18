@@ -203,6 +203,26 @@ model SalaryTier {
   @@map("salary_tiers")
 }
 
+/// Top 3 hebdomadaire par catégorie ("actions"/"vente"/"labos"/"recolte"/
+/// "munitions") et par portée ("individuel"/"groupe") — un emplacement par
+/// (guildId, category, scope, rank), remplacé en place quand un meilleur
+/// total hebdomadaire est atteint (voir `quotas.checkAndUpdateRecords`,
+/// branché sur le reset hebdomadaire). `userId` est null en portée "groupe".
+model WeeklyRecord {
+  guildId   String   @map("guild_id")
+  id        Int      @id @default(autoincrement())
+  category  String
+  scope     String
+  rank      Int
+  userId    String?  @map("user_id")
+  total     Float
+  weekUntil DateTime @map("week_until")
+
+  @@unique([guildId, category, scope, rank])
+  @@index([guildId, category])
+  @@map("weekly_records")
+}
+
 /// Points de classement (entiers, pas $ — indépendant de SalaryRate) par
 /// catégorie de quota. Voir `/config classement` et `quotas.computeClassement`.
 model ClassementRate {

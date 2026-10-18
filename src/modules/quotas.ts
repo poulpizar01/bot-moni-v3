@@ -1391,7 +1391,7 @@ const weeklyResetRunning = new Set<string>();
  * reconstruites, date avancée, semaines notées à publier), qui clôt chaque
  * semaine pile au dimanche 19h — les mêmes bornes que `?week=` côté API,
  * quelle que soit l'heure réelle du passage, et une période par dimanche
- * manqué. La publication (bilan, paie, fourrières) est calculée depuis
+ * manqué. La publication (bilan, paie, fourrières, records) est calculée depuis
  * `Transaction` sur la période close, jamais depuis `Stat`. Chaque étape est
  * indépendante des autres et cochée une fois postée : une erreur Discord ou
  * un arrêt du process la fait reprendre au passage suivant sans rien
@@ -1445,16 +1445,16 @@ async function publishPendingWeeks(client: Client, guildId: string): Promise<voi
   const pending = await db.getPendingPublications(guildId, PUBLICATION_KEY);
   if (!pending.length) return;
   for (const week of pending) await publishWeek(client, guildId, week, () => db.setPendingPublications(guildId, PUBLICATION_KEY, pending));
-  await db.setPendingPublications(guildId, PUBLICATION_KEY, pending.filter(week => !(week.bilan && week.paie && week.fourrieres)));
+  await db.setPendingPublications(guildId, PUBLICATION_KEY, pending.filter(week => !(week.bilan && week.paie && week.fourrieres && week.records)));
 }
 
-/** Les trois étapes de publication d'une semaine close, chacune indépendante : une étape en échec n'empêche pas les autres et sera retentée. */
+/** Les étapes de publication d'une semaine close (bilan, paie, fourrières, records), chacune indépendante : une étape en échec n'empêche pas les autres et sera retentée. */
 async function publishWeek(client: Client, guildId: string, week: db.PendingPublication, save: () => Promise<void>): Promise<void> {
   const c = configStore.get(guildId);
   const range: QuotaRange = { since: week.since, until: week.until };
   const debut = week.since > 0 ? week.since : week.until - 7 * 24 * 60 * 60 * 1000;
   const entete = `${formatDate(debut)} — ${formatDate(week.until)}`;
-  const etape = async (nom: 'bilan' | 'paie' | 'fourrieres', fn: () => Promise<void>) => {
+  const etape = async (nom: 'bilan' | 'paie' | 'fourrieres' | 'records', fn: () => Promise<void>) => {
     if (week[nom]) return;
     try {
       await fn();
@@ -1499,6 +1499,77 @@ async function publishWeek(client: Client, guildId: string, week: db.PendingPubl
   });
 
   await etape('fourrieres', () => garages.resetFourrieresHebdo(client, guildId, entete, week.until));
+
+  await etape('records', () => checkAndUpdateRecords(guildId, range));
+}
+
+// ─── RECORDS HEBDOMADAIRES (top 3, voir `src/api/routes/records.ts`) ──────────
+
+/** Catégories suivies : les 4 catégories de quota (`ACTIVITY_TYPES[*].quotaType`). */
+export const RECORD_CATEGORIES = ['actions', 'vente', 'labos', 'recolte'] as const;
+export type RecordCategory = typeof RECORD_CATEGORIES[number];
+
+interface RecordCandidate { userId: string | null; total: number }
+
+/**
+ * Fusionne le podium existant avec les nouveaux candidats de la semaine qui
+ * vient de se clore, et réécrit les emplacements qui changent.
+ *
+ * En portée "individuel", un joueur ne peut détenir qu'une seule place : on
+ * ne compare son nouveau total qu'à SA propre meilleure performance déjà au
+ * podium (jamais à celle d'un autre), et on ne la remplace que s'il la
+ * dépasse strictement — à égalité, l'ancien record garde sa place (décision
+ * explicite). En portée "groupe", il n'y a qu'un seul candidat (le total de
+ * la guilde entière cette semaine), sans notion de joueur à dédupliquer.
+ */
+async function updateRecordSlots(
+  guildId: string, category: RecordCategory, scope: 'individuel' | 'groupe', candidates: RecordCandidate[], weekUntil: number,
+): Promise<void> {
+  const existing = await db.getWeeklyRecordSlots(guildId, category, scope);
+  const entries: Array<{ userId: string | null; total: number; weekUntil: number; isNew: boolean }> =
+    existing.map(e => ({ userId: e.userId, total: e.total, weekUntil: e.weekUntil, isNew: false }));
+
+  for (const candidate of candidates) {
+    if (candidate.total <= 0) continue;
+    const rivalIndex = scope === 'individuel' ? entries.findIndex(e => e.userId === candidate.userId) : -1;
+    if (rivalIndex === -1) entries.push({ userId: candidate.userId, total: candidate.total, weekUntil, isNew: true });
+    else if (candidate.total > entries[rivalIndex].total) entries[rivalIndex] = { userId: candidate.userId, total: candidate.total, weekUntil, isNew: true };
+  }
+
+  entries.sort((a, b) => b.total - a.total || (a.isNew ? 1 : 0) - (b.isNew ? 1 : 0));
+  const top3 = entries.slice(0, 3);
+  for (let rank = 1; rank <= top3.length; rank++) {
+    const entry = top3[rank - 1];
+    await db.upsertWeeklyRecordSlot(guildId, category, scope, rank, entry.userId, entry.total, entry.weekUntil);
+  }
+}
+
+/**
+ * Vérifie et met à jour les records (top 3 individuel + record de groupe) de
+ * la semaine qui vient de se clore, pour chaque catégorie de `RECORD_CATEGORIES`.
+ * Appelé comme les autres étapes de publication (voir `publishWeek`) — après
+ * le reset, sur `Transaction` (jamais purgée), donc rejouable sans risque si
+ * le process s'arrête avant que l'étape soit cochée.
+ */
+async function checkAndUpdateRecords(guildId: string, range: QuotaRange): Promise<void> {
+  const summaries = await getAllUserQuotaSummariesForRange(guildId, range);
+  const perCategoryUserTotals = new Map<RecordCategory, Map<string, number>>();
+  for (const cat of RECORD_CATEGORIES) perCategoryUserTotals.set(cat, new Map());
+
+  for (const { userId, byQuotaType } of summaries) {
+    for (const cat of RECORD_CATEGORIES) {
+      const total = byQuotaType[cat] ?? 0;
+      if (total > 0) perCategoryUserTotals.get(cat)!.set(userId, total);
+    }
+  }
+
+  for (const [category, perUser] of perCategoryUserTotals) {
+    const individualCandidates: RecordCandidate[] = [...perUser.entries()].map(([userId, total]) => ({ userId, total }));
+    await updateRecordSlots(guildId, category, 'individuel', individualCandidates, range.until);
+
+    const groupTotal = [...perUser.values()].reduce((a, b) => a + b, 0);
+    await updateRecordSlots(guildId, category, 'groupe', [{ userId: null, total: groupTotal }], range.until);
+  }
 }
 
 // ─── RAPPEL DE QUOTA DU DIMANCHE (00h → 19h) — spécifique à la catégorie "vente" ──

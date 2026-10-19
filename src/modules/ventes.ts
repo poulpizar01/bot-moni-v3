@@ -37,8 +37,8 @@ import * as quotas from './quotas';
 import type { StockEntry } from './stocks';
 import { ARGENT_ITEMS, demandeMontantVente, montantRow, lireMontant, refusMontant } from './argent';
 
-/** Fenêtre max (ms) entre retrait et dépôt d'argent pour confirmation auto (3h). */
-const WINDOW_MS = 3 * 60 * 60 * 1000;
+/** Fenêtre max (ms) entre retrait et dépôt d'argent pour confirmation auto (4h). */
+const WINDOW_MS = 4 * 60 * 60 * 1000;
 /** Fenêtre max (ms) entre deux retraits successifs cumulés dans la même alerte (5 min). */
 const ACCUMULATION_WINDOW_MS = 5 * 60 * 1000;
 
@@ -301,7 +301,7 @@ async function sendLogVente(client: Client, guildId: string, sales: Array<NonNul
     )
     .setTimestamp();
 
-  await channel.send({ embeds: [embed] });
+  await channel.send({ embeds: [embed] }).catch(() => null);
 
   for (const sale of sales) {
     if (!sale.discordId) {
@@ -557,6 +557,8 @@ export async function cleanupExpiredSales(client: Client, guildId: string): Prom
       if (!(await db.transitionPendingSale(guildId, sale.id, ['en_attente', 'declare', 'repose'], 'expire'))) continue;
       await editAlertMessage(client, sale, '⏰ Vente expirée — aucune action', 0x95A5A6);
     }
+  } catch (err) {
+    console.error(`[ventes] cleanupExpiredSales(${guildId}):`, (err as Error).message);
   } finally {
     cleanupRunning.delete(guildId);
   }

@@ -22,10 +22,10 @@
  */
 import * as db from './db';
 import * as configStore from './config-store';
-import { MUNITIONS_STOCK_GROUP, MUNITIONS_SMG_ITEM } from './modules/armurerie';
+import { MUNITIONS_STOCK_GROUP, MUNITIONS_SMG_ITEM, MUNITIONS_SMG_STOCK_GROUP } from './modules/armurerie';
 import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 
-// `display_order` négatif : garantit que les 5 items génériques ci-dessous restent
+// `display_order` négatif : garantit que les 6 items génériques ci-dessous restent
 // TOUJOURS en tête du Stock Général, quel que soit l'ordre d'insertion réel
 // ou de futurs items ajoutés via `/config item add` (qui n'expose pas cette
 // option et retombe donc sur le défaut 0, donc toujours après). Valeurs
@@ -46,16 +46,20 @@ import { CONFIRME_VENTE_ITEM } from './modules/ventes';
 // « Outil de crochetage » (nos logs écrivent « Outil de crochettage », deux "t").
 const DEFAULT_ITEMS: db.ItemInput[] = [
   // L'argent précède les munitions dans le Stock Général.
-  { name: 'Argent', display_order: -5 },
+  { name: 'Argent', display_order: -7 },
   // CONFIRME_VENTE_ITEM joue aussi le rôle fixe de confirmation des ventes.
-  { name: CONFIRME_VENTE_ITEM, display_order: -4 },
-  { name: 'Munition de pistolet', stock_group: MUNITIONS_STOCK_GROUP, display_order: -3 },
+  { name: CONFIRME_VENTE_ITEM, display_order: -6 },
+  { name: 'Munition de pistolet', stock_group: MUNITIONS_STOCK_GROUP, display_order: -5 },
   // Vaut 24x "Munition de pistolet" (stock_multiplier) — même groupe, comptée
   // en conséquence dans le total munitions pondéré (voir armurerie.weightedStockSum).
-  { name: 'Boîte mun. pistolet', stock_group: MUNITIONS_STOCK_GROUP, stock_multiplier: 24, display_order: -2 },
-  // Simple item de stock, sans groupe : affiché dans l'armurerie via
-  // MUNITIONS_SMG_ITEM (stock brut uniquement, pas de quota fabrication/vente).
-  { name: MUNITIONS_SMG_ITEM, display_order: -1 },
+  { name: 'Boîte mun. pistolet', stock_group: MUNITIONS_STOCK_GROUP, stock_multiplier: 24, display_order: -4 },
+  // Même principe que "Munition de pistolet"/"Boîte mun. pistolet" ci-dessus,
+  // affiché dans l'armurerie via MUNITIONS_SMG_ITEM (pas de quota
+  // fabrication/vente pour ce calibre, juste le stock pondéré).
+  { name: MUNITIONS_SMG_ITEM, stock_group: MUNITIONS_SMG_STOCK_GROUP, display_order: -3 },
+  // Vaut 24x "Munition de SMG" (stock_multiplier) — même groupe, comptée en
+  // conséquence dans le total munitions SMG pondéré (voir armurerie.weightedStockSum).
+  { name: 'Boîte mun. SMG', stock_group: MUNITIONS_SMG_STOCK_GROUP, stock_multiplier: 24, display_order: -2 },
   // Butin/outils de casse — simple suivi de stock, pas de vente:true.
   { name: 'Or Bleu' },
   { name: 'Jetons ETI' },
